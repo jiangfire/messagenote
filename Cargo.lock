@@ -1995,6 +1995,7 @@ version = "1.0.0"
 dependencies = [
  "messagenote-core",
  "messagenote-server",
+ "messagenote-store",
  "rusqlite",
  "serde",
  "serde_json",
@@ -2022,6 +2023,7 @@ version = "1.0.0"
 dependencies = [
  "axum",
  "messagenote-core",
+ "messagenote-store",
  "rusqlite",
  "serde",
  "serde_json",
@@ -2029,6 +2031,14 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "messagenote-store"
+version = "1.0.0"
+dependencies = [
+ "messagenote-core",
+ "rusqlite",
 ]
 
 [[package]]

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/server", "src-tauri"]
+members = ["crates/core", "crates/server", "crates/store", "src-tauri"]
 
 [workspace.package]
 version = "1.0.0"
@@ -8,6 +8,8 @@ edition = "2021"
 
 [workspace.dependencies]
 messagenote-core = { path = "crates/core" }
+# 只放"在客户端与服务端两种 schema 上都成立"的查询。契约见 crates/store/src/lib.rs。
+messagenote-store = { path = "crates/store" }
 
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

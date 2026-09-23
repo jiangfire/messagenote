@@ -16,7 +16,7 @@ use messagenote_core::wire::HealthResponse;
 #[tauri::command]
 pub fn list_channels(db: State<'_, Db>) -> AppResult<Vec<Channel>> {
     let conn = db.conn()?;
-    db::list_channels(&conn)
+    Ok(db::list_channels(&conn)?)
 }
 
 #[tauri::command]
@@ -75,7 +75,7 @@ pub fn list_timeline(
         }
     };
 
-    db::list_messages(&conn, scope, limit.unwrap_or(120), cursor.as_ref())
+    Ok(db::list_messages(&conn, scope, limit.unwrap_or(120), cursor.as_ref())?)
 }
 
 /// 两个参数必须**一起**给：只给时间戳等于退回单键游标，会漏记录。
@@ -122,20 +122,20 @@ pub fn search_messages(
     limit: Option<i64>,
 ) -> AppResult<Vec<SearchHit>> {
     let conn = db.conn()?;
-    db::search(&conn, &query, limit.unwrap_or(60))
+    Ok(db::search(&conn, &query, limit.unwrap_or(60))?)
 }
 
 #[tauri::command]
 pub fn list_tags(db: State<'_, Db>) -> AppResult<Vec<TagCount>> {
     let conn = db.conn()?;
-    db::list_tags(&conn)
+    Ok(db::list_tags(&conn)?)
 }
 
 /// 侧边栏的两个计数：时间线总数、收件箱（未打标签）数。
 #[tauri::command]
 pub fn timeline_stats(db: State<'_, Db>) -> AppResult<TimelineStats> {
     let conn = db.conn()?;
-    db::timeline_stats(&conn)
+    Ok(db::timeline_stats(&conn)?)
 }
 
 #[tauri::command]

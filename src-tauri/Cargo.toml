@@ -17,6 +17,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [dependencies]
 messagenote-core = { workspace = true }
+messagenote-store = { workspace = true }
 
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-global-shortcut = "2"

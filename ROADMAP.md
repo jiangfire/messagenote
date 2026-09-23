@@ -48,24 +48,77 @@
 
 ## 二、下一步
 
-### S2 · 网页端 + 服务端检索
+### S2 · 网页端（读写）+ 服务端读 API
 
-**目标**：浏览器里能看、能搜、能记。
+**目标**：浏览器里能看、能搜、**也能记**。
 
-- 抽出共享 UI 组件：把 `src/` 里与 Tauri 无关的部分（Sidebar / Stream / Composer /
-  Markdown）提取成可复用包。
-- 把数据访问藏到一个 `NoteApi` 接口后面，两个实现：
-  - `TauriApi` —— 走 `invoke`，本地优先（桌面端）
-  - `HttpApi` —— 走 `fetch`，直连服务端（网页端）
-- 服务端补 FTS 索引，**复用 `core::search`**，保证网页端和桌面端检索语义一致
-  —— 这正是当初把 core 抽出来的理由。
+已定下的三个决策（2026-09）：
+
+1. **网页端要能写**，不只是只读。
+2. **写入走"服务端代笔"**（见 ③），浏览器里**不重实现** HLC / 合并 / 冲突处理。
+3. **浏览语义现在就下沉**到共享层，不等到两端各写一份之后。
+
+分五段做，每段都带测试：
+
+#### ① 浏览语义下沉到 `crates/store` ✅
+
+`INBOX_ID` / `Scope` / `Cursor` / `list_messages` / `timeline_stats` /
+`list_channels` / `list_tags` / `search` 搬到新 crate `messagenote-store`。
+
+**为什么是新 crate 而不是 `core`**：`core` 是纯逻辑（不依赖 rusqlite）。
+更重要的是，`core/src/lib.rs` 里那条"各自的存储实现不要共享"的判断对**写入**
+仍然成立 —— 客户端有 `dirty`、服务端有 `server_seq`。所以共享的部分要有自己
+的边界：`store` 的契约只有一句，**只放"在两种 schema 上都成立"的查询**。
+
+这个前提（服务端的表是客户端同名表的超集）**已经被测试证实**，不是推断：
+`store::tests::shared_browse_queries_work_on_the_server_schema`。
+
+验收：桌面端 `db.rs` 里那些浏览测试**一行没改**仍然全绿。
+
+#### ② 服务端补 FTS 索引 + 只读 API
+
+- 服务端建自己的 `message_fts`，复用 `core::search::to_index_text`。
+  **索引维护必须和 `upsert()` 在同一个事务里** —— 分开写会让索引和数据静默漂移，
+  表现成"搜得到但点不开"。
+- 现有数据要能回填。
+- 新增 `GET /api/timeline`（scope / channelId / tag / limit / before*）、
+  `/api/timeline/stats`、`/api/channels`、`/api/tags`、`/api/search`。
+
+#### ③ 服务端代笔写入
+
+`POST /api/message` 之类：**服务端把自己当一台设备**，生成 HLC、写进变更日志、
+分配 seq。桌面端下次同步照常拉到。
+
+好处不只是省事：裁定权仍然只在服务端那一份 `should_accept_push` 里。
+如果在 JS 里再实现一套合并规则，就多了一份会漂移的实现 —— 而那正是我们
+已经吃过亏的地方。
+
+代价：**网页端写入需要联网**。离线捕获留给 S3 的 outbox。
+
+#### ④ 会话鉴权
+
+长期令牌换短期会话。**不要用服务端内存里的 Map**：重启就掉线，多进程部署会失效。
+倾向签名令牌（无状态）+ 较短有效期。
+
+上线前提：长期令牌放进 localStorage 等于把全库读写权限交给任何一次 XSS，
+而正文是要渲染用户 Markdown 的。
+
+#### ⑤ 前端 `NoteApi` 抽象 + 网页端外壳
+
+`src/lib/api.ts` 已经是唯一的收口点（全部调用都是一行 `invoke`，没有组件直接
+碰 Tauri），所以换数据层很便宜：定义 `NoteApi` 接口，`TauriApi` 就是现在这份，
+`HttpApi` 走 `fetch`，注入点在根组件，**组件一行不用改**。
+
+一个产品层面的现实：桌面端的核心价值是全局快捷键 + 置顶捕获浮层，这两样在
+浏览器里都不存在。所以网页端的重心应该是**查和整理**（它在这两件事上不比桌面
+差），写入做成够用即可。
 
 ### S3 · PWA + 离线捕获 outbox
 
 **目标**：手机上能随手记，没网也能记。
 
 - 瘦客户端 + Service Worker 缓存外壳。
-- 离线时记录进 IndexedDB 队列，联网后重放。
+- 离线时记录进 IndexedDB 队列，联网后重放（补上 S2 ③ 缺的那块离线能力）。
 - **刻意不做**"浏览器里跑完整本地优先"（sqlite-wasm + OPFS）：
   浏览和检索可以要求联网，而为它们付出"在浏览器里重建整个同步引擎"的代价不划算。
   真正必须离线的是**捕获**，一个小 outbox 就够。

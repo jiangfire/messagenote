@@ -710,6 +710,9 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    // 共享存储层。这里是**服务端**第一次真的用它 —— 见 shared_browse_queries_…
+    use messagenote_store::{Cursor, Scope};
+
     fn store() -> Store {
         Store::in_memory().unwrap()
     }
@@ -728,6 +731,148 @@ mod tests {
                 "updatedAt": wall
             })),
         }
+    }
+
+    fn msg_in(id: &str, channel_id: &str, wall: i64, body: &str) -> Change {
+        let mut c = msg(id, wall, 0, "a", body);
+        c.data = Some(json!({
+            "channelId": channel_id,
+            "body": body,
+            "createdAt": wall,
+            "updatedAt": wall
+        }));
+        c
+    }
+
+    fn channel_change(id: &str, name: &str, kind: &str, sort: i64, wall: i64) -> Change {
+        Change {
+            seq: None,
+            kind: EntityKind::Channel,
+            id: id.into(),
+            hlc: Hlc::new(wall, 0, "a"),
+            deleted: false,
+            data: Some(json!({
+                "name": name,
+                "kind": kind,
+                "sortOrder": sort,
+                "createdAt": wall,
+                "updatedAt": wall
+            })),
+        }
+    }
+
+    fn tag_change(name: &str, wall: i64) -> Change {
+        Change {
+            seq: None,
+            kind: EntityKind::Tag,
+            id: name.into(),
+            hlc: Hlc::new(wall, 0, "a"),
+            deleted: false,
+            data: Some(json!({ "createdAt": wall, "updatedAt": wall })),
+        }
+    }
+
+    fn msg_tag_change(message_id: &str, tag_name: &str, wall: i64) -> Change {
+        Change {
+            seq: None,
+            kind: EntityKind::MessageTag,
+            id: messagenote_core::payload::message_tag_key::encode(message_id, tag_name),
+            hlc: Hlc::new(wall, 0, "a"),
+            deleted: false,
+            data: Some(json!({
+                "messageId": message_id,
+                "tagName": tag_name,
+                "createdAt": wall,
+                "updatedAt": wall
+            })),
+        }
+    }
+
+    /// **验证 `messagenote-store` 的立身之本：那些浏览查询在服务端的 schema 上
+    /// 同样成立。**
+    ///
+    /// `crates/store` 存在的全部理由，是"服务端的表是客户端同名表的超集，
+    /// 所以浏览用的 SQL 两边都能跑"。这句话如果只是读一遍 schema 得出的推断，
+    /// 那这个 crate 就建在沙子上 —— 而它承载的是"桌面端和网页端看到的时间线
+    /// 完全一致"这件事，漂移起来是静默的（差几条，不报错）。
+    ///
+    /// 所以这里用**真实的 `Store`** 落一批数据，再把共享查询原样跑一遍。
+    /// 任何一条语句哪天碰到了服务端没有的列，这个测试会立刻红。
+    #[test]
+    fn shared_browse_queries_work_on_the_server_schema() {
+        let s = store();
+        s.push(&[
+            channel_change("inbox", "收件箱", "inbox", 0, 10),
+            channel_change("ch-work", "工作", "normal", 1, 11),
+            msg("m1", 100, 0, "a", "收件箱里的一条"),
+            msg_in("m2", "ch-work", 101, "工作里的一条"),
+            tag_change("重要", 102),
+            msg_tag_change("m1", "重要", 103),
+        ])
+        .unwrap();
+
+        let conn = s.conn().unwrap();
+
+        // 频道列表：收件箱必须排在最前 —— 排序表达式 `(kind = 'inbox') DESC`
+        // 是 SQLite 特有的写法，值得单独确认它在服务端表上也成立。
+        let chans = messagenote_store::list_channels(&conn).unwrap();
+        assert_eq!(chans.len(), 2);
+        assert_eq!(chans[0].id, "inbox", "收件箱要排在第一位");
+        assert_eq!(chans[0].kind, "inbox");
+        assert_eq!(chans[0].message_count, 1);
+        assert_eq!(chans[1].id, "ch-work");
+        assert_eq!(chans[1].message_count, 1);
+
+        // 时间线主视图
+        let all = messagenote_store::list_messages(&conn, Scope::All, 50, None).unwrap();
+        assert_eq!(all.items.len(), 2);
+        assert_eq!(all.items[0].id, "m2", "按 created_at 倒序");
+        assert!(!all.has_more);
+
+        // 未归档 —— 也就是时间线上那个筛选条
+        let unfiled = messagenote_store::list_messages(&conn, Scope::Unfiled, 50, None).unwrap();
+        assert_eq!(unfiled.items.len(), 1);
+        assert_eq!(unfiled.items[0].id, "m1");
+
+        // 按频道
+        let work =
+            messagenote_store::list_messages(&conn, Scope::Channel("ch-work"), 50, None).unwrap();
+        assert_eq!(work.items.len(), 1);
+        assert_eq!(work.items[0].id, "m2");
+
+        // 按标签：标签是横切的，未归档的那条照样查得到
+        let tagged = messagenote_store::list_messages(&conn, Scope::Tag("重要"), 50, None).unwrap();
+        assert_eq!(tagged.items.len(), 1);
+        assert_eq!(tagged.items[0].id, "m1");
+        assert_eq!(
+            tagged.items[0].tags,
+            vec!["重要".to_string()],
+            "标签要跟着消息一起带出来，否则网页端渲染不出 chip"
+        );
+
+        // 统计与筛选必须对得上 —— 侧边栏显示"未归档 3"而点进去只有 2 条，
+        // 这种小出入最伤信任
+        let stats = messagenote_store::timeline_stats(&conn).unwrap();
+        assert_eq!(stats.total, 2);
+        assert_eq!(stats.unfiled, 1);
+        assert_eq!(stats.unfiled as usize, unfiled.items.len());
+
+        let tags = messagenote_store::list_tags(&conn).unwrap();
+        assert_eq!(tags.len(), 1);
+        assert_eq!(tags[0].name, "重要");
+        assert_eq!(tags[0].count, 1);
+
+        // 键集分页：同一毫秒的兄弟行不漏，翻到底 has_more 要变成 false
+        let page1 = messagenote_store::list_messages(&conn, Scope::All, 1, None).unwrap();
+        assert_eq!(page1.items.len(), 1);
+        assert_eq!(page1.items[0].id, "m2");
+        assert!(page1.has_more, "还有更早的");
+
+        let cursor = Cursor::before(&page1.items[0]);
+        let page2 = messagenote_store::list_messages(&conn, Scope::All, 1, Some(&cursor)).unwrap();
+        assert_eq!(page2.items.len(), 1);
+        assert_eq!(page2.items[0].id, "m1");
+        assert!(!page2.has_more, "已经翻到底了，不该再说还有");
     }
 
     #[test]
