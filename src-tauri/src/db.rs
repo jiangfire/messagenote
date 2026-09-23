@@ -172,6 +172,16 @@ impl Db {
             .lock()
             .map_err(|_| AppError::Msg("数据库连接锁已损坏，请重启应用".into()))
     }
+
+    /// 尝试取连接，拿不到立刻返回 `None`，**绝不阻塞**。
+    ///
+    /// 存在的理由是守住同步引擎最容易退化的那条性质：网络往返期间不持有
+    /// 数据库锁（见 `sync::LocalStore`）。验证它必须能在锁被占住时立刻失败，
+    /// 而不是挂在那里 —— 一个挂起的测试会被当成"跑得慢"，一个失败的测试
+    /// 才会被人修。
+    pub fn try_conn(&self) -> Option<std::sync::MutexGuard<'_, Connection>> {
+        self.inner.try_lock().ok()
+    }
 }
 
 pub fn open(path: &Path) -> AppResult<Db> {
@@ -329,32 +339,11 @@ pub fn clock_next(conn: &Connection) -> AppResult<Hlc> {
 
 /// 观察到远端时间戳后校正本机时钟。收到比本机更超前的时间戳时，
 /// 把本地时钟拉前，避免此后持续落后、每次冲突都输。
-#[allow(dead_code)] // 由同步引擎调用（下一步接入）
 pub fn clock_observe(conn: &Connection, remote: &Hlc) -> AppResult<()> {
     let device = device_id(conn)?;
     let mut hlc = read_clock(conn, &device)?;
     hlc.observe(remote, messagenote_core::now_ms());
     write_clock(conn, &hlc)
-}
-
-/// 取某一行的 (HLC, dirty)，供同步合并判定使用。
-#[allow(dead_code)] // 由同步引擎调用（下一步接入）
-pub fn row_state(conn: &Connection, table: &str, id: &str) -> AppResult<Option<(Hlc, bool)>> {
-    // table 只能来自调用方硬编码的白名单，不接受外部输入
-    let sql = format!("SELECT hlc_wall, hlc_counter, device_id, dirty FROM {table} WHERE id = ?1");
-    let row = conn
-        .query_row(&sql, params![id], |r| {
-            Ok((
-                Hlc::new(
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, u32>(1)?,
-                    r.get::<_, String>(2)?,
-                ),
-                r.get::<_, i64>(3)? != 0,
-            ))
-        })
-        .optional()?;
-    Ok(row)
 }
 
 // ---------------------------------------------------------------- 读取辅助

@@ -58,10 +58,12 @@ fn api(addr: SocketAddr) -> HttpServerApi {
 }
 
 /// 跑到静止：某一轮既没推也没拉。
+///
+/// 注意这里**不持有 `db.conn()`** —— `sync_once` 自己按需加锁，
+/// 握着 guard 调它会死锁。同样地，真实 HTTP 往返全程也不持锁。
 fn sync_until_quiet(db: &Db, api: &HttpServerApi) {
-    let conn = db.conn().expect("取连接");
     for _ in 0..40 {
-        let r = sync_once(&conn, api).expect("同步失败");
+        let r = sync_once(db, api).expect("同步失败");
         if r.pushed == 0 && r.pulled == 0 {
             return;
         }

@@ -10,7 +10,7 @@
 //! 两者不能混用：拿 seq 判胜负会变成"网络顺序赢"，跨设备不一致；
 //! 拿时间戳做游标会漏数据。
 //!
-//! ## 三条不能违反的规则
+//! ## 四条不能违反的规则
 //!
 //! 1. **删除状态落库时必须由变更内容推导，不能用本机 now()。**
 //!    否则两台设备对同一条墓碑会写出不同的 `deleted_at`，状态永远收敛不了。
@@ -18,10 +18,16 @@
 //!    无条件清零会把第二次修改误标成"已同步"，那条编辑就永远出不去了。
 //! 3. **远端胜出而本地有未上传的改动时，先留副本再覆盖。**
 //!    个人记忆工具里，少一条笔记比多一条重复内容严重得多。
-
-// 传输层（HTTP）和界面入口尚未接上，所以这些入口暂时没有非测试调用方。
-// 它们已经被下面的随机化收敛测试完整覆盖，不是半成品。
-#![allow(dead_code)]
+//! 4. **网络往返期间绝不持有数据库锁。**
+//!    [`sync_once`] 只通过 [`LocalStore`] 接触数据库，而 trait 的每个方法
+//!    各自加锁、返回前释放，**网络调用一律夹在两次调用之间** ——
+//!    那正是锁被放开的时刻。`sync_once` 拿不到 `&Connection`，
+//!    所以这条约束由类型来保证，不靠注释和自觉。
+//!
+//!    为什么必须这样：连接超时 4 秒、整体兜底 30 秒。一旦把锁的持有期
+//!    拉长到整个 HTTP 往返，用户在同步期间打字就会跟着卡住。更要命的是
+//!    `std::sync::Mutex` **不可重入** —— 已有调用方习惯先 `db.conn()` 再操作，
+//!    在 guard 还活着的时候调进来不是变慢，是**直接死锁**。
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::de::DeserializeOwned;
@@ -32,7 +38,7 @@ use messagenote_core::payload::{message_tag_key, ChannelPayload, MessagePayload,
 use messagenote_core::search;
 use messagenote_core::wire::{Change, EntityKind, PullResponse, PushResponse};
 
-use crate::db;
+use crate::db::{self, Db};
 use crate::error::{AppError, AppResult};
 
 /// 单次推送/拉取的批量上限。取值只需要"不会让一次 HTTP 请求过大"，
@@ -49,6 +55,46 @@ const CURSOR_KEY: &str = "sync_cursor";
 pub trait ServerApi {
     fn pull(&self, since: i64, limit: i64) -> AppResult<PullResponse>;
     fn push(&self, changes: &[Change]) -> AppResult<PushResponse>;
+}
+
+/// 一轮同步对本地库提出的全部需求。**每个方法内部各自加锁、返回前释放。**
+///
+/// 这个 trait 存在的唯一理由，是让"锁的持有期"没法被写长。
+/// [`sync_once`] 只认这个 trait、拿不到 `&Connection`，所以网络往返
+/// 必然发生在两次调用之间 —— 那正是锁被放开的时刻。
+///
+/// 谁要是为了省事把 `&Connection` 加回 `sync_once` 的参数表，锁的持有期
+/// 立刻从毫秒级变成整个 HTTP 往返（连接超时 4 秒、整体兜底 30 秒）。
+/// 更糟的是 `std::sync::Mutex` **不可重入**：调用方习惯先 `db.conn()`
+/// 再操作，在一个还活着的 guard 上再调进来就是直接死锁。
+/// 这种约束必须由类型来保证，注释拦不住。
+pub trait LocalStore {
+    /// 阶段一：取出待上传的一批变更（加锁 → 读 → 释放）
+    fn take_pending_batch(&self, limit: i64) -> AppResult<Vec<Change>>;
+
+    /// 阶段三：落地推送结果（加锁 → 写 → 释放）。返回新建的冲突副本数。
+    ///
+    /// "应用落败者"和"清 dirty"必须在**同一次加锁**里做完：
+    /// 中间若放开，另一条路径的写入会让 `clear_dirty` 基于过期的状态判断。
+    fn commit_push_result(&self, sent: &[Change], resp: &PushResponse) -> AppResult<usize>;
+
+    /// 当前拉取游标（加锁 → 读 → 释放）
+    fn current_cursor(&self) -> AppResult<i64>;
+
+    /// 阶段三：落地一批拉取结果并推进游标（加锁 → 写 → 释放）。
+    ///
+    /// 落库和推游标放在同一次加锁里。崩在中间的话，下次会重拉同一批，
+    /// 靠 HLC 相等那条幂等路径兜住 —— 安全，但没必要留这个窗口。
+    fn commit_pull_batch(&self, changes: &[Change], new_cursor: i64) -> AppResult<ApplyCount>;
+}
+
+/// 一批远端变更落库后的统计。
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ApplyCount {
+    /// 真正写进本地库的条数（HLC 判负、保持本地不动的那些不算）
+    pub applied: usize,
+    /// 为保住本地未上传的编辑而新建的冲突副本数量
+    pub conflicts: usize,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -424,20 +470,6 @@ fn clear_dirty(conn: &Connection, sent: &[Change]) -> AppResult<()> {
 
 // ---------------------------------------------------------------- 应用远端变更
 
-pub fn apply_changes(conn: &Connection, changes: &[Change]) -> AppResult<SyncReport> {
-    let mut report = SyncReport::default();
-    for c in changes {
-        let a = apply_one(conn, c)?;
-        if a.applied {
-            report.pulled += 1;
-        }
-        if a.conflict_copy {
-            report.conflicts += 1;
-        }
-    }
-    Ok(report)
-}
-
 fn apply_one(conn: &Connection, change: &Change) -> AppResult<Applied> {
     // 先把本机时钟推到远端之后。漏了这一步，本机后续写入会产出比远端
     // 更旧的时间戳，于是自己的修改在冲突里持续判负。
@@ -609,54 +641,91 @@ fn write_remote(conn: &Connection, change: &Change) -> AppResult<()> {
 
 // ---------------------------------------------------------------- 一轮同步
 
-/// 推一次、拉干净。返回本轮统计。
-pub fn sync_once(conn: &Connection, api: &dyn ServerApi) -> AppResult<SyncReport> {
-    let mut report = SyncReport::default();
+/// `Db` 是**唯一**的 `LocalStore` 实现。
+///
+/// 刻意不为 `Connection` 实现它：那样调用方就能一边握着 guard 一边同步，
+/// 把"网络期间持锁"重新引回来 —— 而且是死锁，不是变慢。
+impl LocalStore for Db {
+    fn take_pending_batch(&self, limit: i64) -> AppResult<Vec<Change>> {
+        let conn = self.conn()?;
+        pending_changes(&conn, limit)
+    }
 
-    // ---- 推 ----
-    let outgoing = pending_changes(conn, BATCH)?;
-    if !outgoing.is_empty() {
-        report.pushed = outgoing.len();
-        let resp = api.push(&outgoing)?;
+    fn commit_push_result(&self, sent: &[Change], resp: &PushResponse) -> AppResult<usize> {
+        let conn = self.conn()?;
+        let mut conflicts = 0;
 
         // 被判负的变更：服务端把胜出的版本回传给我们，落下来。
-        // 注意这里是 apply_one 而不是直接覆盖 —— 本地那一版如果从未上传过，
+        // 注意这里走 apply_one 而不是直接覆盖 —— 本地那一版如果从未上传过，
         // 会先被存成冲突副本。
         for outcome in &resp.results {
             if outcome.accepted {
                 continue;
             }
             if let Some(winner) = &outcome.winner {
-                let a = apply_one(conn, winner)?;
-                if a.conflict_copy {
-                    report.conflicts += 1;
+                if apply_one(&conn, winner)?.conflict_copy {
+                    conflicts += 1;
                 }
             }
         }
 
-        clear_dirty(conn, &outgoing)?;
+        clear_dirty(&conn, sent)?;
+        Ok(conflicts)
     }
 
-    // ---- 拉 ----
-    let mut since = cursor(conn)?;
-    loop {
-        let resp = api.pull(since, BATCH)?;
-        for c in &resp.changes {
-            let a = apply_one(conn, c)?;
+    fn current_cursor(&self) -> AppResult<i64> {
+        let conn = self.conn()?;
+        cursor(&conn)
+    }
+
+    fn commit_pull_batch(&self, changes: &[Change], new_cursor: i64) -> AppResult<ApplyCount> {
+        let conn = self.conn()?;
+        let mut out = ApplyCount::default();
+
+        for c in changes {
+            let a = apply_one(&conn, c)?;
             if a.applied {
-                report.pulled += 1;
+                out.applied += 1;
             }
             if a.conflict_copy {
-                report.conflicts += 1;
+                out.conflicts += 1;
             }
         }
 
         // 即使一条都没应用也要推进游标：那些变更确实已经"看过了"，
         // 反复拉同一批只会原地打转。
-        if resp.cursor > since {
-            since = resp.cursor;
-            set_cursor(conn, since)?;
+        if new_cursor > cursor(&conn)? {
+            set_cursor(&conn, new_cursor)?;
         }
+
+        Ok(out)
+    }
+}
+
+/// 推一次、拉干净。返回本轮统计。
+///
+/// **网络调用一律发生在两次 `LocalStore` 调用之间** —— 那是锁被放开的时刻。
+/// 这条性质由 `the_database_is_not_locked_while_the_network_is_busy` 守着。
+pub fn sync_once(store: &dyn LocalStore, api: &dyn ServerApi) -> AppResult<SyncReport> {
+    let mut report = SyncReport::default();
+
+    // ---- 推 ----
+    let outgoing = store.take_pending_batch(BATCH)?; // 锁：读 ─┐
+    if !outgoing.is_empty() {
+        report.pushed = outgoing.len();
+        let resp = api.push(&outgoing)?; // 无锁 ◄──────────────┘
+        report.conflicts += store.commit_push_result(&outgoing, &resp)?; // 锁：写
+    }
+
+    // ---- 拉 ----
+    let mut since = store.current_cursor()?; // 锁：读
+    loop {
+        let resp = api.pull(since, BATCH)?; // 无锁 ◄────────────┐
+        let a = store.commit_pull_batch(&resp.changes, resp.cursor)?; // 锁：写 ─┘
+        report.pulled += a.applied;
+        report.conflicts += a.conflicts;
+
+        since = since.max(resp.cursor);
 
         if resp.changes.is_empty() || !resp.has_more {
             break;
@@ -670,7 +739,8 @@ pub fn sync_once(conn: &Connection, api: &dyn ServerApi) -> AppResult<SyncReport
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use messagenote_core::wire::PushOutcome;
 
@@ -776,11 +846,13 @@ mod tests {
     }
 
     /// 反复同步直到双方都不再有变化。收敛测试必须先跑到静止。
+    ///
+    /// 注意这里**不持有 `db.conn()`** —— `sync_once` 自己按需加锁。
+    /// 握着 guard 调它是死锁，不是变慢。
     fn sync_until_quiet(db: &Db, server: &dyn ServerApi) -> SyncReport {
-        let conn = db.conn().unwrap();
         let mut total = SyncReport::default();
         for _ in 0..40 {
-            let r = sync_once(&conn, server).expect("同步失败");
+            let r = sync_once(db, server).expect("同步失败");
             total.pushed += r.pushed;
             total.pulled += r.pulled;
             total.conflicts += r.conflicts;
@@ -1021,17 +1093,22 @@ mod tests {
     fn pushing_the_same_change_twice_is_idempotent() {
         let server = MemoryServer::new();
         let a = device("device-a");
-        let conn = a.conn().unwrap();
-        db::append_message(&conn, "只此一条", None).unwrap();
+        {
+            let conn = a.conn().unwrap();
+            db::append_message(&conn, "只此一条", None).unwrap();
+        }
 
-        let first = sync_once(&conn, &server).unwrap();
+        let first = sync_once(&a, &server).unwrap();
         assert!(first.pushed > 0);
 
         // 强行把 dirty 再置起来，模拟"网络超时后客户端重试"
-        conn.execute("UPDATE message SET dirty = 1", []).unwrap();
-        let second = sync_once(&conn, &server).unwrap();
+        {
+            let conn = a.conn().unwrap();
+            conn.execute("UPDATE message SET dirty = 1", []).unwrap();
+        }
+        let second = sync_once(&a, &server).unwrap();
 
-        let snap = snapshot(&conn);
+        let snap = snapshot(&a.conn().unwrap());
         assert_eq!(
             snap.iter().filter(|s| s.starts_with("message|")).count(),
             1,
@@ -1223,6 +1300,122 @@ mod tests {
         assert_eq!(bodies[0], "B 的版本");
     }
 
+    // ------------------------------------------------ 锁的粒度
+
+    /// 一个会反过来检查"本地库此刻能不能被打开"的假服务端。
+    ///
+    /// 它站在网络的另一端：每次收到请求，就回头敲一下本地数据库的门。
+    /// 门开不开，直接反映同步线程有没有把锁攥在手里。
+    struct LockProbingServer {
+        db: Arc<Db>,
+        probes: AtomicUsize,
+    }
+
+    impl LockProbingServer {
+        fn new(db: &Arc<Db>) -> Self {
+            Self {
+                db: Arc::clone(db),
+                probes: AtomicUsize::new(0),
+            }
+        }
+
+        /// 站在"网络另一端"回头看一眼本地库能不能被打开。
+        fn probe(&self) -> AppResult<()> {
+            let conn = self.db.try_conn().ok_or_else(|| {
+                AppError::Msg("网络往返期间数据库锁仍被同步线程持有 —— 界面上的写入会卡住".into())
+            })?;
+            // 真读一次，确认拿到的是能用的连接，而不只是"锁没被占"
+            conn.query_row("SELECT COUNT(*) FROM message", [], |r| r.get::<_, i64>(0))?;
+            self.probes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    impl ServerApi for LockProbingServer {
+        fn push(&self, changes: &[Change]) -> AppResult<PushResponse> {
+            self.probe()?;
+            Ok(PushResponse {
+                results: changes
+                    .iter()
+                    .map(|c| PushOutcome {
+                        kind: c.kind,
+                        id: c.id.clone(),
+                        accepted: true,
+                        winner: None,
+                    })
+                    .collect(),
+            })
+        }
+
+        fn pull(&self, since: i64, _limit: i64) -> AppResult<PullResponse> {
+            self.probe()?;
+            Ok(PullResponse {
+                changes: Vec::new(),
+                cursor: since,
+                has_more: false,
+            })
+        }
+    }
+
+    /// **同步引擎最要紧的一条结构性质：网络往返期间不持有数据库锁。**
+    ///
+    /// 锁要是被同步线程占着，`try_conn` 直接给 `None`，测试立刻红；
+    /// 而在真实使用中，同一个退化只会表现成"用户打字卡住 4 到 30 秒"——
+    /// 一种没有任何告警、也没人会去查的现象。
+    ///
+    /// 刻意用 `try_conn` 而不是 `conn`：一旦有人把锁的粒度退回去，
+    /// 这个测试必须是**失败**，不能是**挂起**。挂起的测试会被当成"跑得慢"。
+    #[test]
+    fn the_database_is_not_locked_while_the_network_is_busy() {
+        let db = Arc::new(device("device-lock-probe"));
+        {
+            let conn = db.conn().unwrap();
+            db::append_message(&conn, "触发一次推送", None).unwrap();
+        }
+
+        let server = LockProbingServer::new(&db);
+        let report = sync_once(&*db, &server).expect("网络期间不该有人持着数据库锁");
+
+        assert!(report.pushed > 0, "测试不能空跑：必须有东西被推出去");
+        assert!(
+            server.probes.load(Ordering::SeqCst) >= 2,
+            "推送和拉取都必须各自在网络里探测过一次"
+        );
+    }
+
+    /// 反向验证：探针本身必须真的能发现"被占住的锁"。
+    ///
+    /// **没有这一条，上面那个测试可能因为探针失灵而永远绿。**
+    /// 一个永远绿的守卫测试比没有测试更糟 —— 它让人以为性质已经被守住了。
+    ///
+    /// 顺带钉死两条语义：锁被占时**立刻返回 `None`**（不是阻塞等待），
+    /// 以及放开之后又能正常拿到。
+    #[test]
+    fn the_lock_probe_detects_a_held_lock() {
+        let db = Arc::new(device("device-lock-probe-negative"));
+        let server = LockProbingServer::new(&db);
+
+        server.probe().expect("没人持锁时探针不该报错");
+
+        // 锁被占住 —— 这正是"网络期间持锁"退化以后的样子
+        let guard = db.conn().unwrap();
+        let err = server
+            .probe()
+            .expect_err("锁被占住时探针必须失败，而不是挂在那里等");
+        assert!(
+            err.to_string().contains("数据库锁"),
+            "错误信息要让人一眼看出是锁的问题：{err}"
+        );
+        drop(guard);
+
+        server.probe().expect("锁放开后又该正常了");
+        assert_eq!(
+            server.probes.load(Ordering::SeqCst),
+            2,
+            "只有两次成功的探测该被计数"
+        );
+    }
+
     /// 用随机操作序列压同步逻辑。
     ///
     /// 同步的 bug 几乎都藏在操作组合里，写死的用例覆盖不到 ——
@@ -1286,8 +1479,7 @@ mod tests {
             // 有一定概率同步其中一台，制造"两边进度不一致"的真实时序
             if rng.below(3) == 0 {
                 let syncer: &Db = if rng.next() % 2 == 0 { &a } else { &b };
-                let conn = syncer.conn().unwrap();
-                let _ = sync_once(&conn, &server).unwrap();
+                let _ = sync_once(syncer, &server).unwrap();
             }
         }
 

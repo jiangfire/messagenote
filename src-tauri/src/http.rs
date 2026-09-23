@@ -15,11 +15,13 @@ use messagenote_core::wire::{
 use crate::error::{AppError, AppResult};
 use crate::sync::ServerApi;
 
-/// 连接超时。同步全程持有数据库锁，这个值直接决定"服务端不可达时
-/// 界面会卡多久"，所以宁可短。
+/// 连接超时。服务端不可达时，后台同步线程会卡这么久才报错。
+/// 但它**卡不住界面** —— 网络往返期间不持有数据库锁（见 `sync::LocalStore`），
+/// 所以这个值只影响"多久看到失败提示"，不再决定用户打字会不会顿。
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// 整体超时兜底：防止对端"连上了但不说话"把同步线程永久挂住。
+/// 同理，它只占用后台线程，不占用数据库锁。
 const OVERALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct HttpServerApi {
