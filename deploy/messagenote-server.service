@@ -1,0 +1,46 @@
+[Unit]
+Description=MessageNote 同步服务端
+Documentation=https://github.com/your/messagenote
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=messagenote
+Group=messagenote
+WorkingDirectory=/var/lib/messagenote
+
+# 令牌放在单独的文件里，**不要**写进 unit：
+# unit 的内容任何能跑 `systemctl cat` 的人都能看到。
+# 文件内容形如：MESSAGENOTE_TOKEN=至少32个字符的随机串
+EnvironmentFile=/etc/messagenote.env
+Environment=MESSAGENOTE_DB=/var/lib/messagenote/messagenote-server.sqlite
+# 只监听环回，由前面的 Caddy 终结 TLS 并转发过来
+Environment=MESSAGENOTE_BIND=127.0.0.1:8787
+Environment=RUST_LOG=info
+
+ExecStart=/usr/local/bin/messagenote-server
+Restart=always
+RestartSec=3
+
+# ---- 加固 ----
+# 这个进程只需要：读自己的二进制、读写一个目录、监听一个端口。
+# 其余能力一律收回。
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+# 唯一需要写的地方
+ReadWritePaths=/var/lib/messagenote
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,50 @@
+# MessageNote 同步服务端的 Caddy 配置
+#
+# 服务端自己**只说 HTTP 明文**、且默认只绑 127.0.0.1。
+# TLS 全部由 Caddy 终结 —— 这样证书申请、续期、HTTP/2 这些都不用自己写。
+#
+# 把 notes.example.com 换成你自己的域名，然后：
+#   caddy reload --config /etc/caddy/Caddyfile
+
+notes.example.com {
+	# 笔记正文是文本，压缩收益很高
+	encode zstd gzip
+
+	# 反代到只监听环回的服务端
+	reverse_proxy 127.0.0.1:8787
+
+	header {
+		# 这个服务只应该通过 HTTPS 访问，别让浏览器有降级的机会
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		# 不要对外暴露服务端软件信息
+		-Server
+	}
+
+	log {
+		output file /var/log/caddy/messagenote.log
+	}
+}
+
+# ---------------------------------------------------------------- 限流
+#
+# 这个服务的鉴权只有一个静态令牌，公网上必然会被扫描和爆破。
+# **强烈建议**装上限流插件（官方 Caddy 不带 rate_limit）：
+#
+#   xcaddy build --with github.com/mholt/caddy-ratelimit
+#
+# 然后在上面的站点块里加上：
+#
+#	rate_limit {
+#		zone auth {
+#			match {
+#				path /api/sync/*
+#			}
+#			key {remote_host}
+#			events 30
+#			window 1m
+#		}
+#	}
+#
+# 另外，令牌至少 32 个字符（服务端启动时会强制检查），
+# 这样即便被无限次尝试也不可能撞出来。

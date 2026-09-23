@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/server", "src-tauri"]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+
+[workspace.dependencies]
+messagenote-core = { path = "crates/core" }
+
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+
+# v7：UUID 按时间单调递增，客户端离线也能自己生成排序友好的主键
+uuid = { version = "1.20", features = ["v7"] }
+
+# bundled：把 SQLite 源码一起编译，保证 FTS5 一定可用，
+# 且不依赖目标机器上有没有 sqlite3.dll
+rusqlite = { version = "0.40", features = ["bundled"] }
+
+# 注意：profile 必须定义在 workspace 根，成员 crate 里写了会被忽略。
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

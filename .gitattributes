@@ -1,0 +1,17 @@
+# 统一换行符：仓库里一律存 LF，检出时也保持 LF。
+#
+# 不加这个的话，git 会对每个文本文件报 "LF will be replaced by CRLF" 警告，
+# 而且在 Windows / macOS 之间协作时，换行符差异会产生整文件级的假 diff ——
+# 一次改动看起来像"整个文件都改了"，把真正的改动淹掉。
+#
+# 纯 Windows 项目本来可以不管，但统一成 LF 的成本是零，收益是以后再也不用想这件事。
+* text=auto eol=lf
+
+# 二进制文件明确标出来，避免任何换行处理
+*.png binary
+*.ico binary
+*.icns binary
+*.exe binary
+*.sqlite binary
+*.sqlite-wal binary
+*.sqlite-shm binary

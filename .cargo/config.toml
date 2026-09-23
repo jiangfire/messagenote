@@ -1,0 +1,18 @@
+# 项目级 cargo 配置。
+#
+# 这个文件在项目根目录下会被 cargo 自动读取（无论 CARGO_HOME 指向哪里），
+# 所以拉下来就自带国内镜像，不需要各自去改 ~/.cargo/config.toml。
+#
+# 注意：CARGO_HOME 本身不能用配置文件指定，它是纯环境变量。
+# 在受限沙箱里开发时可能需要在命令行上临时把它指到工作区内，
+# 详见 README 的「开发环境注意事项」。
+
+[source.crates-io]
+replace-with = 'aliyun'
+
+[source.aliyun]
+registry = "sparse+https://mirrors.aliyun.com/crates.io-index/"
+
+[net]
+# 走 git CLI 拉取依赖，绕开 libgit2 在某些企业网络/代理下的证书问题
+git-fetch-with-cli = true

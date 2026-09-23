@@ -1,0 +1,38 @@
+/* 主题变量单独抽出来，让主窗口和捕获浮层共用同一套配色。
+   浮层是独立入口（capture.html），如果各自复制一份变量，
+   迟早会出现"深色模式下浮层还是浅色"这类不一致。 */
+
+:root {
+  --bg: #f6f6f9;
+  --panel: #ffffff;
+  --panel-2: #fafafc;
+  --border: #e7e7ee;
+  --text: #1b1b22;
+  --muted: #8b8b9c;
+  --accent: #4f46e5;
+  --accent-soft: #eef0ff;
+  --bubble: #ffffff;
+  --danger: #dc2626;
+  --shadow: 0 1px 2px rgba(20, 20, 40, 0.05), 0 4px 14px rgba(20, 20, 40, 0.04);
+  --shadow-pop: 0 18px 50px rgba(15, 15, 35, 0.26), 0 2px 8px rgba(15, 15, 35, 0.12);
+  --radius: 12px;
+  --font: "Segoe UI", "Microsoft YaHei UI", "PingFang SC", system-ui, sans-serif;
+  --mono: "Cascadia Code", "JetBrains Mono", Consolas, monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0e0e13;
+    --panel: #16161d;
+    --panel-2: #1b1b23;
+    --border: #272730;
+    --text: #e8e8f0;
+    --muted: #8d8da3;
+    --accent: #818cf8;
+    --accent-soft: #23233a;
+    --bubble: #1d1d26;
+    --danger: #f87171;
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 6px 20px rgba(0, 0, 0, 0.3);
+    --shadow-pop: 0 18px 50px rgba(0, 0, 0, 0.6), 0 2px 8px rgba(0, 0, 0, 0.4);
+  }
+}

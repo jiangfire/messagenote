@@ -1,0 +1,38 @@
+[package]
+name = "messagenote"
+version.workspace = true
+edition.workspace = true
+description = "聊天框式本地优先笔记 —— 零摩擦捕获，事后组织"
+# 注意：这里不要写 rust-version。
+# 一旦声明了偏低的 MSRV，cargo 的 MSRV 感知解析会「向下兼容」地
+# 挑到 Tauri v1 甚至预发布版本，而不是最新的稳定版。
+
+[lib]
+# Tauri v2 约定：业务逻辑放在 lib 里，main.rs 只做一层薄壳。
+# 这样后续要接移动端 / 集成测试时不用改动业务代码。
+name = "messagenote_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+# profile 定义在 workspace 根，见仓库根目录的 Cargo.toml
+
+[dependencies]
+messagenote-core = { workspace = true }
+
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-global-shortcut = "2"
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+rusqlite = { workspace = true }
+uuid = { workspace = true }
+ureq = { version = "3.4.2", features = ["json"] }
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dev-dependencies]
+# 端到端测试会在一份进程里把**真实的** axum 服务端跑起来，
+# 让两个真实的客户端库通过真实 HTTP 同步。
+messagenote-server = { path = "../crates/server" }
+tokio = { version = "1", features = ["rt-multi-thread", "net"] }

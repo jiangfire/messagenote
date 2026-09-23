@@ -1,0 +1,27 @@
+[package]
+name = "messagenote-server"
+version.workspace = true
+edition.workspace = true
+description = "MessageNote 同步服务端"
+
+# 同时提供 lib 和 bin：
+# lib 让端到端测试能在一个进程里把真实的 axum 服务端跑起来，
+# 不必去 spawn 二进制、也不必占固定端口。
+[lib]
+name = "messagenote_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "messagenote-server"
+path = "src/main.rs"
+
+[dependencies]
+axum = "0.8.9"
+messagenote-core = { workspace = true }
+rusqlite = { workspace = true, features = ["bundled"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

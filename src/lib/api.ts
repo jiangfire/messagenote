@@ -1,0 +1,111 @@
+import { invoke } from "@tauri-apps/api/core";
+import type {
+  Channel,
+  Cursor,
+  HealthResponse,
+  Message,
+  MessagePage,
+  SearchHit,
+  SyncConfig,
+  SyncStatus,
+  TagCount,
+  TimelineStats,
+} from "./types";
+
+/**
+ * 对 Tauri 命令的类型化封装。
+ *
+ * 集中在这里的唯一理由：命令名和参数名一旦拼错，报错只会出现在运行时，
+ * 而 TypeScript 拦不住裸字符串。收拢成一层后，全应用只有这一个文件可能写错。
+ *
+ * 注意：Tauri v2 会把 Rust 侧的 snake_case 参数名映射成 camelCase，
+ * 所以这里传的是 channelId 而不是 channel_id。
+ */
+export const api = {
+  listChannels: () => invoke<Channel[]>("list_channels"),
+
+  createChannel: (name: string) => invoke<Channel>("create_channel", { name }),
+
+  renameChannel: (id: string, name: string) =>
+    invoke<void>("rename_channel", { id, name }),
+
+  deleteChannel: (id: string) => invoke<void>("delete_channel", { id }),
+
+  /**
+   * 时间线查询。`scope` 取 `"all"` / `"unfiled"` / `"channel"` / `"tag"`。
+   *
+   * `before` 是**往前翻**的游标，必须同时带 `createdAt` 和 `id`：
+   * 只给时间戳会在同一毫秒内的多条消息处漏掉整批记录，
+   * 而且不报错——只是往前翻的时候有东西不见了。
+   */
+  listTimeline: (
+    scope: "all" | "unfiled" | "channel" | "tag",
+    target: { channelId?: string; tag?: string },
+    limit?: number,
+    before?: Cursor | null
+  ) =>
+    invoke<MessagePage>("list_timeline", {
+      scope,
+      channelId: target.channelId ?? null,
+      tag: target.tag ?? null,
+      limit: limit ?? null,
+      beforeCreatedAt: before?.createdAt ?? null,
+      beforeId: before?.id ?? null,
+    }),
+
+  /** 侧边栏的两个计数。 */
+  timelineStats: () => invoke<TimelineStats>("timeline_stats"),
+
+  appendMessage: (body: string, channelId: string | null) =>
+    invoke<Message>("append_message", { body, channelId }),
+  updateMessage: (id: string, body: string) =>
+    invoke<Message>("update_message", { id, body }),
+
+  deleteMessage: (id: string) => invoke<void>("delete_message", { id }),
+
+  moveMessage: (id: string, channelId: string) =>
+    invoke<void>("move_message", { id, channelId }),
+
+  searchMessages: (query: string, limit?: number) =>
+    invoke<SearchHit[]>("search_messages", { query, limit: limit ?? null }),
+
+  listTags: () => invoke<TagCount[]>("list_tags"),
+
+  setMessageTags: (messageId: string, tags: string[]) =>
+    invoke<void>("set_message_tags", { messageId, tags }),
+
+  /** 收起捕获浮层。走 Rust 侧命令，保证"如何收起"只有一个实现。 */
+  hideCapture: () => invoke<void>("hide_capture"),
+
+  // ------------------------------------------------------------ 同步
+
+  getSyncConfig: () => invoke<SyncConfig>("get_sync_config"),
+
+  setSyncConfig: (url: string, token: string) =>
+    invoke<void>("set_sync_config", { url, token }),
+
+  /** 请求立刻同步一次。命令立刻返回，结果通过 `sync://status` 事件推上来。 */
+  syncNow: () => invoke<void>("sync_now"),
+
+  /**
+   * 最近一次同步的结果。
+   *
+   * 挂载时必须主动读一次：后台线程在应用启动时就会同步一次，
+   * 那一刻前端往往还没注册好事件监听器，只靠监听会漏掉它。
+   */
+  getSyncStatus: () => invoke<SyncStatus | null>("get_sync_status"),
+
+  /**
+   * 测试连接。注意它打的是**鉴权过的** handshake 端点，
+   * 所以令牌不对时会明确失败 —— 而不是给出"连接成功"的假象。
+   */
+  testSyncConnection: (url: string, token: string) =>
+    invoke<HealthResponse>("test_sync_connection", { url, token }),
+};
+
+/** 把后端抛出的错误整理成能直接显示的一句话。 */
+export function errorText(e: unknown): string {
+  if (typeof e === "string") return e;
+  if (e instanceof Error) return e.message;
+  return String(e);
+}

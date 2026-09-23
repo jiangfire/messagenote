@@ -1,0 +1,58 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "MessageNote",
+  "version": "1.0.0",
+  "identifier": "com.messagenote.desktop",
+  "build": {
+    "beforeDevCommand": "pnpm dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "pnpm build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "MessageNote",
+        "width": 1120,
+        "height": 800,
+        "minWidth": 720,
+        "minHeight": 480,
+        "resizable": true,
+        "center": true
+      },
+      {
+        "label": "capture",
+        "title": "快速记录",
+        "url": "capture.html",
+        "width": 680,
+        "height": 108,
+        "resizable": false,
+        "decorations": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "visible": false,
+        "focus": false,
+        "center": false,
+        "shadow": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "publisher": "MessageNote",
+    "category": "Productivity",
+    "shortDescription": "聊天框式本地优先笔记",
+    "longDescription": "零摩擦捕获、事后整理的个人笔记应用。全局快捷键唤起捕获浮层，内容落到时间线，按频道归档、按标签横切。支持自建服务端的多设备同步。",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.ico"
+    ]
+  }
+}

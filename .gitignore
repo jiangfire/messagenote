@@ -1,0 +1,34 @@
+# 依赖与构建产物
+node_modules/
+dist/
+# pnpm 把 store 放在项目所在盘上，工作区根下会冒出这个目录（几万个文件）
+.pnpm-store/
+# 用了 Cargo workspace，构建目录在仓库根，客户端与服务端共享编译缓存
+/target/
+src-tauri/target/
+
+# 项目本地 CARGO_HOME（沙箱适配，见 .cargo/config.toml 顶部说明）
+# 用"全部忽略再放行一个"而不是逐个列：cargo 会在里面放好几类缓存
+# （registry / .global-cache / .package-cache / .package-cache-mutate …），
+# 逐个列一定会漏。唯一需要进仓库的就是那个 config.toml。
+.cargo/*
+!.cargo/config.toml
+
+# 临时验证目录
+.scratch/
+
+# 本地数据库（开发期数据，绝不入库）
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+.dev-data/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log
+
+# tauri-build 每次构建都会重新生成的 capability schema
+src-tauri/gen/

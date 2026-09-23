@@ -1,0 +1,118 @@
+/* 捕获浮层的样式。
+ *
+ * 关于「为什么是方的」——这是一个有意的取舍，不要随手加回圆角：
+ *
+ * 浮层最初用的是 transparent:true + 圆角面板。但在本机实测发现，
+ * 屏幕合成结果里窗口四角是纯黑（#000000），圆角会变成黑方块露在桌面上。
+ * 更麻烦的是：这个环境里**两种截图手段都无法可信地判断透明是否生效** ——
+ * PrintWindow 抓不到分层窗口的 alpha（报不透明纯黑），
+ * 而 BitBlt 系（CopyFromScreen）对 DWM/DirectComposition 合成的内容本就不保证正确。
+ *
+ * 所以这里选了**能被验证**的方案：窗口不透明，整块窗口就是面板本身 ——
+ * 不留外边距、不画圆角、不画外阴影，杜绝任何"露出底色方块"的可能。
+ * 视觉上的"输入态"靠顶部那条 accent 强调线来表达。
+ *
+ * 如果你的机器上透明是正常的，想换回圆角，改动很小：
+ * 在 tauri.conf.json 的 capture 窗口加 "transparent": true，
+ * 并把下面 html/body 的 background 改成 transparent、给 .cap-shell 加回 padding。
+ */
+
+@import "../theme.css";
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: var(--panel);
+  overflow: hidden;
+  font-family: var(--font);
+  font-size: 14px;
+  color: var(--text);
+  /* 浮层整体不参与文本选择，只有输入框例外 —— 否则误拖会选中边框文字 */
+  user-select: none;
+}
+
+#root,
+.cap-shell {
+  display: block;
+}
+
+/* 整块窗口即面板，所以这里只负责内边距和"输入态"的那条强调线 */
+.cap-panel {
+  border-top: 3px solid var(--accent);
+  padding: 12px 16px 8px;
+}
+
+.cap-input {
+  display: block;
+  width: 100%;
+  border: 0;
+  outline: none;
+  resize: none;
+  background: transparent;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 17px;
+  line-height: 1.5;
+  overflow-y: auto;
+  user-select: text;
+}
+
+.cap-input::placeholder {
+  color: var(--muted);
+}
+
+.cap-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 6px;
+  font-size: 11.5px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.cap-keys {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.cap-target {
+  flex: none;
+  opacity: 0.75;
+}
+
+.cap-error {
+  flex: none;
+  max-width: 46%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--danger);
+}
+
+kbd {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  padding: 1px 5px;
+  border: 1px solid var(--border);
+  border-bottom-width: 2px;
+  border-radius: 5px;
+  background: var(--panel-2);
+}
+
+/* 浮层里的滚动条要更细，否则在这个小尺寸下非常抢眼 */
+::-webkit-scrollbar {
+  width: 8px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
