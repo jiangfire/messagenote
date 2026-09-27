@@ -171,7 +171,10 @@ export async function pressEnter(s, selector) {
 
 export async function screenshot(s, path) {
   const r = await s.send("Page.captureScreenshot", { format: "png" });
-  const { writeFile } = await import("node:fs/promises");
+  const { writeFile, mkdir } = await import("node:fs/promises");
+  const { dirname } = await import("node:path");
+  // writeFile 不会自动建父目录 —— 不建的话第一次跑就 ENOENT
+  await mkdir(dirname(path), { recursive: true });
   await writeFile(path, Buffer.from(r.data, "base64"));
   return path;
 }

@@ -17,6 +17,9 @@ src-tauri/target/
 # 临时验证目录
 .scratch/
 
+# 浏览器端到端测试的截图（跑一次就重新生成，见 scripts/web-e2e/README.md）
+scripts/web-e2e/shots/
+
 # 本地数据库（开发期数据，绝不入库）
 *.sqlite
 *.sqlite-wal
