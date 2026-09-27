@@ -60,20 +60,10 @@ pub fn list_timeline(
     let conn = db.conn()?;
     let cursor = cursor_from(before_created_at, before_id);
 
-    let scope = match scope.as_str() {
-        "all" => db::Scope::All,
-        "unfiled" => db::Scope::Unfiled,
-        "channel" => db::Scope::Channel(channel_id.as_deref().ok_or_else(|| {
-            AppError::Msg("scope=channel 时必须提供 channel_id".into())
-        })?),
-        "tag" => db::Scope::Tag(
-            tag.as_deref()
-                .ok_or_else(|| AppError::Msg("scope=tag 时必须提供 tag".into()))?,
-        ),
-        other => {
-            return Err(AppError::Msg(format!("未知的时间线范围：{other}")));
-        }
-    };
+    // 解析规则住在共享存储层，服务端 API 用的也是同一份 —— 两边各写一个
+    // match 的话，"unfiled" 在哪一边改了含义，另一边只会静默地换内容。
+    let scope = db::Scope::parse(&scope, channel_id.as_deref(), tag.as_deref())
+        .map_err(|e| AppError::Msg(e.to_string()))?;
 
     Ok(db::list_messages(&conn, scope, limit.unwrap_or(120), cursor.as_ref())?)
 }

@@ -112,3 +112,36 @@ pub struct HealthResponse {
     pub protocol: u32,
     pub server_time_ms: i64,
 }
+
+/// `GET /api/timeline` 的查询参数。
+///
+/// 放在线缆协议里而不是服务端本地类型，是因为**网页端也要构造它**。
+/// 参数名各写一份的话，前端发 `channelId` 而服务端读 `channel_id`
+/// 会静默地退化成"全部消息"—— 不报错，只是筛选没生效。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TimelineQuery {
+    /// `"all"` / `"unfiled"` / `"channel"` / `"tag"`
+    pub scope: String,
+    #[serde(default)]
+    pub channel_id: Option<String>,
+    #[serde(default)]
+    pub tag: Option<String>,
+    #[serde(default)]
+    pub limit: Option<i64>,
+    /// 往前翻的游标。**两个字段必须一起给** —— 只给时间戳等于退回单键游标，
+    /// 会在同一毫秒的兄弟行处整批漏掉记录。
+    #[serde(default)]
+    pub before_created_at: Option<i64>,
+    #[serde(default)]
+    pub before_id: Option<String>,
+}
+
+/// `GET /api/search` 的查询参数。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchQuery {
+    pub q: String,
+    #[serde(default)]
+    pub limit: Option<i64>,
+}

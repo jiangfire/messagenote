@@ -1,9 +1,20 @@
 //! HTTP 接口层。
 //!
-//! 只有三个端点：
-//! - `GET  /api/health`      探活（不需要 token，泄露的信息为零）
-//! - `GET  /api/sync/pull`   拉取变更
-//! - `POST /api/sync/push`   推送变更
+//! 同步（桌面端用）：
+//! - `GET  /api/health`         探活（不需要 token，泄露的信息为零）
+//! - `GET  /api/sync/handshake` 鉴权过的握手
+//! - `GET  /api/sync/pull`      拉取变更
+//! - `POST /api/sync/push`      推送变更
+//!
+//! 读取（网页端用）：
+//! - `GET  /api/timeline`        时间线，scope + 键集游标
+//! - `GET  /api/timeline/stats`  侧边栏那两个计数
+//! - `GET  /api/channels`
+//! - `GET  /api/tags`
+//! - `GET  /api/search`
+//!
+//! 这些读取全部走 `messagenote-store`，和桌面端是**同一份**查询实现 ——
+//! 网页端看到的不是"另一个长得像的时间线"。
 //!
 //! 刻意用朴素的 REST 而不是 WebSocket：同步是"客户端主动推拉"的模型，
 //! REST 更好调试（curl 就能复现问题），而实时推送（SSE）等 S4 再说。
@@ -18,9 +29,12 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 
 use messagenote_core::hlc::now_ms;
+use messagenote_core::models::{Channel, MessagePage, SearchHit, TagCount, TimelineStats};
 use messagenote_core::wire::{
-    HealthResponse, PullQuery, PullResponse, PushRequest, PushResponse, PROTOCOL_VERSION,
+    HealthResponse, PullQuery, PullResponse, PushRequest, PushResponse, SearchQuery, TimelineQuery,
+    PROTOCOL_VERSION,
 };
+use messagenote_store::{Cursor, Scope};
 
 use crate::error::{ServerError, ServerResult};
 use crate::store::Store;
@@ -28,6 +42,13 @@ use crate::store::Store;
 /// 单批变更数上限。防止一次请求把内存吃满（这个服务面向公网，
 /// 不能假设请求方一定是自己的客户端）。
 const MAX_BATCH: usize = 1000;
+
+/// 时间线一页的默认条数。和桌面端 `list_timeline` 的默认值对齐 ——
+/// 同一个时间线在两端翻页的手感不该不一样。
+const DEFAULT_TIMELINE_LIMIT: i64 = 120;
+
+/// 检索默认条数。同样和桌面端对齐。
+const DEFAULT_SEARCH_LIMIT: i64 = 60;
 
 pub struct AppState {
     pub store: Store,
@@ -40,6 +61,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/sync/handshake", get(handshake))
         .route("/api/sync/pull", get(pull))
         .route("/api/sync/push", post(push))
+        .route("/api/timeline", get(timeline))
+        .route("/api/timeline/stats", get(timeline_stats))
+        .route("/api/channels", get(channels))
+        .route("/api/tags", get(tags))
+        .route("/api/search", get(search))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_token,
@@ -118,12 +144,70 @@ async fn push(
     Json(req): Json<PushRequest>,
 ) -> ServerResult<Json<PushResponse>> {
     if req.changes.len() > MAX_BATCH {
-        return Err(ServerError::Msg(format!(
+        return Err(ServerError::BadRequest(format!(
             "单批变更数 {} 超过上限 {MAX_BATCH}",
             req.changes.len()
         )));
     }
     Ok(Json(state.store.push(&req.changes)?))
+}
+
+// ---------------------------------------------------------------- 读取
+
+/// 解析筛选范围。规则来自共享存储层，桌面端命令层用的是同一份。
+fn scope_of(q: &TimelineQuery) -> ServerResult<Scope<'_>> {
+    Scope::parse(&q.scope, q.channel_id.as_deref(), q.tag.as_deref())
+        .map_err(|e| ServerError::BadRequest(e.to_string()))
+}
+
+/// `beforeCreatedAt` 和 `beforeId` **必须一起给**。
+///
+/// 只给时间戳等于退回单键游标：同一毫秒内写入的多条会被整批跳过，
+/// 往前翻时凭空少掉一段，而且不报错。
+fn cursor_of(q: &TimelineQuery) -> Option<Cursor> {
+    match (&q.before_created_at, &q.before_id) {
+        (Some(created_at), Some(id)) => Some(Cursor {
+            created_at: *created_at,
+            id: id.clone(),
+        }),
+        _ => None,
+    }
+}
+
+async fn timeline(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<TimelineQuery>,
+) -> ServerResult<Json<MessagePage>> {
+    let scope = scope_of(&q)?;
+    let cursor = cursor_of(&q);
+    Ok(Json(state.store.list_messages(
+        scope,
+        q.limit.unwrap_or(DEFAULT_TIMELINE_LIMIT),
+        cursor.as_ref(),
+    )?))
+}
+
+async fn timeline_stats(State(state): State<Arc<AppState>>) -> ServerResult<Json<TimelineStats>> {
+    Ok(Json(state.store.timeline_stats()?))
+}
+
+async fn channels(State(state): State<Arc<AppState>>) -> ServerResult<Json<Vec<Channel>>> {
+    Ok(Json(state.store.list_channels()?))
+}
+
+async fn tags(State(state): State<Arc<AppState>>) -> ServerResult<Json<Vec<TagCount>>> {
+    Ok(Json(state.store.list_tags()?))
+}
+
+async fn search(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<SearchQuery>,
+) -> ServerResult<Json<Vec<SearchHit>>> {
+    Ok(Json(
+        state
+            .store
+            .search(&q.q, q.limit.unwrap_or(DEFAULT_SEARCH_LIMIT))?,
+    ))
 }
 
 #[cfg(test)]

@@ -75,14 +75,34 @@
 
 验收：桌面端 `db.rs` 里那些浏览测试**一行没改**仍然全绿。
 
-#### ② 服务端补 FTS 索引 + 只读 API
+#### ② 服务端补 FTS 索引 + 只读 API ✅
 
-- 服务端建自己的 `message_fts`，复用 `core::search::to_index_text`。
-  **索引维护必须和 `upsert()` 在同一个事务里** —— 分开写会让索引和数据静默漂移，
-  表现成"搜得到但点不开"。
-- 现有数据要能回填。
-- 新增 `GET /api/timeline`（scope / channelId / tag / limit / before*）、
-  `/api/timeline/stats`、`/api/channels`、`/api/tags`、`/api/search`。
+- 服务端建了自己的 `message_fts`，索引文本用同一个 `core::search::to_index_text`。
+  **索引维护和 `upsert()` 在同一个事务里** —— 分开写会让索引和数据静默漂移，
+  表现成"搜得到但点不开"。`push_is_all_or_nothing` 现在也顺带断言了
+  整批回滚时索引不留半截内容。
+- 升级路径会回填（`SCHEMA_VERSION` 1 → 2）。不回填的话，服务端建了索引却是
+  空的 —— 表现是"老笔记永远搜不到，新写的能搜到"，不报任何错。
+- 新增 `GET /api/timeline`、`/api/timeline/stats`、`/api/channels`、`/api/tags`、
+  `/api/search`，全部走 `messagenote-store`。
+- 参数错回 **400** 而不是 500（加了 `ServerError::BadRequest`）。一律回 500
+  会让人以为服务端炸了，去查错地方。
+
+**这一步抓到两个真问题，都属于"只有逐字段比对才能发现"的那类：**
+
+1. **服务端的频道列表里没有收件箱。** 收件箱是"每台设备各自创建的常量实体"，
+   客户端从不推送它（`dirty` 恒为 0），所以服务端从来没有这一行 ——
+   而"未归档"正是收件箱的另一个名字，网页端会缺掉最主要的那个入口。
+   修法：服务端也种一份（`seed_constants`），`server_seq = 0` 所以不进变更流。
+2. **检索排序不稳定。** `ORDER BY bm25(...)` 没有次级键，分数相同时 FTS5 按
+   rowid 返回，而 rowid 取决于插入顺序 —— 服务端和客户端必然不同。于是同一批
+   数据在两端会搜出**不同的顺序**。加了 `(created_at, id)` 次级键。
+
+抓出它们的是 `desktop_and_server_agree_on_browse_and_search`：把同一批数据喂给
+桌面端和服务端，逐字段比对**两端的 JSON 本身**（不是"ids 大致相等"）。
+
+顺带把 `Scope` 的字符串解析也收进了共享层（`Scope::parse`）—— 桌面端命令层和
+服务端 API 之前各有一份 `match`，`"unfiled"` 在哪边改了含义另一边不会报错。
 
 #### ③ 服务端代笔写入
 

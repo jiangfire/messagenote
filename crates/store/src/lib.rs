@@ -36,5 +36,5 @@ pub mod browse;
 
 pub use browse::{
     attach_tags, list_channels, list_messages, list_tags, row_to_message, search, timeline_stats,
-    Cursor, Scope, INBOX_ID,
+    Cursor, Scope, ScopeParseError, INBOX_ID,
 };

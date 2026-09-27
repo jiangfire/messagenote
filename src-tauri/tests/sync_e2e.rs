@@ -296,3 +296,218 @@ fn a_long_offline_device_catches_up_through_http() {
         .unwrap();
     assert_eq!(n, 30, "离线期间的 15 条和在线期间的 15 条都要在");
 }
+
+// ---------------------------------------------------------------- 读 API 一致性
+
+/// 只处理 UTF-8 字节的百分号编码。测试里够用了 ——
+/// 不是为了做一个 URL 库，是为了让中文标签能塞进查询串。
+fn pct(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+/// 直接打一个 GET 端点，返回原始 JSON。
+///
+/// 刻意不经过 `HttpServerApi`：它只有同步端点，而这里要的正是
+/// "线缆上真实传了什么字节"。
+fn get_json(addr: SocketAddr, path: &str) -> serde_json::Value {
+    let resp = ureq::get(&format!("http://{addr}{path}"))
+        .header("Authorization", &format!("Bearer {TOKEN}"))
+        .call()
+        .unwrap_or_else(|e| panic!("GET {path} 失败：{e}"));
+    resp.into_body().read_json().expect("响应不是合法 JSON")
+}
+
+/// **桌面端和服务端对同一批数据必须给出完全一样的浏览与检索结果。**
+///
+/// 这是"浏览语义下沉到 `messagenote-store`"的全部意义所在。两端跑的是同一份
+/// SQL（服务端的表是客户端表的超集），但"共用一份实现"是否真的成立，
+/// 只有把同一批数据喂给两个 schema、再逐字段比对才能证明。
+///
+/// 比对的是 **JSON 本身**（`serde_json::Value`），不是"ids 大致相等"：
+/// 字段名、大小写、排序、数值类型任何一处不一致都会让它红。
+/// 网页端拿到的就是这个 JSON，它必须和桌面端渲染的是同一份东西。
+#[test]
+fn desktop_and_server_agree_on_browse_and_search() {
+    let addr = start_server();
+    let a = db::open_memory("e2e-agree-a").expect("建 A 库");
+    let api = api(addr);
+
+    let tag = "水果";
+    {
+        let conn = a.conn().unwrap();
+        let ch = db::create_channel(&conn, "工作").unwrap();
+        let m1 = db::append_message(&conn, "苹果和香蕉", None).unwrap();
+        db::set_message_tags(&conn, &m1.id, &[tag.into()]).unwrap();
+        db::append_message(&conn, "工作里的一条记录", Some(&ch.id)).unwrap();
+        db::append_message(&conn, "收件箱里的第二条", None).unwrap();
+        // 再来两条会命中同一个词的，用来压检索的排序：
+        // bm25 分数相同时 FTS5 按 rowid 返回，而两端的插入顺序必然不同。
+        db::append_message(&conn, "苹果派的做法", None).unwrap();
+        db::append_message(&conn, "第三个苹果", None).unwrap();
+    }
+
+    sync_until_quiet(&a, &api);
+    let conn = a.conn().unwrap();
+
+    // ---- 频道 ----
+    assert_eq!(
+        serde_json::to_value(db::list_channels(&conn).unwrap()).unwrap(),
+        get_json(addr, "/api/channels"),
+        "频道列表两端必须逐字段一致（含 messageCount 与排序）"
+    );
+
+    // ---- 统计 ----
+    assert_eq!(
+        serde_json::to_value(db::timeline_stats(&conn).unwrap()).unwrap(),
+        get_json(addr, "/api/timeline/stats")
+    );
+
+    // ---- 标签 ----
+    assert_eq!(
+        serde_json::to_value(db::list_tags(&conn).unwrap()).unwrap(),
+        get_json(addr, "/api/tags")
+    );
+
+    // ---- 时间线的四种范围 ----
+    let work_id = db::list_channels(&conn)
+        .unwrap()
+        .into_iter()
+        .find(|c| c.name == "工作")
+        .expect("应当有工作频道")
+        .id;
+
+    assert_eq!(
+        serde_json::to_value(db::list_messages(&conn, db::Scope::All, 50, None).unwrap()).unwrap(),
+        get_json(addr, "/api/timeline?scope=all&limit=50"),
+        "scope=all"
+    );
+    assert_eq!(
+        serde_json::to_value(db::list_messages(&conn, db::Scope::Unfiled, 50, None).unwrap())
+            .unwrap(),
+        get_json(addr, "/api/timeline?scope=unfiled&limit=50"),
+        "scope=unfiled —— 未归档的判定必须和桌面端一致，否则网页端点进去条数不对"
+    );
+    assert_eq!(
+        serde_json::to_value(
+            db::list_messages(&conn, db::Scope::Channel(&work_id), 50, None).unwrap()
+        )
+        .unwrap(),
+        get_json(
+            addr,
+            &format!("/api/timeline?scope=channel&channelId={work_id}&limit=50")
+        ),
+        "scope=channel"
+    );
+    assert_eq!(
+        serde_json::to_value(db::list_messages(&conn, db::Scope::Tag(tag), 50, None).unwrap())
+            .unwrap(),
+        get_json(
+            addr,
+            &format!("/api/timeline?scope=tag&tag={}&limit=50", pct(tag))
+        ),
+        "scope=tag —— 中文标签要能正确地过查询串"
+    );
+
+    // ---- 键集分页 ----
+    let first = db::list_messages(&conn, db::Scope::All, 2, None).unwrap();
+    let cursor = db::Cursor::before(&first.items[1]);
+    assert_eq!(
+        serde_json::to_value(db::list_messages(&conn, db::Scope::All, 2, Some(&cursor)).unwrap())
+            .unwrap(),
+        get_json(
+            addr,
+            &format!(
+                "/api/timeline?scope=all&limit=2&beforeCreatedAt={}&beforeId={}",
+                cursor.created_at, cursor.id
+            )
+        ),
+        "往前翻一页的结果两端必须一致"
+    );
+
+    // ---- 检索：双字词走 FTS，单字走 LIKE 回退，两条路径都要一致 ----
+    for q in ["苹果", "苹", "记录"] {
+        assert_eq!(
+            serde_json::to_value(db::search(&conn, q, 20).unwrap()).unwrap(),
+            get_json(addr, &format!("/api/search?q={}&limit=20", pct(q))),
+            "检索「{q}」两端结果必须一致（含命中顺序）"
+        );
+    }
+
+    // 得确认上面那个排序断言不是空跑：至少有一条查询要命中多个结果
+    assert!(
+        db::search(&conn, "苹果", 20).unwrap().len() > 1,
+        "测试不能空跑：检索的排序只有多命中时才有意义"
+    );
+}
+
+/// 读端点必须和同步端点一样要求鉴权。
+///
+/// 这几个端点是**新加的**，而"新加的端点忘了挂 middleware"是最常见的一类
+/// 事故 —— 它不会让任何测试变红，只是把用户全部笔记挂在公网上。
+#[test]
+fn read_endpoints_require_a_token() {
+    let addr = start_server();
+
+    for path in [
+        "/api/timeline?scope=all",
+        "/api/timeline/stats",
+        "/api/channels",
+        "/api/tags",
+        "/api/search?q=x",
+    ] {
+        match ureq::get(&format!("http://{addr}{path}")).call() {
+            Err(ureq::Error::StatusCode(401)) => {}
+            Err(e) => panic!("{path} 应当返回 401，实际：{e}"),
+            Ok(_) => panic!("{path} 不带令牌竟然成功了"),
+        }
+    }
+}
+
+/// 参数写错要回 400，而且要说清楚错在哪。
+///
+/// 一律回 500 会让人以为服务端炸了，去查错地方 —— 而这几个端点是给网页端
+/// 调用的，参数写错是很正常的开发期现象。
+#[test]
+fn a_bad_scope_is_a_400_with_a_readable_message() {
+    let addr = start_server();
+
+    let auth = format!("Bearer {TOKEN}");
+
+    // 未知 scope
+    match ureq::get(&format!("http://{addr}/api/timeline?scope=bogus"))
+        .header("Authorization", &auth)
+        .call()
+    {
+        Err(ureq::Error::StatusCode(400)) => {}
+        Err(e) => panic!("未知 scope 应当返回 400 而不是 500，实际：{e}"),
+        Ok(_) => panic!("未知 scope 竟然被接受了"),
+    }
+
+    // scope=channel 缺 channelId
+    match ureq::get(&format!("http://{addr}/api/timeline?scope=channel"))
+        .header("Authorization", &auth)
+        .call()
+    {
+        Err(ureq::Error::StatusCode(400)) => {}
+        Err(e) => panic!("缺 channelId 应当返回 400，实际：{e}"),
+        Ok(_) => panic!("缺 channelId 竟然被接受了"),
+    }
+
+    // scope=tag 缺 tag
+    match ureq::get(&format!("http://{addr}/api/timeline?scope=tag"))
+        .header("Authorization", &auth)
+        .call()
+    {
+        Err(ureq::Error::StatusCode(400)) => {}
+        Err(e) => panic!("缺 tag 应当返回 400，实际：{e}"),
+        Ok(_) => panic!("缺 tag 竟然被接受了"),
+    }
+}
+

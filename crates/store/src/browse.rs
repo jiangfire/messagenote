@@ -34,6 +34,52 @@ pub enum Scope<'a> {
     Tag(&'a str),
 }
 
+/// [`Scope::parse`] 的失败原因。
+///
+/// 单独一个类型，是为了让两端各自把它包成自己的错误（桌面端是 `AppError`，
+/// 服务端是 `ServerError`），而**"接受哪些字符串、映射到什么"只有一份**。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScopeParseError {
+    UnknownScope(String),
+    MissingChannelId,
+    MissingTag,
+}
+
+impl std::fmt::Display for ScopeParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownScope(s) => write!(f, "未知的时间线范围：{s}"),
+            Self::MissingChannelId => write!(f, "scope=channel 时必须提供 channel_id"),
+            Self::MissingTag => write!(f, "scope=tag 时必须提供 tag"),
+        }
+    }
+}
+
+impl std::error::Error for ScopeParseError {}
+
+impl<'a> Scope<'a> {
+    /// 从查询参数解析筛选范围。
+    ///
+    /// **桌面端的命令层和服务端的 API 共用这一份。** 两边各写一个 `match` 的话，
+    /// `"unfiled"` 这个词在哪一边改了含义，另一边不会报错 —— 只是时间线
+    /// 悄悄换成了别的内容。
+    pub fn parse(
+        scope: &'a str,
+        channel_id: Option<&'a str>,
+        tag: Option<&'a str>,
+    ) -> Result<Self, ScopeParseError> {
+        match scope {
+            "all" => Ok(Scope::All),
+            "unfiled" => Ok(Scope::Unfiled),
+            "channel" => channel_id
+                .map(Scope::Channel)
+                .ok_or(ScopeParseError::MissingChannelId),
+            "tag" => tag.map(Scope::Tag).ok_or(ScopeParseError::MissingTag),
+            other => Err(ScopeParseError::UnknownScope(other.to_string())),
+        }
+    }
+}
+
 /// 时间线游标。
 ///
 /// 用 `(created_at, id)` 复合键，而不是单个时间戳。**这不是洁癖**：
@@ -206,6 +252,14 @@ pub fn timeline_stats(conn: &Connection) -> rusqlite::Result<TimelineStats> {
 
 // ---------------------------------------------------------------- 检索
 
+/// 中文检索。规划查询用的是 `core::search`，两端因此走同一条路径。
+///
+/// **排序必须带次级键。** `bm25()` 分数相同时，FTS5 按 rowid 返回 ——
+/// 而 rowid 取决于插入顺序，服务端和客户端必然不同。于是同一批数据在两端
+/// 会搜出**不同的顺序**：同样的词，桌面端和网页端列表长得不一样。
+/// 不报错，但用户会觉得"这两个东西不是一回事"。
+///
+/// 加 `(created_at, id)` 之后，顺序只由内容决定，与插入顺序无关。
 pub fn search(conn: &Connection, query: &str, limit: i64) -> rusqlite::Result<Vec<SearchHit>> {
     let limit = limit.clamp(1, 200);
     let Some(plan) = search::plan_query(query) else {
@@ -225,7 +279,7 @@ pub fn search(conn: &Connection, query: &str, limit: i64) -> rusqlite::Result<Ve
                    JOIN channel c ON c.id = m.channel_id
                   WHERE message_fts MATCH ?1
                     AND m.deleted_at IS NULL
-                  ORDER BY bm25(message_fts)
+                  ORDER BY bm25(message_fts), m.created_at DESC, m.id DESC
                   LIMIT ?2",
             )?;
             let rows = stmt.query_map(params![match_expr, fetch], |r| {

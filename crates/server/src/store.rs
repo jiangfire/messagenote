@@ -1,9 +1,12 @@
 //! 服务端存储层。
 //!
-//! 和客户端存储层**刻意不共享实现**：客户端有 `dirty` 标记和本地检索索引，
-//! 服务端有的是单调递增的 `server_seq`。两边共用的只是 `core` 里那份
-//! schema 语义（字段含义、墓碑表示法、HLC 比较规则）——
-//! 硬把两套表抽象成一个，只会得到一个到处是分支的怪物。
+//! 和客户端存储层**刻意不共享写入实现**：客户端有 `dirty` 标记和本地检索索引，
+//! 服务端有的是单调递增的 `server_seq`。硬把两套表抽象成一个，只会得到一个
+//! 到处是分支的怪物。
+//!
+//! 但**浏览和检索**是例外：那部分查询只碰两边都有的列，住在 `messagenote-store`
+//! 里，两端跑的是同一份实现。理由见那个 crate 的文档 —— 简而言之，时间线
+//! "怎么排、怎么翻页"如果两边各写一份，漂移是静默的。
 //!
 //! ## 服务端只多做一件事：分配 seq
 //!
@@ -21,14 +24,17 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 use messagenote_core::hlc::Hlc;
 use messagenote_core::merge;
+use messagenote_core::models::{Channel, MessagePage, SearchHit, TagCount, TimelineStats};
 use messagenote_core::payload::{
     message_tag_key, ChannelPayload, MessagePayload, MessageTagPayload, TagPayload,
 };
+use messagenote_core::search;
 use messagenote_core::wire::{Change, EntityKind, PullResponse, PushOutcome, PushResponse};
+use messagenote_store::{Cursor, Scope};
 
 use crate::error::{ServerError, ServerResult};
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 const SCHEMA: &str = r#"
 -- 单行计数器。seq 必须全局单调，不能按实体各自计数，
@@ -93,6 +99,19 @@ CREATE TABLE IF NOT EXISTS message_tag (
   PRIMARY KEY (message_id, tag_name)
 );
 CREATE INDEX IF NOT EXISTS idx_message_tag_seq ON message_tag(server_seq);
+
+-- 检索索引。定义和客户端那份**逐字一致** —— 两端用同一个 core::search 规划查询，
+-- 索引文本也必须用同一个 core::search::to_index_text 生成，否则同样的关键词
+-- 在一端搜得到、在另一端搜不到。
+--
+-- 独立 FTS5 表而不是 external-content 表：索引内容（bigram 展开）是 Rust 侧
+-- 算出来的，SQL 触发器算不出来。代价是**忘了同步索引就是静默的检索失效**，
+-- 所以写入路径必须成对出现在同一个事务里（见 upsert）。
+CREATE VIRTUAL TABLE IF NOT EXISTS message_fts USING fts5(
+  search_text,
+  message_id UNINDEXED,
+  tokenize = 'unicode61 remove_diacritics 2'
+);
 "#;
 
 pub struct Store {
@@ -116,8 +135,14 @@ impl Store {
         let current: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if current < SCHEMA_VERSION {
             conn.execute_batch(SCHEMA)?;
+            // v2 加了检索索引。已经有数据的服务端升级上来时，建了表却是空的 ——
+            // 表现是"检索永远没有结果"，而且不报任何错。所以必须回填。
+            if current < 2 {
+                backfill_fts(&conn)?;
+            }
             conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         }
+        seed_constants(&conn)?;
 
         Ok(Self {
             conn: Mutex::new(conn),
@@ -129,6 +154,7 @@ impl Store {
     pub fn in_memory() -> ServerResult<Self> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
+        seed_constants(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -225,6 +251,44 @@ impl Store {
 
         tx.commit()?;
         Ok(PushResponse { results })
+    }
+
+    // ---------------------------------------------------------------- 读取
+    //
+    // 全部委托给 `messagenote-store`，这里只负责加锁。
+    //
+    // 这一点很要紧：网页端看到的**不是**"一份和桌面端长得像的实现"，而是
+    // 同一份。时间线怎么排、未归档怎么算、同一毫秒的兄弟行怎么翻页，
+    // 这些语义如果两边各写一份，漂移起来是静默的 —— 差几条，不报错。
+
+    pub fn list_channels(&self) -> ServerResult<Vec<Channel>> {
+        let conn = self.conn()?;
+        Ok(messagenote_store::list_channels(&conn)?)
+    }
+
+    pub fn list_tags(&self) -> ServerResult<Vec<TagCount>> {
+        let conn = self.conn()?;
+        Ok(messagenote_store::list_tags(&conn)?)
+    }
+
+    pub fn timeline_stats(&self) -> ServerResult<TimelineStats> {
+        let conn = self.conn()?;
+        Ok(messagenote_store::timeline_stats(&conn)?)
+    }
+
+    pub fn list_messages(
+        &self,
+        scope: Scope<'_>,
+        limit: i64,
+        before: Option<&Cursor>,
+    ) -> ServerResult<MessagePage> {
+        let conn = self.conn()?;
+        Ok(messagenote_store::list_messages(&conn, scope, limit, before)?)
+    }
+
+    pub fn search(&self, query: &str, limit: i64) -> ServerResult<Vec<SearchHit>> {
+        let conn = self.conn()?;
+        Ok(messagenote_store::search(&conn, query, limit)?)
     }
 }
 
@@ -601,6 +665,59 @@ fn collect_message_tags(
 
 // ---------------------------------------------------------------- 写入
 
+/// 建库时就要存在的常量行，且**不参与同步**。
+///
+/// 收件箱是**常量实体**：每台设备（包括服务端）都独立创建同样的它。
+/// 客户端不推送它（`dirty` 恒为 0），服务端也不把它算进变更流
+/// （`server_seq = 0`，任何 `pull(since >= 0)` 都拉不到）。
+///
+/// 服务端也必须有这一份，否则网页端的频道列表里**没有收件箱** —— 而"未归档"
+/// 正是收件箱的另一个名字，网页端会缺少最主要的那个入口。
+///
+/// 这一条是被 `desktop_and_server_agree_on_browse_and_search` 抓出来的：
+/// 那个测试逐字段比对两端的频道列表，桌面端两个、服务端只有一个。
+fn seed_constants(conn: &Connection) -> ServerResult<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO channel
+           (id, name, kind, sort_order, created_at, updated_at, device_id,
+            hlc_wall, hlc_counter, deleted_at, server_seq)
+         VALUES (?1, '收件箱', 'inbox', 0, 0, 0, '', 0, 0, NULL, 0)",
+        params![messagenote_store::INBOX_ID],
+    )?;
+    Ok(())
+}
+
+/// 为 `message` 表里已有的行重建检索索引。
+///
+/// 索引文本（bigram 展开）只有 Rust 侧算得出来，SQL 算不出来 —— 这既是索引
+/// 维护没做成触发器的原因，也是这里必须把正文读出来、算一遍、再写回去的原因。
+///
+/// 只在"从没有索引的旧版本升上来"这条路径上跑。
+fn backfill_fts(conn: &Connection) -> ServerResult<()> {
+    // 先把行读进内存，再开事务写。不然 `stmt` 借用着 conn，事务就借不到了。
+    let rows: Vec<(String, String)> = {
+        let mut stmt = conn.prepare("SELECT id, body FROM message WHERE deleted_at IS NULL")?;
+        let it = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        it.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    let tx = conn.unchecked_transaction()?;
+    // 这条路径上索引本来就该是空的，清一次是幂等的
+    tx.execute("DELETE FROM message_fts", [])?;
+    for (id, body) in &rows {
+        tx.execute(
+            "INSERT INTO message_fts (search_text, message_id) VALUES (?1, ?2)",
+            params![search::to_index_text(body), id],
+        )?;
+    }
+    tx.commit()?;
+
+    if !rows.is_empty() {
+        tracing::info!(count = rows.len(), "升级：检索索引已回填");
+    }
+    Ok(())
+}
+
 /// 把一条已接受的变更落库，并打上新的 seq。
 ///
 /// 时间字段一律取自变更本身（含墓碑的 `deleted_at`，用 payload 的
@@ -652,6 +769,19 @@ fn upsert(conn: &Connection, c: &Change, seq: i64) -> ServerResult<()> {
                     seq
                 ],
             )?;
+
+            // 检索索引是派生数据，但必须和正文在**同一个事务**里更新。
+            // 分开写的话，索引和数据会静默漂移 —— 表现成"搜得到但点不开"
+            // 或者"明明写了却搜不到"，两种都极难查。
+            //
+            // 注意 `upsert` 拿到的 conn 就是 `push` 那个事务，所以这里天然同事务。
+            conn.execute("DELETE FROM message_fts WHERE message_id = ?1", params![c.id])?;
+            if !c.deleted {
+                conn.execute(
+                    "INSERT INTO message_fts (search_text, message_id) VALUES (?1, ?2)",
+                    params![search::to_index_text(&p.body), c.id],
+                )?;
+            }
         }
 
         EntityKind::Tag => {
@@ -801,8 +931,9 @@ mod tests {
     #[test]
     fn shared_browse_queries_work_on_the_server_schema() {
         let s = store();
+        // 刻意**不推**收件箱：客户端从不推送它（dirty 恒为 0），服务端
+        // 建库时就自己种了一份。这里要验证的正是"服务端那份够用"。
         s.push(&[
-            channel_change("inbox", "收件箱", "inbox", 0, 10),
             channel_change("ch-work", "工作", "normal", 1, 11),
             msg("m1", 100, 0, "a", "收件箱里的一条"),
             msg_in("m2", "ch-work", 101, "工作里的一条"),
@@ -816,7 +947,7 @@ mod tests {
         // 频道列表：收件箱必须排在最前 —— 排序表达式 `(kind = 'inbox') DESC`
         // 是 SQLite 特有的写法，值得单独确认它在服务端表上也成立。
         let chans = messagenote_store::list_channels(&conn).unwrap();
-        assert_eq!(chans.len(), 2);
+        assert_eq!(chans.len(), 2, "服务端种下的收件箱 + 推上来的工作频道");
         assert_eq!(chans[0].id, "inbox", "收件箱要排在第一位");
         assert_eq!(chans[0].kind, "inbox");
         assert_eq!(chans[0].message_count, 1);
@@ -978,5 +1109,75 @@ mod tests {
             "批次失败后不能留下半截数据"
         );
         assert_eq!(s.max_seq().unwrap(), 0, "回滚后 seq 也不该前进");
+
+        // 检索索引和正文在同一个事务里，所以它同样不能留下半截内容 ——
+        // 否则会出现"搜得到一条根本不存在的消息"
+        assert!(
+            s.search("好的", 10).unwrap().is_empty(),
+            "整批回滚时，检索索引里也不能留下那条消息"
+        );
+    }
+
+    /// 检索索引必须跟着正文走。
+    ///
+    /// 索引文本（bigram 展开）是 Rust 算出来的，SQL 触发器算不出来，所以
+    /// "忘了更新索引"是一个完全可能的退化 —— 而且它**不报错**。轻则搜不到，
+    /// 重则搜得到一条正文已经改掉的消息，点开发现内容对不上。
+    #[test]
+    fn the_search_index_follows_the_body() {
+        let s = store();
+        // 注意检索是**连续子串**语义（见 core::search），不是分词：
+        // 「读了」连续所以命中，「读书」不连续所以不该命中。
+        s.push(&[msg("m1", 100, 0, "a", "今天读了点书")]).unwrap();
+        assert_eq!(s.search("读了", 10).unwrap().len(), 1, "刚推上来就该能搜到");
+
+        // 改正文
+        s.push(&[msg("m1", 200, 0, "a", "今天去爬山了")]).unwrap();
+        assert!(
+            s.search("读了", 10).unwrap().is_empty(),
+            "正文改掉之后旧词不能再搜到 —— 还能搜到就说明索引和数据已经漂移"
+        );
+        assert_eq!(s.search("爬山", 10).unwrap().len(), 1);
+
+        // 删除
+        let mut tomb = msg("m1", 300, 0, "a", "今天去爬山了");
+        tomb.deleted = true;
+        s.push(&[tomb]).unwrap();
+        assert!(
+            s.search("爬山", 10).unwrap().is_empty(),
+            "墓碑必须从索引里摘掉"
+        );
+    }
+
+    /// 升级路径：从"还没有索引表"的版本升上来时，已有数据必须回填。
+    ///
+    /// 不回填的话，服务端建了索引却是空的 —— 表现是"老笔记永远搜不到，
+    /// 新写的能搜到"。不报任何错，而且很容易被当成"我没记过这个"。
+    #[test]
+    fn upgrading_backfills_the_search_index_for_existing_rows() {
+        let s = store();
+        {
+            let conn = s.conn().unwrap();
+            // 模拟旧版本的库：有数据，但没有索引表
+            conn.execute("DROP TABLE message_fts", []).unwrap();
+            conn.execute(
+                "INSERT INTO message
+                   (id, channel_id, body, created_at, updated_at, hlc_wall, hlc_counter, server_seq)
+                 VALUES ('old-1', 'inbox', '升级前就存在的笔记', 50, 50, 50, 0, 1)",
+                [],
+            )
+            .unwrap();
+        }
+
+        // 重新建表 + 回填 —— 这就是 `open()` 在 current < 2 时做的事
+        {
+            let conn = s.conn().unwrap();
+            conn.execute_batch(SCHEMA).unwrap();
+            backfill_fts(&conn).unwrap();
+        }
+
+        let hits = s.search("升级", 10).unwrap();
+        assert_eq!(hits.len(), 1, "回填之后，升级前就有的数据也要搜得到");
+        assert_eq!(hits[0].message.id, "old-1");
     }
 }
