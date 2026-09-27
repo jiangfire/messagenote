@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "description": "聊天框式本地优先笔记 —— 零摩擦捕获，事后组织",
+  "license": "Apache-2.0",
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",

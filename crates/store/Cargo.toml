@@ -2,6 +2,7 @@
 name = "messagenote-store"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 description = "MessageNote 共享存储层：只放「在客户端与服务端两种 schema 上都成立」的查询"
 
 [dependencies]

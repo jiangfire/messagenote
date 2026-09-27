@@ -2,6 +2,7 @@
 name = "messagenote"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 description = "聊天框式本地优先笔记 —— 零摩擦捕获，事后组织"
 # 注意：这里不要写 rust-version。
 # 一旦声明了偏低的 MSRV，cargo 的 MSRV 感知解析会「向下兼容」地

@@ -2,6 +2,7 @@
 name = "messagenote-server"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 description = "MessageNote 同步服务端"
 
 # 同时提供 lib 和 bin：

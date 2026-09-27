@@ -139,6 +139,11 @@ jobs:
     needs: [desktop, server]
     runs-on: ubuntu-latest
     steps:
+      # 这个 job 本来不需要仓库内容，但 Apache-2.0 第 4 条要求**分发二进制时
+      # 附带许可证副本** —— 所以把 LICENSE 也放进 Release 附件。
+      # 不指定 ref：手动触发时是 main，tag push 时就是那个 tag。
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
@@ -165,6 +170,8 @@ jobs:
              "out/messagenote-server_${V}_linux-x64-static"
           # 版本号在文件名中间，glob 里不能漏掉那一段
           chmod +x out/messagenote-server_"${V}"_linux-x64*
+          # Apache-2.0 第 4 条：二进制分发要附带许可证副本
+          cp LICENSE out/LICENSE.txt
           ls -la out
 
       - name: 创建或更新 Release

@@ -498,3 +498,24 @@ cargo test -p messagenote -- --ignored --nocapture
 
 明确不做的：完整 CRDT、多用户协作、用 Syncthing 之类同步 `.sqlite` 文件
 （WAL 下多端同时改是**必定静默损坏**的）。理由见 `ROADMAP.md`。
+
+## 许可证
+
+[Apache License 2.0](LICENSE)。可以自由使用、修改、分发，包括商用；
+需要保留版权与许可声明，且附带专利授权。
+
+## 下载
+
+预编译产物在 [Releases](https://github.com/jiangfire/messagenote/releases)：
+
+| 文件 | 说明 |
+| --- | --- |
+| `MessageNote_<版本>_x64-setup.exe` | Windows 桌面端安装包 |
+| `MessageNote_<版本>_x64-portable.exe` | Windows 免安装版，双击即用 |
+| `messagenote-server_<版本>_windows-x64.exe` | 同步服务端（Windows） |
+| `messagenote-server_<版本>_linux-x64` | 同步服务端（Linux，glibc） |
+| `messagenote-server_<版本>_linux-x64-static` | 同步服务端（Linux，**静态**，任何发行版都能跑） |
+
+安装包**未做代码签名**，Windows SmartScreen 会弹警告 —— 这是预期行为，
+不是安装包损坏。自用可以直接「仍要运行」。
+

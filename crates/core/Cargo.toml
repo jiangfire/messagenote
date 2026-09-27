@@ -2,6 +2,7 @@
 name = "messagenote-core"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 description = "MessageNote 共享内核：中文检索分词、混合逻辑时钟、同步合并决策、线缆协议"
 
 [dependencies]
