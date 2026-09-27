@@ -52,11 +52,7 @@ fn scan(input: &str, emit_single_cjk: bool, mut on_token: impl FnMut(String)) {
     let mut cjk_run: Vec<char> = Vec::new();
     let mut word = String::new();
 
-    fn flush_cjk(
-        run: &mut Vec<char>,
-        emit_single: bool,
-        on_token: &mut impl FnMut(String),
-    ) {
+    fn flush_cjk(run: &mut Vec<char>, emit_single: bool, on_token: &mut impl FnMut(String)) {
         match run.len() {
             0 => {}
             1 => {

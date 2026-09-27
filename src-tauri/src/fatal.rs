@@ -150,8 +150,14 @@ mod tests {
         // 这里的是**进程级**全局状态，别的测试也可能往里写，
         // 所以只断言"包含"和相对顺序，不断言总数。
         let list = startup_warnings();
-        let a = list.iter().position(|w| w == "测试警告甲").expect("甲应当在");
-        let b = list.iter().position(|w| w == "测试警告乙").expect("乙应当在");
+        let a = list
+            .iter()
+            .position(|w| w == "测试警告甲")
+            .expect("甲应当在");
+        let b = list
+            .iter()
+            .position(|w| w == "测试警告乙")
+            .expect("乙应当在");
         assert!(a < b, "警告应当按发生顺序保留：{list:?}");
     }
 }

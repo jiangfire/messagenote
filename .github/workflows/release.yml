@@ -1,0 +1,169 @@
+name: Release
+
+# 打 v* tag 时构建并发布。tag 由维护者手动打 —— 版本号同时出现在
+# Cargo.toml、package.json、tauri.conf.json 三处，让 CI 去猜容易出错。
+on:
+  push:
+    tags: ["v*"]
+
+# 创建 Release 需要写权限。其余一律只读。
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  desktop:
+    name: Windows 桌面端
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 改用官方 crates.io 源
+        shell: bash
+        run: rm -f .cargo/config.toml
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12.5.1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      # 发布前先验一遍。tag 通常打在 main 上、CI 已经跑过，但"通常"不是保证 ——
+      # 而发布出去的二进制是收不回来的。
+      - name: 测试
+        run: cargo test --locked --workspace
+
+      # beforeBuildCommand 会自己跑 pnpm build
+      - name: 打包
+        run: pnpm tauri build
+
+      - name: 收集产物
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          cp target/release/messagenote.exe out/
+          cp target/release/bundle/nsis/*.exe out/
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-windows
+          path: out/*
+          if-no-files-found: error
+
+  server:
+    name: 服务端 · ${{ matrix.label }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            label: Windows x64
+          # 用 22.04 而不是 ubuntu-latest：glibc 版本更低，编出来的二进制
+          # 在更老的发行版上也能跑。ubuntu-latest 编的常常在 Debian stable 上就起不来。
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            label: Linux x64
+          # musl 版是**静态链接**的单个文件，扔到任何 Linux 上都能跑，
+          # 不用管对方装了什么 glibc。自建服务端的人多半想要这个。
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+            label: Linux x64 · 静态
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 改用官方 crates.io 源
+        shell: bash
+        run: rm -f .cargo/config.toml
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # rusqlite 的 bundled 特性要从源码编 SQLite（C 代码），
+      # musl 目标需要一个 musl 的 C 编译器 —— cc crate 会自动去找 musl-gcc。
+      - name: 装 musl 工具链
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: 构建服务端
+        run: cargo build --release --locked -p messagenote-server --target ${{ matrix.target }}
+
+      - name: 收集产物
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          src="target/${{ matrix.target }}/release/messagenote-server"
+          if [ -f "$src.exe" ]; then src="$src.exe"; fi
+          cp "$src" out/
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: server-${{ matrix.target }}
+          path: out/*
+          if-no-files-found: error
+
+  release:
+    name: 发 Release
+    needs: [desktop, server]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      # 产物名要让人一眼看出"这是什么、给哪个平台"。
+      # messagenote.exe / messagenote-server 这种名字下载下来就分不清了。
+      - name: 整理文件名
+        shell: bash
+        run: |
+          set -euo pipefail
+          V="${GITHUB_REF_NAME#v}"
+          mkdir -p out
+          cp artifacts/desktop-windows/messagenote.exe \
+             "out/MessageNote_${V}_x64-portable.exe"
+          cp artifacts/desktop-windows/MessageNote_${V}_x64-setup.exe \
+             "out/MessageNote_${V}_x64-setup.exe"
+          cp artifacts/server-x86_64-pc-windows-msvc/messagenote-server.exe \
+             "out/messagenote-server_${V}_windows-x64.exe"
+          cp artifacts/server-x86_64-unknown-linux-gnu/messagenote-server \
+             "out/messagenote-server_${V}_linux-x64"
+          cp artifacts/server-x86_64-unknown-linux-musl/messagenote-server \
+             "out/messagenote-server_${V}_linux-x64-static"
+          chmod +x out/messagenote-server_linux-x64*
+          ls -la out
+
+      - name: 创建或更新 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # 这个 job 刻意没有 actions/checkout —— 它只整理产物、调 gh。
+          # 但那样就没有 .git 目录，gh 认不出是哪个仓库，所以要显式告诉它。
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 允许重跑：tag 已经发过 Release 时改成覆盖附件，而不是报错退出
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" out/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" out/* \
+              --title "MessageNote $GITHUB_REF_NAME" \
+              --generate-notes
+          fi

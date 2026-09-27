@@ -34,7 +34,9 @@ use serde::de::DeserializeOwned;
 
 use messagenote_core::hlc::Hlc;
 use messagenote_core::merge::{self, LocalState, Resolution};
-use messagenote_core::payload::{message_tag_key, ChannelPayload, MessagePayload, MessageTagPayload, TagPayload};
+use messagenote_core::payload::{
+    message_tag_key, ChannelPayload, MessagePayload, MessageTagPayload, TagPayload,
+};
 use messagenote_core::search;
 use messagenote_core::wire::{Change, EntityKind, PullResponse, PushResponse};
 
@@ -589,7 +591,10 @@ fn write_remote(conn: &Connection, change: &Change) -> AppResult<()> {
                 ],
             )?;
             // 检索索引是本地派生数据，永远不参与同步，但必须跟着正文更新
-            tx.execute("DELETE FROM message_fts WHERE message_id = ?1", params![change.id])?;
+            tx.execute(
+                "DELETE FROM message_fts WHERE message_id = ?1",
+                params![change.id],
+            )?;
             if !change.deleted {
                 tx.execute(
                     "INSERT INTO message_fts (search_text, message_id) VALUES (?1, ?2)",
@@ -825,11 +830,7 @@ mod tests {
                 .take(limit as usize)
                 .map(|(_, c)| c.clone())
                 .collect();
-            let cursor = changes
-                .iter()
-                .filter_map(|c| c.seq)
-                .max()
-                .unwrap_or(since);
+            let cursor = changes.iter().filter_map(|c| c.seq).max().unwrap_or(since);
 
             Ok(PullResponse {
                 changes,
@@ -1038,13 +1039,25 @@ mod tests {
         let snap_a = snapshot(&a.conn().unwrap());
         let snap_b = snapshot(&b.conn().unwrap());
         assert_eq!(snap_a, snap_b, "两台设备在同步后必须完全一致");
-        assert!(snap_a.iter().any(|s| s.starts_with("message|")), "测试不能空跑");
-        assert!(snap_a.iter().any(|s| s.starts_with("tag|")), "标签也要同步过去");
+        assert!(
+            snap_a.iter().any(|s| s.starts_with("message|")),
+            "测试不能空跑"
+        );
+        assert!(
+            snap_a.iter().any(|s| s.starts_with("tag|")),
+            "标签也要同步过去"
+        );
 
         // B 上应该真的能搜到中文
         let conn = b.conn().unwrap();
-        assert_eq!(db::search_page(&conn, "笔记", 10, 0).unwrap().items.len(), 1);
-        assert_eq!(db::search_page(&conn, "项目", 10, 0).unwrap().items.len(), 1);
+        assert_eq!(
+            db::search_page(&conn, "笔记", 10, 0).unwrap().items.len(),
+            1
+        );
+        assert_eq!(
+            db::search_page(&conn, "项目", 10, 0).unwrap().items.len(),
+            1
+        );
     }
 
     /// 待上传批次必须按依赖顺序消耗预算。
@@ -1428,7 +1441,7 @@ mod tests {
         let mut rng = Lcg::new(0xC0FFEE);
 
         for _ in 0..150 {
-            let use_a = rng.next() % 2 == 0;
+            let use_a = rng.next().is_multiple_of(2);
             let target: &Db = if use_a { &a } else { &b };
             {
                 let conn = target.conn().unwrap();
@@ -1478,7 +1491,7 @@ mod tests {
 
             // 有一定概率同步其中一台，制造"两边进度不一致"的真实时序
             if rng.below(3) == 0 {
-                let syncer: &Db = if rng.next() % 2 == 0 { &a } else { &b };
+                let syncer: &Db = if rng.next().is_multiple_of(2) { &a } else { &b };
                 let _ = sync_once(syncer, &server).unwrap();
             }
         }

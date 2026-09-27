@@ -159,7 +159,10 @@ mod tests {
     fn local_newer_keeps_local() {
         let remote = Hlc::new(100, 0, "a");
         let mine = Hlc::new(200, 0, "b");
-        assert_eq!(resolve(&remote, local(&mine, true, true)), Resolution::KeepLocal);
+        assert_eq!(
+            resolve(&remote, local(&mine, true, true)),
+            Resolution::KeepLocal
+        );
     }
 
     #[test]
@@ -174,7 +177,10 @@ mod tests {
         let older = Hlc::new(100, 0, "a");
         let newer = Hlc::new(200, 0, "a");
 
-        assert!(should_accept_push(&newer, None), "服务端没有这一行时必须接受");
+        assert!(
+            should_accept_push(&newer, None),
+            "服务端没有这一行时必须接受"
+        );
         assert!(should_accept_push(&newer, Some(&older)));
         assert!(
             !should_accept_push(&older, Some(&newer)),

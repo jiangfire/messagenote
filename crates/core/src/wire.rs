@@ -221,5 +221,3 @@ pub struct SessionResponse {
     /// 过期时刻（毫秒时间戳）。客户端据此决定什么时候重新登录。
     pub expires_at: i64,
 }
-
-

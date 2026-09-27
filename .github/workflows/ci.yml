@@ -1,0 +1,124 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# 同一分支上新的推送取消上一次还在跑的 —— 省 runner 时间，状态也更快变绿
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  rust:
+    name: Rust · 测试 / 格式 / Clippy
+    # **Windows 而不是 Linux**：src-tauri 是 Windows 桌面端，在 Linux 上要装
+    # webkit2gtk 那一整套系统依赖才编得过，而它对这个项目没有意义 ——
+    # 真正要验的是"在我发布的那个平台上能跑"。
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 仓库里的 .cargo/config.toml 指向阿里云镜像 —— 那是**给国内开发用的**，
+      # 是作者有意提交的。GitHub 的 runner 在美国，绕那一圈既慢，又多一个
+      # 第三方故障点（镜像偶尔滞后或限流，CI 就会莫名其妙地红）。
+      - name: 改用官方 crates.io 源
+        shell: bash
+        run: rm -f .cargo/config.toml
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: 格式
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        # -D warnings：现在一条警告都没有，那就别让它悄悄长回来
+        # --locked：Cargo.lock 没跟着改动一起提交时立刻红，
+        # 而不是在某人机器上悄悄解析出一套新版本
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: 测试
+        run: cargo test --locked --workspace
+
+  web:
+    name: 网页端 · 构建与 bundle 边界
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 版本写死在这里而不是 package.json 的 packageManager 字段：
+      # 后者会让 pnpm 把各平台的 pnpm 二进制（158 行）记进 lockfile，
+      # 对一个笔记应用来说是纯噪音，CI 还要每次重新下载自己。
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12.5.1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      # tsc --noEmit && vite build
+      - run: pnpm build
+
+      # 网页端不该把 Tauri 的 IPC 代码带进去。这个错误**构建成功、类型检查
+      # 也通过**，只有去看产物才发现 —— 所以值得一个能重复跑的检查。
+      - name: 网页端 bundle 里不能有 Tauri
+        run: node scripts/check-web-bundle.mjs dist
+
+  browser:
+    name: 网页端 · 真实浏览器端到端
+    runs-on: windows-latest
+    needs: [rust]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 改用官方 crates.io 源
+        shell: bash
+        run: rm -f .cargo/config.toml
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # 版本写死在这里而不是 package.json 的 packageManager 字段：
+      # 后者会让 pnpm 把各平台的 pnpm 二进制（158 行）记进 lockfile，
+      # 对一个笔记应用来说是纯噪音，CI 还要每次重新下载自己。
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12.5.1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - run: cargo build --release -p messagenote-server
+
+      # 这一层是唯一能验"React 挂载了、事件接上了、页面真的能用"的手段。
+      # 它抓到过两个别的手段都抓不到的问题：删频道会把笔记一起删掉、
+      # 网页端空状态提示了一个浏览器里不存在的快捷键。
+      - name: 用 Edge + CDP 跑一遍
+        run: pwsh -NoProfile -File scripts/web-e2e/run.ps1
+
+      - name: 失败时留下截图
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-e2e-shots
+          path: scripts/web-e2e/shots/
+          if-no-files-found: ignore

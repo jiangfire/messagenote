@@ -158,9 +158,7 @@ fn read_json<T: serde::de::DeserializeOwned>(
 /// 留着是为了万一将来有别的调用路径没走那个函数。
 fn map_err(e: ureq::Error) -> AppError {
     match e {
-        ureq::Error::StatusCode(401) => {
-            AppError::Msg("同步令牌不对（服务端返回 401）".into())
-        }
+        ureq::Error::StatusCode(401) => AppError::Msg("同步令牌不对（服务端返回 401）".into()),
         ureq::Error::StatusCode(code) => AppError::Msg(format!("服务端返回 HTTP {code}")),
         other => AppError::Msg(format!("网络请求失败：{other}")),
     }

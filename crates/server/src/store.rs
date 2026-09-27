@@ -218,7 +218,7 @@ impl Store {
     /// 当前最大 seq。客户端首次同步时从这里开始，避免把整个历史重放一遍。
     pub fn max_seq(&self) -> ServerResult<i64> {
         let conn = self.conn()?;
-        Ok(max_seq(&conn)?)
+        max_seq(&conn)
     }
 
     /// 拉取 `since` 之后的变更。
@@ -244,11 +244,7 @@ impl Store {
 
         // 游标取本批实际返回的最大 seq。一条都没返回时保持不变，
         // 让客户端停在原地而不是跳到未知位置。
-        let cursor = changes
-            .iter()
-            .filter_map(|c| c.seq)
-            .max()
-            .unwrap_or(since);
+        let cursor = changes.iter().filter_map(|c| c.seq).max().unwrap_or(since);
 
         // 注意：**不能**用 `collected.len() > limit` 判断还有没有更多。
         // 每个实体种类都各自被 LIMIT 截断过，被截掉的尾部是看不见的：
@@ -351,7 +347,9 @@ impl Store {
         before: Option<&Cursor>,
     ) -> ServerResult<MessagePage> {
         let conn = self.conn()?;
-        Ok(messagenote_store::list_messages(&conn, scope, limit, before)?)
+        Ok(messagenote_store::list_messages(
+            &conn, scope, limit, before,
+        )?)
     }
 
     pub fn search(&self, query: &str, limit: i64, offset: i64) -> ServerResult<SearchPage> {
@@ -398,8 +396,10 @@ impl Store {
             data: Some(data),
         };
 
-        if !merge::should_accept_push(&change.hlc, read_stored_hlc(&tx, kind, &change.id)?.as_ref())
-        {
+        if !merge::should_accept_push(
+            &change.hlc,
+            read_stored_hlc(&tx, kind, &change.id)?.as_ref(),
+        ) {
             // 极少见：某台设备的时钟比本机还超前，于是它那一版更"新"。
             // 按 LWW 保留它 —— 但**绝不静默**，否则用户会以为自己的修改保存了。
             let wall = read_change(&tx, kind, &change.id)?
@@ -423,43 +423,41 @@ impl Store {
     /// 少填一个字段，`upsert` 里对应的 `excluded.*` 就会把它写成空值。
     fn message_payload(&self, id: &str) -> ServerResult<MessagePayload> {
         let conn = self.conn()?;
-        Ok(conn
-            .query_row(
-                "SELECT channel_id, body, created_at FROM message
+        conn.query_row(
+            "SELECT channel_id, body, created_at FROM message
                   WHERE id = ?1 AND deleted_at IS NULL",
-                params![id],
-                |r| {
-                    Ok(MessagePayload {
-                        channel_id: r.get(0)?,
-                        body: r.get(1)?,
-                        created_at: r.get(2)?,
-                        updated_at: 0,
-                    })
-                },
-            )
-            .optional()?
-            .ok_or_else(|| ServerError::bad_request("消息不存在"))?)
+            params![id],
+            |r| {
+                Ok(MessagePayload {
+                    channel_id: r.get(0)?,
+                    body: r.get(1)?,
+                    created_at: r.get(2)?,
+                    updated_at: 0,
+                })
+            },
+        )
+        .optional()?
+        .ok_or_else(|| ServerError::bad_request("消息不存在"))
     }
 
     fn channel_payload(&self, id: &str) -> ServerResult<ChannelPayload> {
         let conn = self.conn()?;
-        Ok(conn
-            .query_row(
-                "SELECT name, kind, sort_order, created_at FROM channel
+        conn.query_row(
+            "SELECT name, kind, sort_order, created_at FROM channel
                   WHERE id = ?1 AND deleted_at IS NULL",
-                params![id],
-                |r| {
-                    Ok(ChannelPayload {
-                        name: r.get(0)?,
-                        kind: r.get(1)?,
-                        sort_order: r.get(2)?,
-                        created_at: r.get(3)?,
-                        updated_at: 0,
-                    })
-                },
-            )
-            .optional()?
-            .ok_or_else(|| ServerError::bad_request("频道不存在"))?)
+            params![id],
+            |r| {
+                Ok(ChannelPayload {
+                    name: r.get(0)?,
+                    kind: r.get(1)?,
+                    sort_order: r.get(2)?,
+                    created_at: r.get(3)?,
+                    updated_at: 0,
+                })
+            },
+        )
+        .optional()?
+        .ok_or_else(|| ServerError::bad_request("频道不存在"))
     }
 
     fn message(&self, id: &str) -> ServerResult<Message> {
@@ -479,27 +477,26 @@ impl Store {
 
     fn channel(&self, id: &str) -> ServerResult<Channel> {
         let conn = self.conn()?;
-        Ok(conn
-            .query_row(
-                "SELECT c.id, c.name, c.kind, c.sort_order, c.created_at, c.updated_at,
+        conn.query_row(
+            "SELECT c.id, c.name, c.kind, c.sort_order, c.created_at, c.updated_at,
                         (SELECT COUNT(*) FROM message m
                           WHERE m.channel_id = c.id AND m.deleted_at IS NULL)
                    FROM channel c WHERE c.id = ?1 AND c.deleted_at IS NULL",
-                params![id],
-                |r| {
-                    Ok(Channel {
-                        id: r.get(0)?,
-                        name: r.get(1)?,
-                        kind: r.get(2)?,
-                        sort_order: r.get(3)?,
-                        created_at: r.get(4)?,
-                        updated_at: r.get(5)?,
-                        message_count: r.get(6)?,
-                    })
-                },
-            )
-            .optional()?
-            .ok_or_else(|| ServerError::bad_request("频道不存在"))?)
+            params![id],
+            |r| {
+                Ok(Channel {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    kind: r.get(2)?,
+                    sort_order: r.get(3)?,
+                    created_at: r.get(4)?,
+                    updated_at: r.get(5)?,
+                    message_count: r.get(6)?,
+                })
+            },
+        )
+        .optional()?
+        .ok_or_else(|| ServerError::bad_request("频道不存在"))
     }
 
     fn require_channel(&self, id: &str) -> ServerResult<()> {
@@ -728,9 +725,8 @@ impl Store {
 
         let ids: Vec<String> = {
             let conn = self.conn()?;
-            let mut stmt = conn.prepare(
-                "SELECT id FROM message WHERE channel_id = ?1 AND deleted_at IS NULL",
-            )?;
+            let mut stmt = conn
+                .prepare("SELECT id FROM message WHERE channel_id = ?1 AND deleted_at IS NULL")?;
             let it = stmt.query_map(params![id], |r| r.get::<_, String>(0))?;
             it.collect::<rusqlite::Result<Vec<_>>>()?
         };
@@ -842,9 +838,11 @@ fn has_any_after(conn: &Connection, cursor: i64) -> ServerResult<bool> {
 }
 
 fn max_seq(conn: &Connection) -> ServerResult<i64> {
-    Ok(conn.query_row("SELECT value FROM seq_counter WHERE id = 1", [], |r| {
-        r.get(0)
-    })?)
+    Ok(
+        conn.query_row("SELECT value FROM seq_counter WHERE id = 1", [], |r| {
+            r.get(0)
+        })?,
+    )
 }
 
 /// 取下一个 seq。
@@ -889,13 +887,17 @@ fn read_stored_hlc(conn: &Connection, kind: EntityKind, id: &str) -> ServerResul
     };
 
     let hlc = conn
-        .query_row(sql, rusqlite::params_from_iter(key.iter().map(|b| b.as_ref())), |r| {
-            Ok(Hlc::new(
-                r.get::<_, i64>(0)?,
-                r.get::<_, u32>(1)?,
-                r.get::<_, String>(2)?,
-            ))
-        })
+        .query_row(
+            sql,
+            rusqlite::params_from_iter(key.iter().map(|b| b.as_ref())),
+            |r| {
+                Ok(Hlc::new(
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, u32>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            },
+        )
         .optional()?;
     Ok(hlc)
 }
@@ -1303,7 +1305,9 @@ fn check_references(conn: &Connection, c: &Change) -> ServerResult<()> {
 /// `table` / `column` 只来自上面那个函数里的字面量，不接受外部输入。
 fn row_exists(conn: &Connection, table: &str, column: &str, value: &str) -> ServerResult<bool> {
     let sql = format!("SELECT 1 FROM {table} WHERE {column} = ?1");
-    let found: Option<i64> = conn.query_row(&sql, params![value], |r| r.get(0)).optional()?;
+    let found: Option<i64> = conn
+        .query_row(&sql, params![value], |r| r.get(0))
+        .optional()?;
     Ok(found.is_some())
 }
 
@@ -1330,8 +1334,15 @@ fn upsert(conn: &Connection, c: &Change, seq: i64) -> ServerResult<()> {
                    hlc_wall = excluded.hlc_wall, hlc_counter = excluded.hlc_counter,
                    deleted_at = excluded.deleted_at, server_seq = excluded.server_seq",
                 params![
-                    c.id, p.name, p.kind, p.sort_order, p.created_at, p.updated_at,
-                    h.device, h.wall, h.counter,
+                    c.id,
+                    p.name,
+                    p.kind,
+                    p.sort_order,
+                    p.created_at,
+                    p.updated_at,
+                    h.device,
+                    h.wall,
+                    h.counter,
                     if c.deleted { Some(p.updated_at) } else { None },
                     seq
                 ],
@@ -1352,8 +1363,14 @@ fn upsert(conn: &Connection, c: &Change, seq: i64) -> ServerResult<()> {
                    hlc_wall = excluded.hlc_wall, hlc_counter = excluded.hlc_counter,
                    deleted_at = excluded.deleted_at, server_seq = excluded.server_seq",
                 params![
-                    c.id, p.channel_id, p.body, p.created_at, p.updated_at,
-                    h.device, h.wall, h.counter,
+                    c.id,
+                    p.channel_id,
+                    p.body,
+                    p.created_at,
+                    p.updated_at,
+                    h.device,
+                    h.wall,
+                    h.counter,
                     if c.deleted { Some(p.updated_at) } else { None },
                     seq
                 ],
@@ -1364,7 +1381,10 @@ fn upsert(conn: &Connection, c: &Change, seq: i64) -> ServerResult<()> {
             // 或者"明明写了却搜不到"，两种都极难查。
             //
             // 注意 `upsert` 拿到的 conn 就是 `push` 那个事务，所以这里天然同事务。
-            conn.execute("DELETE FROM message_fts WHERE message_id = ?1", params![c.id])?;
+            conn.execute(
+                "DELETE FROM message_fts WHERE message_id = ?1",
+                params![c.id],
+            )?;
             if !c.deleted {
                 conn.execute(
                     "INSERT INTO message_fts (search_text, message_id) VALUES (?1, ?2)",
@@ -1405,8 +1425,13 @@ fn upsert(conn: &Connection, c: &Change, seq: i64) -> ServerResult<()> {
                    hlc_wall = excluded.hlc_wall, hlc_counter = excluded.hlc_counter,
                    deleted_at = excluded.deleted_at, server_seq = excluded.server_seq",
                 params![
-                    p.message_id, p.tag_name, p.created_at, p.updated_at,
-                    h.device, h.wall, h.counter,
+                    p.message_id,
+                    p.tag_name,
+                    p.created_at,
+                    p.updated_at,
+                    h.device,
+                    h.wall,
+                    h.counter,
                     if c.deleted { Some(p.updated_at) } else { None },
                     seq
                 ],
@@ -1417,9 +1442,10 @@ fn upsert(conn: &Connection, c: &Change, seq: i64) -> ServerResult<()> {
 }
 
 fn decode<T: serde::de::DeserializeOwned>(c: &Change) -> ServerResult<T> {
-    let data = c.data.clone().ok_or_else(|| {
-        ServerError::Msg(format!("变更缺少 data：{} {}", c.kind.as_str(), c.id))
-    })?;
+    let data = c
+        .data
+        .clone()
+        .ok_or_else(|| ServerError::Msg(format!("变更缺少 data：{} {}", c.kind.as_str(), c.id)))?;
     serde_json::from_value(data)
         .map_err(|e| ServerError::Msg(format!("变更 data 解析失败（{}）：{e}", c.id)))
 }
@@ -1656,7 +1682,11 @@ mod tests {
         assert_eq!(first.cursor, 2);
         // 跨种类也必须严格按 seq 升序，客户端才能靠"后到的赢"正确重放
         assert_eq!(
-            first.changes.iter().filter_map(|c| c.seq).collect::<Vec<_>>(),
+            first
+                .changes
+                .iter()
+                .filter_map(|c| c.seq)
+                .collect::<Vec<_>>(),
             vec![1, 2]
         );
 
@@ -1729,7 +1759,11 @@ mod tests {
         // 注意检索是**连续子串**语义（见 core::search），不是分词：
         // 「读了」连续所以命中，「读书」不连续所以不该命中。
         s.push(&[msg("m1", 100, 0, "a", "今天读了点书")]).unwrap();
-        assert_eq!(search_hits(&s, "读了", 10).unwrap().len(), 1, "刚推上来就该能搜到");
+        assert_eq!(
+            search_hits(&s, "读了", 10).unwrap().len(),
+            1,
+            "刚推上来就该能搜到"
+        );
 
         // 改正文
         s.push(&[msg("m1", 200, 0, "a", "今天去爬山了")]).unwrap();
@@ -1806,7 +1840,10 @@ mod tests {
         // 改正文：旧词消失、新词出现、变更流里多一条
         let edited = s.edit_message(&m.id, "改成了别的").unwrap();
         assert_eq!(edited.body, "改成了别的");
-        assert!(search_hits(&s, "网页端", 10).unwrap().is_empty(), "旧正文要从索引里摘掉");
+        assert!(
+            search_hits(&s, "网页端", 10).unwrap().is_empty(),
+            "旧正文要从索引里摘掉"
+        );
         assert_eq!(search_hits(&s, "别的", 10).unwrap().len(), 1);
         assert_eq!(edited.created_at, m.created_at, "改正文不该动 created_at");
 
@@ -1822,7 +1859,10 @@ mod tests {
         let p: MessagePayload = decode(&tomb).unwrap();
         assert!(tomb.deleted);
         assert!(p.updated_at > 0, "墓碑时间取自 payload 的 updatedAt");
-        assert!(search_hits(&s, "别的", 10).unwrap().is_empty(), "墓碑要从索引里摘掉");
+        assert!(
+            search_hits(&s, "别的", 10).unwrap().is_empty(),
+            "墓碑要从索引里摘掉"
+        );
     }
 
     /// 校验规则和桌面端**共用同一份**（`messagenote_store::normalize`）。
@@ -1834,7 +1874,10 @@ mod tests {
         let s = store();
 
         assert!(s.create_message("   ", None).is_err(), "空内容要拒绝");
-        assert!(s.create_message("\n\t\n", None).is_err(), "只有空白的也要拒绝");
+        assert!(
+            s.create_message("\n\t\n", None).is_err(),
+            "只有空白的也要拒绝"
+        );
         assert!(s.create_channel("  ",).is_err(), "空频道名要拒绝");
 
         let m = s.create_message("正常内容", None).unwrap();
@@ -1843,7 +1886,10 @@ mod tests {
             "目标频道不存在要拒绝"
         );
         assert!(s.edit_message(&m.id, "  ").is_err(), "改成空要拒绝");
-        assert!(s.rename_channel(&m.channel_id, "  ").is_err(), "频道名改成空要拒绝");
+        assert!(
+            s.rename_channel(&m.channel_id, "  ").is_err(),
+            "频道名改成空要拒绝"
+        );
         assert!(
             s.remove_channel(&m.channel_id).is_err(),
             "收件箱是默认捕获目标，不能删除"
@@ -1859,7 +1905,8 @@ mod tests {
         let m = s.create_message("带标签的一条", None).unwrap();
         let before = s.max_seq().unwrap();
 
-        s.set_message_tags(&m.id, &["水果".into(), " 水果 ".into(), "".into()]).unwrap();
+        s.set_message_tags(&m.id, &["水果".into(), " 水果 ".into(), "".into()])
+            .unwrap();
         let after_add = s.max_seq().unwrap();
         // 一个 tag 行 + 一个 message_tag 行
         assert_eq!(after_add - before, 2, "新增两个标签应当只产生两条变更");
@@ -1967,7 +2014,10 @@ mod tests {
             .unwrap();
         }
 
-        assert!(s.session_is_valid(&sess.session).unwrap(), "还没过期，应当有效");
+        assert!(
+            s.session_is_valid(&sess.session).unwrap(),
+            "还没过期，应当有效"
+        );
 
         let after: i64 = s
             .conn()

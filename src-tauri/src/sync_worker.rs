@@ -31,7 +31,8 @@ pub const STATUS_EVENT: &str = "sync://status";
 
 #[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SyncStatus {    pub ok: bool,
+pub struct SyncStatus {
+    pub ok: bool,
     pub message: String,
     pub pushed: usize,
     pub pulled: usize,

@@ -65,7 +65,6 @@ pub struct SearchPage {
     pub has_more: bool,
 }
 
-
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TagCount {

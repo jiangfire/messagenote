@@ -24,11 +24,9 @@ const COUNTER_KEY: &str = "hlc_counter";
 
 /// 读一个 meta 值。
 pub fn get(conn: &Connection, key: &str) -> rusqlite::Result<Option<String>> {
-    conn.query_row(
-        "SELECT value FROM meta WHERE key = ?1",
-        params![key],
-        |r| r.get(0),
-    )
+    conn.query_row("SELECT value FROM meta WHERE key = ?1", params![key], |r| {
+        r.get(0)
+    })
     .optional()
 }
 

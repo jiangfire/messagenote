@@ -189,10 +189,9 @@ pub fn run() {
             };
             let db = match db::open(&db_path) {
                 Ok(db) => db,
-                Err(e) => fatal::report(&format!(
-                    "打不开数据库：{e}\n\n路径：{}",
-                    db_path.display()
-                )),
+                Err(e) => {
+                    fatal::report(&format!("打不开数据库：{e}\n\n路径：{}", db_path.display()))
+                }
             };
             app.manage(db);
 
@@ -210,8 +209,7 @@ pub fn run() {
             // 快捷键被别的程序占用是**非致命**的：托盘还在，功能不受损，
             // 只是少了最顺手的那条路径。所以这里只记一笔，不拦启动 ——
             // 但那一笔会显示到界面上（`fatal::startup_warnings`）。
-            let shortcut =
-                Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::Space);
+            let shortcut = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::Space);
             {
                 use tauri_plugin_global_shortcut::GlobalShortcutExt;
                 if let Err(e) = app.global_shortcut().register(shortcut) {
@@ -241,10 +239,12 @@ pub fn run() {
                 let _ = window.hide();
             }
             // 浮层失去焦点就自动收起 —— 点别处即消失，不需要去够 Esc。
-            WindowEvent::Focused(false) if window.label() == CAPTURE_LABEL => {
-                if now_ms() - CAPTURE_SHOWN_AT.load(Ordering::SeqCst) > CAPTURE_FOCUS_GRACE_MS {
-                    let _ = window.hide();
-                }
+            WindowEvent::Focused(false)
+                if window.label() == CAPTURE_LABEL
+                    && now_ms() - CAPTURE_SHOWN_AT.load(Ordering::SeqCst)
+                        > CAPTURE_FOCUS_GRACE_MS =>
+            {
+                let _ = window.hide();
             }
             _ => {}
         })

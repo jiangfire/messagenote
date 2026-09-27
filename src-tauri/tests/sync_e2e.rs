@@ -142,15 +142,15 @@ fn two_clients_converge_through_a_real_http_server() {
 
     let snap_a = snapshot(&a.conn().unwrap());
     let snap_b = snapshot(&b.conn().unwrap());
-    assert_eq!(
-        snap_a, snap_b,
-        "两台设备经真实服务端同步后必须逐字节一致"
-    );
+    assert_eq!(snap_a, snap_b, "两台设备经真实服务端同步后必须逐字节一致");
     assert!(
         snap_a.iter().any(|s| s.contains("端到端的第一条笔记")),
         "测试不能空跑"
     );
-    assert!(snap_a.iter().any(|s| s.contains("测试频道")), "频道也要同步过去");
+    assert!(
+        snap_a.iter().any(|s| s.contains("测试频道")),
+        "频道也要同步过去"
+    );
 
     // B 上的中文检索要能用：本地索引是各设备自己重建的，从不参与同步
     let conn = b.conn().unwrap();
@@ -158,7 +158,9 @@ fn two_clients_converge_through_a_real_http_server() {
     assert_eq!(search_hits(&conn, "频道", 10).unwrap().len(), 1);
 
     let dirty: i64 = conn
-        .query_row("SELECT COUNT(*) FROM message WHERE dirty = 1", [], |r| r.get(0))
+        .query_row("SELECT COUNT(*) FROM message WHERE dirty = 1", [], |r| {
+            r.get(0)
+        })
         .unwrap();
     assert_eq!(dirty, 0, "同步到静止后不该残留待上传的行");
 }
@@ -210,7 +212,9 @@ fn a_deletion_propagates_as_a_tombstone() {
 
     let id = {
         let conn = a.conn().unwrap();
-        db::append_message(&conn, "这条稍后会被删", None).unwrap().id
+        db::append_message(&conn, "这条稍后会被删", None)
+            .unwrap()
+            .id
     };
     sync_until_quiet(&a, &api);
     sync_until_quiet(&b, &api);
@@ -454,7 +458,10 @@ fn desktop_and_server_agree_on_browse_and_search() {
     // ---- 加载更多：翻到第二页，两端同样必须一致 ----
     assert_eq!(
         serde_json::to_value(db::search_page(&conn, "苹果", 1, 1).unwrap()).unwrap(),
-        get_json(addr, &format!("/api/search?q={}&limit=1&offset=1", pct("苹果"))),
+        get_json(
+            addr,
+            &format!("/api/search?q={}&limit=1&offset=1", pct("苹果"))
+        ),
         "检索的第二页两端必须一致"
     );
 
@@ -558,7 +565,9 @@ fn write_req_with(
     let resp = match (method, body) {
         ("POST", Some(b)) => ureq::post(&url).header("Authorization", &auth).send_json(b),
         ("PUT", Some(b)) => ureq::put(&url).header("Authorization", &auth).send_json(b),
-        ("PATCH", Some(b)) => ureq::patch(&url).header("Authorization", &auth).send_json(b),
+        ("PATCH", Some(b)) => ureq::patch(&url)
+            .header("Authorization", &auth)
+            .send_json(b),
         ("DELETE", _) => ureq::delete(&url).header("Authorization", &auth).call(),
         _ => panic!("这里不支持 {method}（或者忘了给 body）"),
     }
@@ -765,7 +774,13 @@ fn a_session_token_works_for_reads_and_writes() {
     );
 
     // ---- 会话也能写 ----
-    let created = write_req_with(addr, "POST", "/api/message", Some(&serde_json::json!({ "body": "用会话写的" })), &session);
+    let created = write_req_with(
+        addr,
+        "POST",
+        "/api/message",
+        Some(&serde_json::json!({ "body": "用会话写的" })),
+        &session,
+    );
     assert_eq!(created["body"], "用会话写的");
 
     // ---- 没带凭据仍然 401 ----
@@ -861,6 +876,3 @@ fn a_rejected_push_surfaces_the_servers_explanation() {
         "应当把服务端那句话带出来（含具体的频道 id），实际：{msg}"
     );
 }
-
-
-

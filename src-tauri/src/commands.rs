@@ -65,7 +65,12 @@ pub fn list_timeline(
     let scope = db::Scope::parse(&scope, channel_id.as_deref(), tag.as_deref())
         .map_err(|e| AppError::Msg(e.to_string()))?;
 
-    Ok(db::list_messages(&conn, scope, limit.unwrap_or(120), cursor.as_ref())?)
+    Ok(db::list_messages(
+        &conn,
+        scope,
+        limit.unwrap_or(120),
+        cursor.as_ref(),
+    )?)
 }
 
 /// 两个参数必须**一起**给：只给时间戳等于退回单键游标，会漏记录。
@@ -135,11 +140,7 @@ pub fn timeline_stats(db: State<'_, Db>) -> AppResult<TimelineStats> {
 }
 
 #[tauri::command]
-pub fn set_message_tags(
-    db: State<'_, Db>,
-    message_id: String,
-    tags: Vec<String>,
-) -> AppResult<()> {
+pub fn set_message_tags(db: State<'_, Db>, message_id: String, tags: Vec<String>) -> AppResult<()> {
     let conn = db.conn()?;
     db::set_message_tags(&conn, &message_id, &tags)
 }
@@ -203,4 +204,3 @@ pub fn get_sync_status(worker: State<'_, SyncWorker>) -> Option<SyncStatus> {
 pub fn test_sync_connection(url: String, token: String) -> AppResult<HealthResponse> {
     crate::http::HttpServerApi::new(&url, &token)?.handshake()
 }
-

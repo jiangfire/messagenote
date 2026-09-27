@@ -43,7 +43,9 @@ use axum::routing::{get, patch, post, put};
 use axum::{Json, Router};
 
 use messagenote_core::hlc::now_ms;
-use messagenote_core::models::{Channel, Message, MessagePage, SearchPage, TagCount, TimelineStats};
+use messagenote_core::models::{
+    Channel, Message, MessagePage, SearchPage, TagCount, TimelineStats,
+};
 use messagenote_core::wire::{
     CreateChannelRequest, CreateMessageRequest, EditMessageRequest, HealthResponse, LoginRequest,
     MoveMessageRequest, PullQuery, PullResponse, PushRequest, PushResponse, RenameChannelRequest,
@@ -94,10 +96,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/channel/{id}",
             patch(rename_channel).delete(remove_channel),
         )
-        .route_layer(middleware::from_fn_with_state(
-            state.clone(),
-            require_token,
-        ));
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_token));
 
     Router::new()
         // 存活探针刻意**不鉴权**：给 Caddy、监控、uptime-kuma 用，

@@ -158,7 +158,10 @@ pub fn list_messages(
     args.push(Box::new(limit + 1));
 
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params_from_iter(args.iter().map(|b| b.as_ref())), row_to_message)?;
+    let rows = stmt.query_map(
+        params_from_iter(args.iter().map(|b| b.as_ref())),
+        row_to_message,
+    )?;
 
     let mut items = Vec::new();
     for r in rows {
@@ -429,7 +432,9 @@ fn load_tags(conn: &Connection, ids: &[String]) -> rusqlite::Result<HashMap<Stri
     if ids.is_empty() {
         return Ok(HashMap::new());
     }
-    let placeholders = std::iter::repeat("?").take(ids.len()).collect::<Vec<_>>().join(",");
+    let placeholders = std::iter::repeat_n("?", ids.len())
+        .collect::<Vec<_>>()
+        .join(",");
     let sql = format!(
         "SELECT mt.message_id, mt.tag_name
            FROM message_tag mt

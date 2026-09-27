@@ -1,5 +1,7 @@
 # MessageNote
 
+[![CI](https://github.com/jiangfire/messagenote/actions/workflows/ci.yml/badge.svg)](https://github.com/jiangfire/messagenote/actions/workflows/ci.yml)
+
 聊天框式的**本地优先**笔记应用。
 
 ## 这个产品在赌什么
@@ -22,6 +24,9 @@
 
 ## 快速开始
 
+需要 **Rust 1.87+**（用到了 `is_multiple_of` / `repeat_n`）、**Node 24**、**pnpm 12**。
+Windows 上还需要 WebView2（Win10/11 自带）。
+
 ```bash
 pnpm install
 pnpm tauri dev      # 开发（会拉起 Vite + 编译 Rust + 打开窗口）
@@ -30,7 +35,24 @@ pnpm tauri build    # 打 Windows 安装包 (NSIS)
 
 首次 `cargo` 构建需要下载依赖树（Tauri 约 400 个 crate），之后全部走本地缓存。
 
+### 测试
+
+```bash
+cargo test --workspace                 # Rust：内核 / 存储 / 服务端 / 端到端
+pnpm build                             # 前端：类型检查 + 打包
+node scripts/check-web-bundle.mjs dist # 网页端 bundle 里不能混进 Tauri
+pwsh scripts/web-e2e/run.ps1           # 真实浏览器端到端（需先 pnpm build + 编服务端）
+```
+
+CI（[`.github/workflows/ci.yml`](.github/workflows/ci.yml)）跑的就是这些。
+打 `v*` tag 会触发 [`release.yml`](.github/workflows/release.yml)，
+构建并发布 Windows 安装包、免安装版，以及三个平台的服务端二进制。
+
 ### 开发环境注意事项
+
+**关于国内镜像**：仓库里的 `.cargo/config.toml` 把 crates.io 指向了阿里云，
+这是**有意提交**的，方便国内开发。GitHub 的 runner 在美国，所以 CI 里会先把它
+删掉改用官方源 —— 绕那一圈既慢，又多一个第三方故障点。
 
 在**受限沙箱**（例如 DSH 的 workspace-write 模式）里构建时有两个坑：
 

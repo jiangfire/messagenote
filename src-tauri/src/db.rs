@@ -633,7 +633,9 @@ mod tests {
     fn fresh_database_lands_on_the_latest_schema_version() {
         let db = mem();
         let conn = db.conn().unwrap();
-        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(v, SCHEMA_VERSION, "新建库应当直接是最新版本");
     }
 
@@ -707,9 +709,15 @@ mod tests {
         assert_eq!(search_hits(&conn, "待办", 10).unwrap().len(), 1);
         delete_message(&conn, &msg.id).unwrap();
 
-        assert!(search_hits(&conn, "待办", 10).unwrap().is_empty(), "删除后不应还能搜到");
         assert!(
-            list_messages(&conn, Scope::All, 50, None).unwrap().items.is_empty(),
+            search_hits(&conn, "待办", 10).unwrap().is_empty(),
+            "删除后不应还能搜到"
+        );
+        assert!(
+            list_messages(&conn, Scope::All, 50, None)
+                .unwrap()
+                .items
+                .is_empty(),
             "删除后不应出现在列表里"
         );
     }
@@ -722,8 +730,15 @@ mod tests {
 
         update_message(&conn, &msg.id, "全新的内容关于量子计算").unwrap();
 
-        assert!(search_hits(&conn, "旧的", 10).unwrap().is_empty(), "旧内容不应还能搜到");
-        assert_eq!(search_hits(&conn, "量子", 10).unwrap().len(), 1, "新内容必须立刻可检索");
+        assert!(
+            search_hits(&conn, "旧的", 10).unwrap().is_empty(),
+            "旧内容不应还能搜到"
+        );
+        assert_eq!(
+            search_hits(&conn, "量子", 10).unwrap().len(),
+            1,
+            "新内容必须立刻可检索"
+        );
     }
 
     #[test]
@@ -740,7 +755,12 @@ mod tests {
         let conn = db.conn().unwrap();
         let msg = append_message(&conn, "一条带标签的记录", None).unwrap();
 
-        set_message_tags(&conn, &msg.id, &["工作".into(), "工作".into(), " 重要 ".into()]).unwrap();
+        set_message_tags(
+            &conn,
+            &msg.id,
+            &["工作".into(), "工作".into(), " 重要 ".into()],
+        )
+        .unwrap();
 
         let page = list_messages(&conn, Scope::All, 50, None).unwrap();
         assert_eq!(
@@ -750,7 +770,10 @@ mod tests {
         );
 
         assert_eq!(
-            list_messages(&conn, Scope::Tag("工作"), 50, None).unwrap().items.len(),
+            list_messages(&conn, Scope::Tag("工作"), 50, None)
+                .unwrap()
+                .items
+                .len(),
             1
         );
     }
@@ -766,7 +789,10 @@ mod tests {
         set_message_tags(&conn, &msg.id, &[]).unwrap();
 
         assert!(
-            list_tags(&conn).unwrap().iter().any(|t| t.name == "会被取消的标签"),
+            list_tags(&conn)
+                .unwrap()
+                .iter()
+                .any(|t| t.name == "会被取消的标签"),
             "取消打标签后标签本身必须保留，否则会误删其它设备在用的同名标签"
         );
     }
@@ -804,7 +830,10 @@ mod tests {
 
         // 它们并没有消失，只是换了归属
         assert_eq!(
-            list_messages(&conn, Scope::All, 50, None).unwrap().items.len(),
+            list_messages(&conn, Scope::All, 50, None)
+                .unwrap()
+                .items
+                .len(),
             2,
             "时间线里两条都还在"
         );
@@ -830,21 +859,33 @@ mod tests {
         set_message_tags(&conn, &m.id, &["重要".into()]).unwrap();
 
         assert_eq!(
-            list_messages(&conn, Scope::Unfiled, 50, None).unwrap().items.len(),
+            list_messages(&conn, Scope::Unfiled, 50, None)
+                .unwrap()
+                .items
+                .len(),
             1,
             "打标签不该让消息离开收件箱 —— 那是频道的职责"
         );
         assert_eq!(
-            list_messages(&conn, Scope::Tag("重要"), 50, None).unwrap().items.len(),
+            list_messages(&conn, Scope::Tag("重要"), 50, None)
+                .unwrap()
+                .items
+                .len(),
             1
         );
 
         // 归档之后，标签仍然能查到它（横切）
         let ch = create_channel(&conn, "项目").unwrap();
         move_message(&conn, &m.id, &ch.id).unwrap();
-        assert!(list_messages(&conn, Scope::Unfiled, 50, None).unwrap().items.is_empty());
+        assert!(list_messages(&conn, Scope::Unfiled, 50, None)
+            .unwrap()
+            .items
+            .is_empty());
         assert_eq!(
-            list_messages(&conn, Scope::Tag("重要"), 50, None).unwrap().items.len(),
+            list_messages(&conn, Scope::Tag("重要"), 50, None)
+                .unwrap()
+                .items
+                .len(),
             1,
             "归档不该让标签失效 —— 频道和标签是正交的两个维度"
         );
@@ -859,11 +900,17 @@ mod tests {
         set_message_tags(&conn, &m.id, &["工作".into(), "重要".into()]).unwrap();
 
         assert_eq!(
-            list_messages(&conn, Scope::Tag("工作"), 50, None).unwrap().items.len(),
+            list_messages(&conn, Scope::Tag("工作"), 50, None)
+                .unwrap()
+                .items
+                .len(),
             1
         );
         assert_eq!(
-            list_messages(&conn, Scope::Tag("重要"), 50, None).unwrap().items.len(),
+            list_messages(&conn, Scope::Tag("重要"), 50, None)
+                .unwrap()
+                .items
+                .len(),
             1
         );
     }
@@ -883,11 +930,17 @@ mod tests {
         assert_eq!(stats.unfiled, 1);
         assert_eq!(
             stats.total,
-            list_messages(&conn, Scope::All, 50, None).unwrap().items.len() as i64
+            list_messages(&conn, Scope::All, 50, None)
+                .unwrap()
+                .items
+                .len() as i64
         );
         assert_eq!(
             stats.unfiled,
-            list_messages(&conn, Scope::Unfiled, 50, None).unwrap().items.len() as i64
+            list_messages(&conn, Scope::Unfiled, 50, None)
+                .unwrap()
+                .items
+                .len() as i64
         );
     }
 
@@ -1026,10 +1079,18 @@ mod tests {
         let b = append_message(&conn, "第二条", None).unwrap();
 
         let (dirty_a, dirty_b): (i64, i64) = (
-            conn.query_row("SELECT dirty FROM message WHERE id=?1", params![a.id], |r| r.get(0))
-                .unwrap(),
-            conn.query_row("SELECT dirty FROM message WHERE id=?1", params![b.id], |r| r.get(0))
-                .unwrap(),
+            conn.query_row(
+                "SELECT dirty FROM message WHERE id=?1",
+                params![a.id],
+                |r| r.get(0),
+            )
+            .unwrap(),
+            conn.query_row(
+                "SELECT dirty FROM message WHERE id=?1",
+                params![b.id],
+                |r| r.get(0),
+            )
+            .unwrap(),
         );
         assert_eq!((dirty_a, dirty_b), (1, 1), "本地写入必须标记为待上传");
 
@@ -1044,14 +1105,21 @@ mod tests {
         let db = mem();
         let conn = db.conn().unwrap();
         let msg = append_message(&conn, "原始内容", None).unwrap();
-        conn.execute("UPDATE message SET dirty = 0 WHERE id = ?1", params![msg.id])
-            .unwrap();
+        conn.execute(
+            "UPDATE message SET dirty = 0 WHERE id = ?1",
+            params![msg.id],
+        )
+        .unwrap();
         let before = hlc_of(&conn, "message", &msg.id);
 
         update_message(&conn, &msg.id, "改过的内容").unwrap();
 
         let dirty: i64 = conn
-            .query_row("SELECT dirty FROM message WHERE id=?1", params![msg.id], |r| r.get(0))
+            .query_row(
+                "SELECT dirty FROM message WHERE id=?1",
+                params![msg.id],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(dirty, 1);
         assert!(hlc_of(&conn, "message", &msg.id) > before);
@@ -1092,10 +1160,16 @@ mod tests {
             [],
         )
         .unwrap();
-        conn.execute("INSERT INTO tag (id,name,created_at) VALUES ('t1','工作',100)", [])
-            .unwrap();
-        conn.execute("INSERT INTO message_tag (message_id,tag_id) VALUES ('m1','t1')", [])
-            .unwrap();
+        conn.execute(
+            "INSERT INTO tag (id,name,created_at) VALUES ('t1','工作',100)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message_tag (message_id,tag_id) VALUES ('m1','t1')",
+            [],
+        )
+        .unwrap();
         conn.execute_batch("PRAGMA user_version = 1;").unwrap();
 
         migrate(&conn).unwrap();
@@ -1192,11 +1266,9 @@ mod tests {
         assert_eq!(chans_after, chans_before, "迁移不能丢频道");
 
         let stale: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM message WHERE dirty = 0",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT COUNT(*) FROM message WHERE dirty = 0", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(stale, 0, "迁移后所有历史消息都必须是待上传状态");
 
@@ -1340,7 +1412,10 @@ mod tests {
         append_message(&conn, "唯一一条", None).unwrap();
 
         let empty = search_page(&conn, "   ", 10, 0).unwrap();
-        assert!(empty.items.is_empty() && !empty.has_more, "空查询应当没有结果");
+        assert!(
+            empty.items.is_empty() && !empty.has_more,
+            "空查询应当没有结果"
+        );
 
         let none = search_page(&conn, "不存在的词", 10, 0).unwrap();
         assert!(none.items.is_empty() && !none.has_more);
