@@ -5,6 +5,14 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  # 也给一个手动入口。没有它的话，发布这一步失败（比如附件名写错）
+  # 就只能"删 tag 再推一遍"来重试 —— 而那时 tag 可能已经对外可见了。
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 要发布的 tag（例如 v1.2.0）
+        required: true
+        type: string
 
 # 创建 Release 需要写权限。其余一律只读。
 permissions:
@@ -19,6 +27,9 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # 手动触发时用输入的 tag；tag push 时就是推上来的那个
+          ref: ${{ inputs.tag || github.ref_name }}
 
       - name: 改用官方 crates.io 源
         shell: bash
@@ -83,6 +94,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          # 手动触发时用输入的 tag；tag push 时就是推上来的那个
+          ref: ${{ inputs.tag || github.ref_name }}
 
       - name: 改用官方 crates.io 源
         shell: bash
@@ -133,9 +147,11 @@ jobs:
       # messagenote.exe / messagenote-server 这种名字下载下来就分不清了。
       - name: 整理文件名
         shell: bash
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
-          V="${GITHUB_REF_NAME#v}"
+          V="${TAG#v}"
           mkdir -p out
           cp artifacts/desktop-windows/messagenote.exe \
              "out/MessageNote_${V}_x64-portable.exe"
@@ -147,7 +163,8 @@ jobs:
              "out/messagenote-server_${V}_linux-x64"
           cp artifacts/server-x86_64-unknown-linux-musl/messagenote-server \
              "out/messagenote-server_${V}_linux-x64-static"
-          chmod +x out/messagenote-server_linux-x64*
+          # 版本号在文件名中间，glob 里不能漏掉那一段
+          chmod +x out/messagenote-server_"${V}"_linux-x64*
           ls -la out
 
       - name: 创建或更新 Release
@@ -156,14 +173,15 @@ jobs:
           # 这个 job 刻意没有 actions/checkout —— 它只整理产物、调 gh。
           # 但那样就没有 .git 目录，gh 认不出是哪个仓库，所以要显式告诉它。
           GH_REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag || github.ref_name }}
         shell: bash
         run: |
           set -euo pipefail
           # 允许重跑：tag 已经发过 Release 时改成覆盖附件，而不是报错退出
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" out/* --clobber
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" out/* --clobber
           else
-            gh release create "$GITHUB_REF_NAME" out/* \
-              --title "MessageNote $GITHUB_REF_NAME" \
+            gh release create "$TAG" out/* \
+              --title "MessageNote $TAG" \
               --generate-notes
           fi
