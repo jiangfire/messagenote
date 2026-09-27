@@ -322,6 +322,26 @@ kbd {
   flex: 1;
 }
 
+/*
+  启动警告条（全局快捷键被占用之类）。
+  和错误条区分开：错误是"这次操作失败了"，警告是"某个功能没启用"——
+  后者不该用危险色，它不吓人，只是需要被知道。
+*/
+.notice-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 18px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 13px;
+  border-bottom: 1px solid var(--border);
+}
+
+.notice-bar span {
+  flex: 1;
+}
+
 .more-hint {
   padding: 6px 18px;
   font-size: 12px;
@@ -935,6 +955,15 @@ kbd {
 .load-older.start {
   padding-top: 4px;
   opacity: 0.65;
+}
+
+/* 检索结果的"加载更多"。
+   刻意做成一个明确的按钮而不是滚动自动加载：检索是瞬态视图，
+   用户需要一个"我看到头了"的确定信号，而不是无限往下滑。 */
+.load-more-row {
+  display: flex;
+  justify-content: center;
+  padding: 14px 0 22px;
 }
 
 /* 时间线上方的筛选条。

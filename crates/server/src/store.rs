@@ -34,7 +34,9 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 use messagenote_core::hlc::{now_ms, Hlc};
 use messagenote_core::merge;
-use messagenote_core::models::{Channel, Message, MessagePage, SearchHit, TagCount, TimelineStats};
+use messagenote_core::models::{
+    Channel, Message, MessagePage, SearchPage, TagCount, TimelineStats,
+};
 use messagenote_core::payload::{
     message_tag_key, ChannelPayload, MessagePayload, MessageTagPayload, TagPayload,
 };
@@ -278,6 +280,12 @@ impl Store {
             // "谁更新"得出完全一致的结论，否则两边各自认为自己的版本胜出，
             // 最终收敛不到同一个状态，而且不报任何错。
             if merge::should_accept_push(&c.hlc, stored.as_ref()) {
+                // 引用完整性。**必须整批拒绝，不能"接受下来以后再说"**：
+                // 客户端的表有外键，一条引用不存在的行会让接收端**整批拉取回滚**，
+                // 而且此后每次同步都在同一个地方失败 —— 那台客户端永久卡死。
+                // 一个坏客户端能因此锁死所有好客户端。
+                check_references(&tx, c)?;
+
                 let seq = next_seq(&tx)?;
                 upsert(&tx, c, seq)?;
 
@@ -346,9 +354,9 @@ impl Store {
         Ok(messagenote_store::list_messages(&conn, scope, limit, before)?)
     }
 
-    pub fn search(&self, query: &str, limit: i64) -> ServerResult<Vec<SearchHit>> {
+    pub fn search(&self, query: &str, limit: i64, offset: i64) -> ServerResult<SearchPage> {
         let conn = self.conn()?;
-        Ok(messagenote_store::search(&conn, query, limit)?)
+        Ok(messagenote_store::search_page(&conn, query, limit, offset)?)
     }
 
     // ---------------------------------------------------------------- 代笔写入
@@ -1245,6 +1253,60 @@ fn backfill_fts(conn: &Connection) -> ServerResult<()> {
     Ok(())
 }
 
+/// 校验一条变更引用的行都存在。
+///
+/// **为什么值得单独做这一步**：我们自己的客户端不会触发它 ——
+/// `pending_changes` 保证同一个批次里频道整体排在消息之前，而上一批推过的
+/// 频道已经落库了。所以这里失败意味着**对端有 bug，或者根本不是我们的客户端**。
+///
+/// 那正是要拦住的东西：一条指向不存在频道的消息落到服务端之后，会被所有客户端
+/// 拉到，而客户端的 `message` 表有指向 `channel` 的外键 —— 那条插入失败会让
+/// **整批拉取回滚**，此后每次同步都从同一个地方失败。一个坏客户端能锁死所有
+/// 好客户端，而且受害的那台看起来只是"同步一直失败"。
+///
+/// 注意判的是**存在性**，不是"没被删"：墓碑行仍然满足外键，客户端也照样能插入。
+/// 判错了会把"频道被删了但消息还没同步到"这种正常时序当成错误。
+fn check_references(conn: &Connection, c: &Change) -> ServerResult<()> {
+    match c.kind {
+        EntityKind::Channel | EntityKind::Tag => Ok(()),
+
+        EntityKind::Message => {
+            let p: MessagePayload = decode(c)?;
+            if !row_exists(conn, "channel", "id", &p.channel_id)? {
+                return Err(ServerError::bad_request(format!(
+                    "消息 {} 指向不存在的频道「{}」",
+                    c.id, p.channel_id
+                )));
+            }
+            Ok(())
+        }
+
+        EntityKind::MessageTag => {
+            let p: MessageTagPayload = decode(c)?;
+            if !row_exists(conn, "message", "id", &p.message_id)? {
+                return Err(ServerError::bad_request(format!(
+                    "标签关联 {} 指向不存在的消息「{}」",
+                    c.id, p.message_id
+                )));
+            }
+            if !row_exists(conn, "tag", "name", &p.tag_name)? {
+                return Err(ServerError::bad_request(format!(
+                    "标签关联 {} 指向不存在的标签「{}」",
+                    c.id, p.tag_name
+                )));
+            }
+            Ok(())
+        }
+    }
+}
+
+/// `table` / `column` 只来自上面那个函数里的字面量，不接受外部输入。
+fn row_exists(conn: &Connection, table: &str, column: &str, value: &str) -> ServerResult<bool> {
+    let sql = format!("SELECT 1 FROM {table} WHERE {column} = ?1");
+    let found: Option<i64> = conn.query_row(&sql, params![value], |r| r.get(0)).optional()?;
+    Ok(found.is_some())
+}
+
 /// 把一条已接受的变更落库，并打上新的 seq。
 ///
 /// 时间字段一律取自变更本身（含墓碑的 `deleted_at`，用 payload 的
@@ -1369,6 +1431,17 @@ mod tests {
 
     // 共享存储层。这里是**服务端**第一次真的用它 —— 见 shared_browse_queries_…
     use messagenote_store::{Cursor, Scope};
+
+    /// 测试只关心"搜到几条、是哪几条"，不关心分页 —— 统一取第一页。
+    ///
+    /// 返回 `Result` 是为了让调用点保持原来的 `….unwrap()` 形状。
+    fn search_hits(
+        s: &Store,
+        q: &str,
+        n: i64,
+    ) -> ServerResult<Vec<messagenote_core::models::SearchHit>> {
+        Ok(s.search(q, n, 0)?.items)
+    }
 
     fn store() -> Store {
         Store::in_memory().unwrap()
@@ -1640,7 +1713,7 @@ mod tests {
         // 检索索引和正文在同一个事务里，所以它同样不能留下半截内容 ——
         // 否则会出现"搜得到一条根本不存在的消息"
         assert!(
-            s.search("好的", 10).unwrap().is_empty(),
+            search_hits(&s, "好的", 10).unwrap().is_empty(),
             "整批回滚时，检索索引里也不能留下那条消息"
         );
     }
@@ -1656,22 +1729,22 @@ mod tests {
         // 注意检索是**连续子串**语义（见 core::search），不是分词：
         // 「读了」连续所以命中，「读书」不连续所以不该命中。
         s.push(&[msg("m1", 100, 0, "a", "今天读了点书")]).unwrap();
-        assert_eq!(s.search("读了", 10).unwrap().len(), 1, "刚推上来就该能搜到");
+        assert_eq!(search_hits(&s, "读了", 10).unwrap().len(), 1, "刚推上来就该能搜到");
 
         // 改正文
         s.push(&[msg("m1", 200, 0, "a", "今天去爬山了")]).unwrap();
         assert!(
-            s.search("读了", 10).unwrap().is_empty(),
+            search_hits(&s, "读了", 10).unwrap().is_empty(),
             "正文改掉之后旧词不能再搜到 —— 还能搜到就说明索引和数据已经漂移"
         );
-        assert_eq!(s.search("爬山", 10).unwrap().len(), 1);
+        assert_eq!(search_hits(&s, "爬山", 10).unwrap().len(), 1);
 
         // 删除
         let mut tomb = msg("m1", 300, 0, "a", "今天去爬山了");
         tomb.deleted = true;
         s.push(&[tomb]).unwrap();
         assert!(
-            s.search("爬山", 10).unwrap().is_empty(),
+            search_hits(&s, "爬山", 10).unwrap().is_empty(),
             "墓碑必须从索引里摘掉"
         );
     }
@@ -1703,7 +1776,7 @@ mod tests {
             backfill_fts(&conn).unwrap();
         }
 
-        let hits = s.search("升级", 10).unwrap();
+        let hits = search_hits(&s, "升级", 10).unwrap();
         assert_eq!(hits.len(), 1, "回填之后，升级前就有的数据也要搜得到");
         assert_eq!(hits[0].message.id, "old-1");
     }
@@ -1728,13 +1801,13 @@ mod tests {
         );
 
         // 索引维护走的是和 push 同一条路径，所以立刻能搜到
-        assert_eq!(s.search("网页端", 10).unwrap().len(), 1);
+        assert_eq!(search_hits(&s, "网页端", 10).unwrap().len(), 1);
 
         // 改正文：旧词消失、新词出现、变更流里多一条
         let edited = s.edit_message(&m.id, "改成了别的").unwrap();
         assert_eq!(edited.body, "改成了别的");
-        assert!(s.search("网页端", 10).unwrap().is_empty(), "旧正文要从索引里摘掉");
-        assert_eq!(s.search("别的", 10).unwrap().len(), 1);
+        assert!(search_hits(&s, "网页端", 10).unwrap().is_empty(), "旧正文要从索引里摘掉");
+        assert_eq!(search_hits(&s, "别的", 10).unwrap().len(), 1);
         assert_eq!(edited.created_at, m.created_at, "改正文不该动 created_at");
 
         // 删除：墓碑要进变更流，且带上 payload 的 updated_at
@@ -1749,7 +1822,7 @@ mod tests {
         let p: MessagePayload = decode(&tomb).unwrap();
         assert!(tomb.deleted);
         assert!(p.updated_at > 0, "墓碑时间取自 payload 的 updatedAt");
-        assert!(s.search("别的", 10).unwrap().is_empty(), "墓碑要从索引里摘掉");
+        assert!(search_hits(&s, "别的", 10).unwrap().is_empty(), "墓碑要从索引里摘掉");
     }
 
     /// 校验规则和桌面端**共用同一份**（`messagenote_store::normalize`）。
@@ -2006,9 +2079,56 @@ mod tests {
         assert_eq!(unfiled.items[0].channel_id, "inbox");
 
         // 正文没变，所以检索也还找得到。
-        // 注意这里走 `messagenote_store::search(&conn, …)` 而不是 `s.search(…)`：
+        // 注意这里走 `messagenote_store::search(&conn, …)` 而不是 `search_hits(&s, …)`：
         // 上面那个 `conn` 还握着锁，`Store` 的方法会再拿一次同一把锁 ——
         // `std::sync::Mutex` 不可重入，那不是变慢，是直接死锁。
-        assert_eq!(messagenote_store::search(&conn, "频道里", 10).unwrap().len(), 1);
+        assert_eq!(
+            messagenote_store::search_page(&conn, "频道里", 10, 0)
+                .unwrap()
+                .items
+                .len(),
+            1
+        );
+    }
+
+    /// 服务端必须拦住"指向不存在的频道"的消息。
+    ///
+    /// 危害比"存了一条脏数据"大得多：客户端的 `message` 表有指向 `channel` 的
+    /// 外键，那条插入失败会让**整批拉取回滚**，此后每次同步都从同一个地方失败。
+    /// 受害的那台客户端看起来只是"同步一直失败"，找不到原因。
+    #[test]
+    fn a_change_pointing_at_a_missing_row_is_rejected() {
+        let s = store();
+
+        // 刻意不先推频道
+        let err = s.push(&[msg_in("m1", "ch-nope", 100, "孤儿消息")]);
+        assert!(err.is_err(), "指向不存在频道的消息必须被拒绝：{err:?}");
+
+        // **整批**拒绝：什么都没落库，seq 也没动
+        assert_eq!(s.max_seq().unwrap(), 0, "被拒绝的批次不该分配 seq");
+        assert_eq!(s.pull(0, 100).unwrap().changes.len(), 0);
+
+        // 同一个批次里先把频道推上去，就是合法的 —— 正常路径正是这样
+        let ok = s.push(&[
+            channel_change("ch-ok", "正常频道", "normal", 1, 50),
+            msg_in("m1", "ch-ok", 100, "有主的消息"),
+        ]);
+        assert!(ok.is_ok(), "同批次里先有频道就该接受：{ok:?}");
+
+        // 标签关联也走同一套校验
+        let err = s.push(&[msg_tag_change("不存在的消息", "不存在的标签", 200)]);
+        assert!(err.is_err(), "指向不存在消息的标签关联必须被拒绝：{err:?}");
+
+        // 频道被删了（墓碑还在）不算"不存在" —— 外键仍然满足，
+        // 判成错误会把"频道删了但消息还没同步到"这种正常时序卡住
+        let ch = s.create_channel("临时").unwrap();
+        let m = s.create_message("里面的一条", Some(&ch.id)).unwrap();
+        s.remove_channel(&ch.id).unwrap();
+        let again = s.push(&[msg_in("m2", &ch.id, 300, "往墓碑频道里写")]);
+        assert!(
+            again.is_ok(),
+            "频道的墓碑行还在，外键满足，不该当成引用错误：{again:?}"
+        );
+        let _ = m;
     }
 }

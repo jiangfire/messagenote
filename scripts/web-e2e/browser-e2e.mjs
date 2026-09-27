@@ -230,6 +230,55 @@ ok(
   (await text()).includes("地铁上想到的一个点子")
 );
 
+// ---------------------------------------------------------------- 检索分页
+console.log("== 检索分页（加载更多结果）==");
+
+// 造够一页以上的命中。经 API 直接写 —— 这一段不是被测对象，只是布置现场。
+const PAGE = 60; // 与 App.tsx 的 SEARCH_PAGE_SIZE 一致
+const total = PAGE + 12;
+{
+  const h = { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" };
+  for (let i = 0; i < total; i++) {
+    const r = await fetch(`${new URL(APP).origin}/api/message`, {
+      method: "POST",
+      headers: h,
+      body: JSON.stringify({ body: `批量记录 ${i}` }),
+    });
+    if (!r.ok) throw new Error(`造数据失败：HTTP ${r.status}`);
+  }
+}
+
+await fill(s, ".search-input", "批量记录");
+await sleep(1500); // 防抖 + 一次往返
+
+const rowCount = () => evaluate(s, "document.querySelectorAll('.msg-row').length");
+ok("首页给出整整一页", (await rowCount()) === PAGE, `实际 ${await rowCount()}`);
+
+const moreBtn = `[...document.querySelectorAll('.load-more-row button')].find(b => b.innerText.includes('加载更多'))`;
+ok("首页之后出现「加载更多结果」", await evaluate(s, `!!${moreBtn}`));
+await screenshot(s, `${SHOTS}/web-07-search-page1.png`);
+
+await click(s, ".load-more-row button");
+await waitFor(
+  s,
+  `document.querySelectorAll('.msg-row').length > ${PAGE}`,
+  "第二页出现"
+);
+ok(
+  "点了之后确实多出来了",
+  (await rowCount()) === total,
+  `总共应当 ${total} 条，实际 ${await rowCount()}`
+);
+ok(
+  "翻到底之后按钮消失，换成一句「没有更多了」",
+  await evaluate(s, `!${moreBtn} && document.body.innerText.includes('没有更多了')`)
+);
+await screenshot(s, `${SHOTS}/web-08-search-page2.png`);
+
+// 回到时间线，避免影响后面的判断
+await fill(s, ".search-input", "");
+await sleep(600);
+
 // ---------------------------------------------------------------- 收尾
 console.log("== 页面健康 ==");
 ok(

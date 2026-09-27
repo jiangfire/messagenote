@@ -19,6 +19,8 @@ import { SyncSettings } from "./components/SyncSettings";
 
 const PAGE_SIZE = 200;
 const SEARCH_DEBOUNCE_MS = 160;
+/** 检索一页给多少条。比时间线小 —— 结果是按相关性排的，翻太多反而更难挑。 */
+const SEARCH_PAGE_SIZE = 60;
 
 /**
  * 把视图映射成时间线的 scope 参数。
@@ -53,12 +55,16 @@ export default function App() {
   const [draft, setDraft] = useState("");
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<SearchHit[] | null>(null);
+  const [resultsHasMore, setResultsHasMore] = useState(false);
+  const [loadingMoreResults, setLoadingMoreResults] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [focusSignal, setFocusSignal] = useState(0);
   const [busy, setBusy] = useState(false);
   const [syncConfigured, setSyncConfigured] = useState(false);
   const [syncStatus, setSyncStatus] = useState<SyncStatus | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  /** 本次启动的非致命警告（快捷键被占用之类）。见下面的 effect。 */
+  const [notices, setNotices] = useState<string[]>([]);
 
   const searchRef = useRef<HTMLInputElement>(null);
 
@@ -158,18 +164,44 @@ export default function App() {
     const q = query.trim();
     if (!q) {
       setResults(null);
+      setResultsHasMore(false);
       return;
     }
     const timer = setTimeout(async () => {
       try {
         setError(null);
-        setResults(await api.searchMessages(q, 80));
+        const page = await api.searchMessages(q, SEARCH_PAGE_SIZE, 0);
+        setResults(page.items);
+        setResultsHasMore(page.hasMore);
       } catch (e) {
         setError(errorText(e));
       }
     }, SEARCH_DEBOUNCE_MS);
     return () => clearTimeout(timer);
   }, [api, query]);
+
+  /**
+   * 加载更多检索结果。
+   *
+   * 用 offset 往后看，而不是像时间线那样用游标往前翻 —— 检索按相关性排序，
+   * 排序键是会随语料变化的 bm25 分数，拿它做游标不稳。
+   */
+  const loadMoreResults = useCallback(async () => {
+    if (loadingMoreResults || !resultsHasMore || results === null) return;
+    const q = query.trim();
+    if (!q) return;
+
+    setLoadingMoreResults(true);
+    try {
+      const page = await api.searchMessages(q, SEARCH_PAGE_SIZE, results.length);
+      setResults((prev) => [...(prev ?? []), ...page.items]);
+      setResultsHasMore(page.hasMore);
+    } catch (e) {
+      setError(errorText(e));
+    } finally {
+      setLoadingMoreResults(false);
+    }
+  }, [api, loadingMoreResults, resultsHasMore, results, query]);
 
   async function run(action: () => Promise<unknown>) {
     try {
@@ -238,6 +270,21 @@ export default function App() {
     })();
     return desktop.onSyncStatus(setSyncStatus);
   }, [desktop, refreshSyncConfig]);
+
+  // 启动警告。挂载时**主动读一次**：它们产生于 Rust 侧的 setup 阶段，
+  // 那时窗口还没加载，事件推送根本没人听得到。
+  //
+  // 不显示的话，用户感受到的只是"这个软件有时候按快捷键没反应" ——
+  // 一个他永远查不出原因的现象。
+  useEffect(() => {
+    if (!desktop) return;
+    desktop
+      .getStartupWarnings()
+      .then(setNotices)
+      .catch(() => {
+        // 读不到警告不影响使用，静默即可
+      });
+  }, [desktop]);
 
   // 捕获永远落收件箱：按快捷键、打字、回车，没有"去哪儿"这一步。
   const targetLabel = "📥 收件箱";
@@ -347,6 +394,19 @@ export default function App() {
           </div>
         </header>
 
+        {notices.length > 0 && (
+          <div className="notice-bar">
+            <span>{notices.join("；")}</span>
+            <button
+              className="icon-btn"
+              onClick={() => setNotices([])}
+              title="知道了"
+            >
+              ×
+            </button>
+          </div>
+        )}
+
         {/* 筛选条只在时间线上出现。
             把"未归档"放在这里而不是侧边栏，是为了让它明确是**时间线的一个筛选**，
             而不是和时间线平级的第二个视图 —— 上一版那两个并列项几乎一模一样。 */}
@@ -395,6 +455,11 @@ export default function App() {
                 onDelete={(id) => run(() => api.deleteMessage(id))}
                 onMove={(id, cid) => run(() => api.moveMessage(id, cid))}
                 onTags={(id, t) => run(() => api.setMessageTags(id, t))}
+                // 检索结果是往**下**翻的，而且用明确的按钮而不是滚动自动加载
+                moreAt="bottom"
+                hasMore={resultsHasMore}
+                loadingOlder={loadingMoreResults}
+                onLoadOlder={loadMoreResults}
               />
             )
           ) : (

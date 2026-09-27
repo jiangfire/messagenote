@@ -5,7 +5,7 @@ import type {
   HealthResponse,
   Message,
   MessagePage,
-  SearchHit,
+  SearchPage,
   SyncConfig,
   SyncStatus,
   TagCount,
@@ -66,8 +66,16 @@ export const api = {
   moveMessage: (id: string, channelId: string) =>
     invoke<void>("move_message", { id, channelId }),
 
-  searchMessages: (query: string, limit?: number) =>
-    invoke<SearchHit[]>("search_messages", { query, limit: limit ?? null }),
+  /**
+   * 检索。`offset` 是"加载更多结果"往后看的条数 —— 检索用 offset 而不是
+   * 键集游标，因为它的排序键是会随语料变化的 bm25 分数。
+   */
+  searchMessages: (query: string, limit?: number, offset?: number) =>
+    invoke<SearchPage>("search_messages", {
+      query,
+      limit: limit ?? null,
+      offset: offset ?? null,
+    }),
 
   listTags: () => invoke<TagCount[]>("list_tags"),
 
@@ -76,6 +84,14 @@ export const api = {
 
   /** 收起捕获浮层。走 Rust 侧命令，保证"如何收起"只有一个实现。 */
   hideCapture: () => invoke<void>("hide_capture"),
+
+  /**
+   * 本次启动记下的**非致命**警告（比如全局快捷键被别的程序占用）。
+   *
+   * 挂载时读一次。这些警告产生于 Rust 侧的 setup 阶段 —— 那时界面还没加载，
+   * 事件推送没人听得到，所以必须有这个"可查询"的入口。
+   */
+  getStartupWarnings: () => invoke<string[]>("get_startup_warnings"),
 
   // ------------------------------------------------------------ 同步
 

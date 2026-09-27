@@ -144,6 +144,10 @@ pub struct SearchQuery {
     pub q: String,
     #[serde(default)]
     pub limit: Option<i64>,
+    /// 往后看几条。"加载更多结果"用的 —— 检索没有键集游标，
+    /// 因为它的排序键是会随语料变化的 bm25 分数。
+    #[serde(default)]
+    pub offset: Option<i64>,
 }
 
 // ---------------------------------------------------------------- 写入请求

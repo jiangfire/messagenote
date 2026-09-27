@@ -436,7 +436,7 @@ $env:MESSAGENOTE_MIGRATE_TEST_DB = "…\副本.sqlite"
 cargo test -p messagenote -- --ignored --nocapture
 ```
 
-## 当前限制（v1.1.0）
+## 当前限制（v1.2.0）
 
 诚实地列出来，避免误判成熟度：
 
@@ -445,11 +445,9 @@ cargo test -p messagenote -- --ignored --nocapture
 - **网页端没有捕获快捷键和置顶浮层。** 这两样在浏览器里都不存在，所以网页端
   的重心是查和整理，写入够用即可。真正的"随手记"仍然只有桌面端能做。
 - **没有附件**（图片/文件）。
-- **检索结果不分页**：按 bm25 排序后截断，精确过滤还可能让实际返回条数少于请求条数。
-  时间线是可以一直往前翻的，检索（桌面端和网页端都一样）还只给前 60 条。
-- **WebView 的 CSP 是关闭的**（`tauri.conf.json` 里 `"csp": null`）。渲染笔记正文
-  靠 DOMPurify 挡住脚本注入（粘贴进来的内容可能夹带 HTML），但少了一层纵深防御。
-  收紧 CSP 要同时处理开发期的 HMR 连接和内联脚本，到现在还没做。
+- **外链图片会向第三方暴露"你打开了这条笔记"。** WebView 的 CSP 是收紧过的
+  （脚本注入那一层挡住了），但 `img-src` 刻意留着 `https:` —— 笔记里
+  `![](https://…)` 能正常显示。哪天想换掉这个取舍，删掉 `img-src` 里的 `https:` 即可。
 - **应用图标是程序生成的**（`scripts/gen-icon.mjs`，纯 Node 手写 PNG 编码），
   不是设计稿。要换图标就改那个脚本后重跑 `pnpm tauri icon scripts/app-icon.png`。
 - **安装包未做代码签名。** Windows SmartScreen 会对未签名的安装程序弹警告 ——
@@ -462,6 +460,8 @@ cargo test -p messagenote -- --ignored --nocapture
 **接下来的计划、已知但未修的问题、以及每项的理由，都在 [`ROADMAP.md`](ROADMAP.md)。**
 那份文件是项目的工作记忆，这里只留一个索引：
 
+- **v1.2.0 —— 已知问题清空。** 启动警告推到界面、检索支持"加载更多结果"、
+  WebView 的 CSP 收紧、服务端校验引用完整性。做法与踩到的坑见 ROADMAP 第一节。
 - **S2 网页端 —— 已完成。** 浏览语义下沉到 `crates/store`（两端同一份查询）、
   服务端补 FTS 索引与只读 API、**服务端代笔写入**（服务端当一台设备，浏览器里
   没有第二套合并规则）、会话鉴权、前端 `NoteApi` 抽象 + 网页端外壳。

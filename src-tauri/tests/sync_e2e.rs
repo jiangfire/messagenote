@@ -15,9 +15,12 @@ use std::sync::Arc;
 
 use rusqlite::Connection;
 
+use messagenote_core::hlc::Hlc;
+use messagenote_core::models::SearchHit;
+use messagenote_core::wire::{Change, EntityKind};
 use messagenote_lib::db::{self, Db};
 use messagenote_lib::http::HttpServerApi;
-use messagenote_lib::sync::sync_once;
+use messagenote_lib::sync::{sync_once, ServerApi};
 use messagenote_server::{AppState, Store};
 
 const TOKEN: &str = "e2e-test-token-0123456789abcdefghijklmnop";
@@ -51,6 +54,11 @@ fn start_server() -> SocketAddr {
         });
     });
     rx.recv().expect("等待服务端就绪")
+}
+
+/// 测试只关心"搜到几条、是哪几条"，不关心分页 —— 统一取第一页。
+fn search_hits(conn: &Connection, q: &str, limit: i64) -> rusqlite::Result<Vec<SearchHit>> {
+    Ok(db::search_page(conn, q, limit, 0)?.items)
 }
 
 fn api(addr: SocketAddr) -> HttpServerApi {
@@ -146,8 +154,8 @@ fn two_clients_converge_through_a_real_http_server() {
 
     // B 上的中文检索要能用：本地索引是各设备自己重建的，从不参与同步
     let conn = b.conn().unwrap();
-    assert_eq!(db::search(&conn, "端到端", 10).unwrap().len(), 1);
-    assert_eq!(db::search(&conn, "频道", 10).unwrap().len(), 1);
+    assert_eq!(search_hits(&conn, "端到端", 10).unwrap().len(), 1);
+    assert_eq!(search_hits(&conn, "频道", 10).unwrap().len(), 1);
 
     let dirty: i64 = conn
         .query_row("SELECT COUNT(*) FROM message WHERE dirty = 1", [], |r| r.get(0))
@@ -228,7 +236,7 @@ fn a_deletion_propagates_as_a_tombstone() {
         "A 上这条也应该消失"
     );
     assert!(
-        db::search(&conn, "稍后", 10).unwrap().is_empty(),
+        search_hits(&conn, "稍后", 10).unwrap().is_empty(),
         "检索索引也要跟着摘掉"
     );
 }
@@ -432,18 +440,28 @@ fn desktop_and_server_agree_on_browse_and_search() {
     );
 
     // ---- 检索：双字词走 FTS，单字走 LIKE 回退，两条路径都要一致 ----
+    //
+    // 比的是**分页封套本身**（SearchPage），不是裸数组 —— 网页端拿到的就是
+    // 这个对象，"还有没有更多"的判定也必须在两端一致。
     for q in ["苹果", "苹", "记录"] {
         assert_eq!(
-            serde_json::to_value(db::search(&conn, q, 20).unwrap()).unwrap(),
+            serde_json::to_value(db::search_page(&conn, q, 20, 0).unwrap()).unwrap(),
             get_json(addr, &format!("/api/search?q={}&limit=20", pct(q))),
-            "检索「{q}」两端结果必须一致（含命中顺序）"
+            "检索「{q}」两端结果必须一致（含命中顺序和 hasMore）"
         );
     }
 
-    // 得确认上面那个排序断言不是空跑：至少有一条查询要命中多个结果
+    // ---- 加载更多：翻到第二页，两端同样必须一致 ----
+    assert_eq!(
+        serde_json::to_value(db::search_page(&conn, "苹果", 1, 1).unwrap()).unwrap(),
+        get_json(addr, &format!("/api/search?q={}&limit=1&offset=1", pct("苹果"))),
+        "检索的第二页两端必须一致"
+    );
+
+    // 得确认上面那些断言不是空跑：至少有一条查询要命中多个结果
     assert!(
-        db::search(&conn, "苹果", 20).unwrap().len() > 1,
-        "测试不能空跑：检索的排序只有多命中时才有意义"
+        search_hits(&conn, "苹果", 20).unwrap().len() > 1,
+        "测试不能空跑：检索的排序和分页只有多命中时才有意义"
     );
 }
 
@@ -609,7 +627,7 @@ fn a_web_write_reaches_the_desktop_through_sync() {
             "{name} 端没拿到网页端建的频道"
         );
         assert_eq!(
-            db::search(&conn, "网页端", 10).unwrap().len(),
+            search_hits(&conn, "网页端", 10).unwrap().len(),
             1,
             "{name} 端的本地检索索引也要跟着建起来"
         );
@@ -638,7 +656,7 @@ fn a_web_write_reaches_the_desktop_through_sync() {
             .unwrap();
         assert_eq!(body, "网页端改过了");
         assert_eq!(
-            db::search(&conn, "改过", 10).unwrap().len(),
+            search_hits(&conn, "改过", 10).unwrap().len(),
             1,
             "改了正文之后，本端索引也要跟着重建"
         );
@@ -654,7 +672,7 @@ fn a_web_write_reaches_the_desktop_through_sync() {
     sync_until_quiet(&a, &api);
     {
         let conn = a.conn().unwrap();
-        let hits = db::search(&conn, "改过", 10).unwrap();
+        let hits = search_hits(&conn, "改过", 10).unwrap();
         assert_eq!(
             hits[0].message.tags,
             vec!["网页标签".to_string()],
@@ -807,6 +825,41 @@ fn the_long_lived_token_still_works_directly() {
     // 同步端点也一样
     let api = api(addr);
     assert!(api.handshake().is_ok());
+}
+
+/// 服务端拒绝时，**它那句解释必须能到用户眼前**。
+///
+/// `ureq` 默认会把 4xx 变成一个只带状态码的错误，顺手把响应体丢掉 ——
+/// 于是用户看到的只有 "HTTP 400"，而"哪一条、为什么"明明就在那句被丢掉的话里。
+/// 自建服务端的人不会去看服务端日志。
+#[test]
+fn a_rejected_push_surfaces_the_servers_explanation() {
+    let addr = start_server();
+    let http = api(addr);
+
+    // 推一条指向不存在频道的消息：服务端会整批拒绝（引用完整性）
+    let orphan = Change {
+        seq: None,
+        kind: EntityKind::Message,
+        id: "orphan".into(),
+        hlc: Hlc::new(100, 0, "test-device"),
+        deleted: false,
+        data: Some(serde_json::json!({
+            "channelId": "ch-nope",
+            "body": "孤儿消息",
+            "createdAt": 100,
+            "updatedAt": 100
+        })),
+    };
+
+    let err = http.push(&[orphan]).expect_err("服务端应当拒绝这条");
+    let msg = err.to_string();
+
+    assert!(msg.contains("400"), "应当说明是 400：{msg}");
+    assert!(
+        msg.contains("ch-nope"),
+        "应当把服务端那句话带出来（含具体的频道 id），实际：{msg}"
+    );
 }
 
 

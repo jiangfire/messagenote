@@ -115,9 +115,10 @@ export function httpApi(opts: HttpApiOptions): NoteApi {
     deleteMessage: (id) => req("DELETE", msg(id)),
     moveMessage: (id, channelId) => req("POST", `${msg(id)}/move`, { channelId }),
 
-    searchMessages: (query, limit) => {
+    searchMessages: (query, limit, offset) => {
       const p = new URLSearchParams({ q: query });
       if (limit != null) p.set("limit", String(limit));
+      if (offset != null) p.set("offset", String(offset));
       return req("GET", `/api/search?${p}`);
     },
     listTags: () => req("GET", "/api/tags"),

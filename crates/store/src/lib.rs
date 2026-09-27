@@ -37,6 +37,6 @@ pub mod clock;
 pub mod normalize;
 
 pub use browse::{
-    attach_tags, list_channels, list_messages, list_tags, row_to_message, search, timeline_stats,
-    Cursor, Scope, ScopeParseError, INBOX_ID,
+    attach_tags, list_channels, list_messages, list_tags, row_to_message, search, search_page,
+    timeline_stats, Cursor, Scope, ScopeParseError, INBOX_ID,
 };

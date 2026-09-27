@@ -28,8 +28,8 @@ use messagenote_core::search as core_search;
 // 浏览与检索的查询住在共享存储层，两端跑的是同一份实现。这里只做转出，
 // 好让 `db::Scope`、`db::list_messages` 这些既有名字继续可用。
 pub use messagenote_store::{
-    attach_tags, list_channels, list_messages, list_tags, row_to_message, search, timeline_stats,
-    Cursor, Scope, INBOX_ID,
+    attach_tags, list_channels, list_messages, list_tags, row_to_message, search, search_page,
+    timeline_stats, Cursor, Scope, INBOX_ID,
 };
 // 时钟推进同理：它决定"谁更新"，两端必须逐字一致。
 pub use messagenote_store::clock::{clock_next, clock_observe, device_id};
@@ -601,6 +601,14 @@ mod tests {
 
     // 主代码里不再直接构造 Hlc（推进逻辑已经搬进共享层），只有测试需要
     use messagenote_core::hlc::Hlc;
+    use messagenote_core::models::SearchHit;
+
+    /// 测试只关心"搜到几条、是哪几条"，不关心分页 —— 统一取第一页。
+    ///
+    /// 包成 `Result` 是为了让调用点保持 `….unwrap()` 的形状。
+    fn search_hits(conn: &Connection, q: &str, n: i64) -> AppResult<Vec<SearchHit>> {
+        Ok(search_page(conn, q, n, 0)?.items)
+    }
 
     /// 内存库。这些测试同时承担两个职责：
     /// 1. 验证 SQLite 的 FTS5 扩展确实被编译进来了（`bundled` 特性的关键前提）
@@ -637,20 +645,20 @@ mod tests {
         append_message(&conn, "买菜：西红柿、鸡蛋", None).unwrap();
 
         // 双字词 —— 这正是 FTS5 的 trigram 分词器会失败、而 bigram 方案必须成功的场景
-        let hits = search(&conn, "笔记", 10).unwrap();
+        let hits = search_hits(&conn, "笔记", 10).unwrap();
         assert_eq!(hits.len(), 1, "「笔记」应命中 1 条，实际 {}", hits.len());
 
-        let hits = search(&conn, "开会", 10).unwrap();
+        let hits = search_hits(&conn, "开会", 10).unwrap();
         assert_eq!(hits.len(), 1, "「开会」应命中 1 条");
 
-        let hits = search(&conn, "笔记软件", 10).unwrap();
+        let hits = search_hits(&conn, "笔记软件", 10).unwrap();
         assert_eq!(hits.len(), 1, "「笔记软件」应命中 1 条");
 
-        let hits = search(&conn, "架构设计模式", 10).unwrap();
+        let hits = search_hits(&conn, "架构设计模式", 10).unwrap();
         assert!(hits.is_empty(), "无关词不应命中");
 
         // 单字退化为 LIKE 回退（bigram 无法表达单字）
-        let hits = search(&conn, "蛋", 10).unwrap();
+        let hits = search_hits(&conn, "蛋", 10).unwrap();
         assert_eq!(hits.len(), 1, "单字「蛋」应通过 LIKE 回退命中 1 条");
     }
 
@@ -666,11 +674,11 @@ mod tests {
         append_message(&conn, "今天开了个会", None).unwrap();
 
         assert!(
-            search(&conn, "开会", 10).unwrap().is_empty(),
+            search_hits(&conn, "开会", 10).unwrap().is_empty(),
             "「开了个会」中间隔着字，连续子串匹配不应命中「开会」"
         );
-        assert_eq!(search(&conn, "开了个会", 10).unwrap().len(), 1);
-        assert_eq!(search(&conn, "个会", 10).unwrap().len(), 1);
+        assert_eq!(search_hits(&conn, "开了个会", 10).unwrap().len(), 1);
+        assert_eq!(search_hits(&conn, "个会", 10).unwrap().len(), 1);
     }
 
     #[test]
@@ -682,11 +690,11 @@ mod tests {
         // 必须由末尾的子串精确过滤挡掉。
         append_message(&conn, "笔记，记软件", None).unwrap();
 
-        let hits = search(&conn, "笔记软件", 10).unwrap();
+        let hits = search_hits(&conn, "笔记软件", 10).unwrap();
         assert!(hits.is_empty(), "FTS 粗筛会命中，但精确过滤必须剔除");
 
         append_message(&conn, "这是一份笔记软件的设计稿", None).unwrap();
-        let hits = search(&conn, "笔记软件", 10).unwrap();
+        let hits = search_hits(&conn, "笔记软件", 10).unwrap();
         assert_eq!(hits.len(), 1, "连续出现时应命中 1 条");
     }
 
@@ -696,10 +704,10 @@ mod tests {
         let conn = db.conn().unwrap();
         let msg = append_message(&conn, "临时记录一下待办事项", None).unwrap();
 
-        assert_eq!(search(&conn, "待办", 10).unwrap().len(), 1);
+        assert_eq!(search_hits(&conn, "待办", 10).unwrap().len(), 1);
         delete_message(&conn, &msg.id).unwrap();
 
-        assert!(search(&conn, "待办", 10).unwrap().is_empty(), "删除后不应还能搜到");
+        assert!(search_hits(&conn, "待办", 10).unwrap().is_empty(), "删除后不应还能搜到");
         assert!(
             list_messages(&conn, Scope::All, 50, None).unwrap().items.is_empty(),
             "删除后不应出现在列表里"
@@ -714,8 +722,8 @@ mod tests {
 
         update_message(&conn, &msg.id, "全新的内容关于量子计算").unwrap();
 
-        assert!(search(&conn, "旧的", 10).unwrap().is_empty(), "旧内容不应还能搜到");
-        assert_eq!(search(&conn, "量子", 10).unwrap().len(), 1, "新内容必须立刻可检索");
+        assert!(search_hits(&conn, "旧的", 10).unwrap().is_empty(), "旧内容不应还能搜到");
+        assert_eq!(search_hits(&conn, "量子", 10).unwrap().len(), 1, "新内容必须立刻可检索");
     }
 
     #[test]
@@ -1252,7 +1260,7 @@ mod tests {
         assert_eq!(unfiled.items[0].id, m.id);
 
         // 正文没变，所以检索索引不用动，也还找得到
-        assert_eq!(search(&conn, "频道里", 10).unwrap().len(), 1);
+        assert_eq!(search_hits(&conn, "频道里", 10).unwrap().len(), 1);
 
         // 这次移动**必须同步出去**（dirty=1），否则别的设备上这条记录还挂在一个
         // 已经不存在的频道下 —— 那边看起来就像"记录丢了"。
@@ -1264,5 +1272,87 @@ mod tests {
             )
             .unwrap();
         assert_eq!(dirty, 1, "移动必须置 dirty，否则别的设备看不到这次归档");
+    }
+
+    /// 检索分页：逐页翻到底，不重、不漏、`hasMore` 不说谎。
+    ///
+    /// 这条同时在防另一个坑：**粗筛窗口太窄会静默少返回**。
+    /// 干扰项「笔记记软件」含有 笔记 / 记软 / 软件 三个 bigram，能过 FTS 粗筛，
+    /// 但过不了"必须含连续子串「笔记软件」"那一步精确过滤。旧的固定窗口
+    /// （`limit * 5`）一旦被这类干扰项填满，就会报告"没有了" ——
+    /// 而真正的结果明明还在后面。窗口逐步放大就是为它准备的。
+    #[test]
+    fn search_paging_returns_every_match_exactly_once() {
+        let db = mem();
+        let conn = db.conn().unwrap();
+
+        for i in 0..25 {
+            append_message(&conn, &format!("笔记软件 第 {i} 条"), None).unwrap();
+        }
+        for i in 0..25 {
+            append_message(&conn, &format!("笔记记软件 干扰 {i}"), None).unwrap();
+        }
+
+        let mut seen: Vec<String> = Vec::new();
+        let mut offset = 0;
+        let mut rounds = 0;
+
+        loop {
+            let page = search_page(&conn, "笔记软件", 7, offset).unwrap();
+            assert!(page.items.len() <= 7, "一页不该超过 limit");
+
+            for h in &page.items {
+                assert!(
+                    h.message.body.contains("笔记软件"),
+                    "精确过滤漏了：「{}」不该出现在结果里",
+                    h.message.body
+                );
+                assert!(
+                    !seen.contains(&h.message.id),
+                    "分页出现了重复项：{}",
+                    h.message.body
+                );
+                seen.push(h.message.id.clone());
+            }
+
+            rounds += 1;
+            assert!(rounds < 50, "分页没有收敛，可能在原地打转");
+
+            if !page.has_more {
+                break;
+            }
+            assert!(!page.items.is_empty(), "说还有更多，却一条都不给");
+            offset += page.items.len() as i64;
+        }
+
+        assert_eq!(
+            seen.len(),
+            25,
+            "25 条精确命中必须一条不漏地翻出来（干扰项不算）"
+        );
+    }
+
+    /// 空查询和越界 offset 都要给出干净的答案，而不是报错或乱给。
+    #[test]
+    fn search_paging_handles_edges() {
+        let db = mem();
+        let conn = db.conn().unwrap();
+        append_message(&conn, "唯一一条", None).unwrap();
+
+        let empty = search_page(&conn, "   ", 10, 0).unwrap();
+        assert!(empty.items.is_empty() && !empty.has_more, "空查询应当没有结果");
+
+        let none = search_page(&conn, "不存在的词", 10, 0).unwrap();
+        assert!(none.items.is_empty() && !none.has_more);
+
+        // offset 超出结果总数：给空的，但**不能**说还有更多
+        let past = search_page(&conn, "唯一", 10, 100).unwrap();
+        assert!(past.items.is_empty(), "越界 offset 应当给空页");
+        assert!(!past.has_more, "越界之后不该还说有更多");
+
+        // 恰好取到边界：1 条结果、limit=1 → 后面没有了
+        let exact = search_page(&conn, "唯一", 1, 0).unwrap();
+        assert_eq!(exact.items.len(), 1);
+        assert!(!exact.has_more, "只有一条时不该说还有更多");
     }
 }

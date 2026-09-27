@@ -7,7 +7,9 @@ use std::collections::HashMap;
 
 use rusqlite::{params, params_from_iter, Connection, Row};
 
-use messagenote_core::models::{Channel, Message, MessagePage, SearchHit, TagCount, TimelineStats};
+use messagenote_core::models::{
+    Channel, Message, MessagePage, SearchHit, SearchPage, TagCount, TimelineStats,
+};
 use messagenote_core::search::{self, QueryPlan};
 
 /// 收件箱使用固定 ID（而不是随机 UUID）：
@@ -260,85 +262,148 @@ pub fn timeline_stats(conn: &Connection) -> rusqlite::Result<TimelineStats> {
 /// 不报错，但用户会觉得"这两个东西不是一回事"。
 ///
 /// 加 `(created_at, id)` 之后，顺序只由内容决定，与插入顺序无关。
-pub fn search(conn: &Connection, query: &str, limit: i64) -> rusqlite::Result<Vec<SearchHit>> {
+///
+/// `offset` 用于"加载更多结果"，分页那层的封套见 [`search_page`]。
+pub fn search(
+    conn: &Connection,
+    query: &str,
+    limit: i64,
+    offset: i64,
+) -> rusqlite::Result<Vec<SearchHit>> {
     let limit = limit.clamp(1, 200);
+    let offset = offset.max(0);
     let Some(plan) = search::plan_query(query) else {
         return Ok(Vec::new());
     };
 
-    let mut hits: Vec<SearchHit> = Vec::new();
+    // 粗筛窗口要够大：跳过 offset 之后还得能剩下 limit 条精确命中。
+    // 注意这只是**窗口的目标**，不是返回条数 —— 返回的切片由下面的
+    // `skip/take` 决定，而"还有没有更多"由调用方多要一条来判断
+    // （见 [`search_page`]）。
+    let want = offset + limit + 1;
 
-    match plan {
+    let raw: Vec<(Message, String)> = match plan {
         QueryPlan::Fts { match_expr, words } => {
-            // 多取一些候选，因为最后还有一步精确过滤会淘汰掉假阳性
-            let fetch = limit.saturating_mul(5).max(50);
-            let mut stmt = conn.prepare(
-                "SELECT m.id, m.channel_id, m.body, m.created_at, m.updated_at, c.name
-                   FROM message_fts
-                   JOIN message m ON m.id = message_fts.message_id
-                   JOIN channel c ON c.id = m.channel_id
-                  WHERE message_fts MATCH ?1
-                    AND m.deleted_at IS NULL
-                  ORDER BY bm25(message_fts), m.created_at DESC, m.id DESC
-                  LIMIT ?2",
-            )?;
-            let rows = stmt.query_map(params![match_expr, fetch], |r| {
-                let msg = row_to_message(r)?;
-                let channel_name: String = r.get(5)?;
-                Ok((msg, channel_name))
-            })?;
-            for r in rows {
-                let (msg, channel_name) = r?;
-                if search::matches_all(&msg.body, &words) {
-                    hits.push(SearchHit {
-                        message: msg,
-                        channel_name,
-                    });
-                    if hits.len() as i64 >= limit {
-                        break;
-                    }
+            // **窗口要逐步放大。** SQL 的 LIMIT 作用在粗筛上，而精确过滤在
+            // Rust 里 —— 固定的窗口（早先是 limit*5）在候选里假阳性多的时候会
+            // **静默少返回**：明明还有结果，却因为粗筛窗口里凑不出足够的精确
+            // 命中而报告"没有了"。所以放大到凑够 want 条、或确认没有候选为止。
+            let mut window = (want * 5).max(50);
+            loop {
+                let rows = fts_candidates(conn, &match_expr, window)?;
+                let exhausted = (rows.len() as i64) < window;
+                let matched: Vec<(Message, String)> = rows
+                    .into_iter()
+                    .filter(|(m, _)| search::matches_all(&m.body, &words))
+                    .collect();
+
+                if matched.len() as i64 >= want || exhausted || window >= MAX_SCAN {
+                    break matched;
                 }
+                window = (window * 4).min(MAX_SCAN);
             }
         }
-        QueryPlan::Like { words } => {
-            // 单个汉字之类的查询无法用 bigram 表达，退回子串扫描。
-            // 用全部词做 AND 粗筛（仍然是精确结果的超集），再逐条确认。
-            let mut sql = String::from(
-                "SELECT m.id, m.channel_id, m.body, m.created_at, m.updated_at, c.name
-                   FROM message m
-                   JOIN channel c ON c.id = m.channel_id
-                  WHERE m.deleted_at IS NULL",
-            );
-            let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-            for w in &words {
-                sql.push_str(" AND m.body LIKE ? ESCAPE '\\'");
-                args.push(Box::new(search::like_pattern(w)));
-            }
-            sql.push_str(" ORDER BY m.created_at DESC, m.id DESC LIMIT ?");
-            args.push(Box::new(limit));
+        // LIKE 回退路径的过滤条件就在 SQL 里，取多少就是多少，不用再筛
+        QueryPlan::Like { words } => like_candidates(conn, &words, want)?,
+    };
 
-            let mut stmt = conn.prepare(&sql)?;
-            let rows = stmt.query_map(params_from_iter(args.iter().map(|b| b.as_ref())), |r| {
-                let msg = row_to_message(r)?;
-                let channel_name: String = r.get(5)?;
-                Ok((msg, channel_name))
-            })?;
-            for r in rows {
-                let (msg, channel_name) = r?;
-                hits.push(SearchHit {
-                    message: msg,
-                    channel_name,
-                });
-            }
-        }
-    }
+    let items: Vec<SearchHit> = raw
+        .into_iter()
+        .skip(offset as usize)
+        .take(limit as usize)
+        .map(|(message, channel_name)| SearchHit {
+            message,
+            channel_name,
+        })
+        .collect();
 
-    let ids: Vec<String> = hits.iter().map(|h| h.message.id.clone()).collect();
+    // 标签只给最终这一页补齐 —— 给所有候选补是白费一次查询
+    let ids: Vec<String> = items.iter().map(|h| h.message.id.clone()).collect();
     let map = load_tags(conn, &ids)?;
-    for h in hits.iter_mut() {
-        h.message.tags = map.get(&h.message.id).cloned().unwrap_or_default();
+    Ok(items
+        .into_iter()
+        .map(|mut h| {
+            h.message.tags = map.get(&h.message.id).cloned().unwrap_or_default();
+            h
+        })
+        .collect())
+}
+
+/// 粗筛窗口的上限。
+///
+/// 到了这个数还凑不够精确命中就不再往下扫了 —— 宁可少返回几条，
+/// 也不能让一次检索把整个库拖进内存。
+const MAX_SCAN: i64 = 5000;
+
+/// FTS 粗筛：按相关性取前 `window` 条候选。
+fn fts_candidates(
+    conn: &Connection,
+    match_expr: &str,
+    window: i64,
+) -> rusqlite::Result<Vec<(Message, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT m.id, m.channel_id, m.body, m.created_at, m.updated_at, c.name
+           FROM message_fts
+           JOIN message m ON m.id = message_fts.message_id
+           JOIN channel c ON c.id = m.channel_id
+          WHERE message_fts MATCH ?1
+            AND m.deleted_at IS NULL
+          ORDER BY bm25(message_fts), m.created_at DESC, m.id DESC
+          LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![match_expr, window], |r| {
+        Ok((row_to_message(r)?, r.get::<_, String>(5)?))
+    })?;
+    rows.collect()
+}
+
+/// LIKE 回退：单字 CJK 之类构不成 bigram 的查询。
+fn like_candidates(
+    conn: &Connection,
+    words: &[String],
+    window: i64,
+) -> rusqlite::Result<Vec<(Message, String)>> {
+    let mut sql = String::from(
+        "SELECT m.id, m.channel_id, m.body, m.created_at, m.updated_at, c.name
+           FROM message m
+           JOIN channel c ON c.id = m.channel_id
+          WHERE m.deleted_at IS NULL",
+    );
+    let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    for w in words {
+        sql.push_str(" AND m.body LIKE ? ESCAPE '\\'");
+        args.push(Box::new(search::like_pattern(w)));
     }
-    Ok(hits)
+    sql.push_str(" ORDER BY m.created_at DESC, m.id DESC LIMIT ?");
+    args.push(Box::new(window));
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(args.iter().map(|b| b.as_ref())), |r| {
+        Ok((row_to_message(r)?, r.get::<_, String>(5)?))
+    })?;
+    rows.collect()
+}
+
+/// 取一页检索结果。
+///
+/// 这一层只做一件事：**多要一条**，用"多出来的那一条"回答"还有没有更多"，
+/// 不必再查一次 count。
+pub fn search_page(
+    conn: &Connection,
+    query: &str,
+    limit: i64,
+    offset: i64,
+) -> rusqlite::Result<SearchPage> {
+    let limit = limit.clamp(1, 200);
+
+    // 这里必须显式要 `limit + 1`。`search` 自己只会按 offset/limit 切片，
+    // **不会**替我们多取一条 —— 早先的版本想当然地以为它会，
+    // 于是 `items.len() > limit` 恒为假，`has_more` 永远是 false：
+    // 界面上的"加载更多"从来不出现，而结果明明还有。
+    let mut items = search(conn, query, limit + 1, offset)?;
+    let has_more = items.len() as i64 > limit;
+    items.truncate(limit as usize);
+    Ok(SearchPage { items, has_more })
 }
 
 // ---------------------------------------------------------------- 读取辅助

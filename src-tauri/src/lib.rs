@@ -208,7 +208,8 @@ pub fn run() {
             // 而不是"打开一个应用去翻记录"。
             //
             // 快捷键被别的程序占用是**非致命**的：托盘还在，功能不受损，
-            // 只是少了最顺手的那条路径。所以这里只记一笔，不拦启动。
+            // 只是少了最顺手的那条路径。所以这里只记一笔，不拦启动 ——
+            // 但那一笔会显示到界面上（`fatal::startup_warnings`）。
             let shortcut =
                 Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::Space);
             {
@@ -218,6 +219,13 @@ pub fn run() {
                         "Ctrl+Shift+Space 注册失败（多半已被其它程序占用）：{e}"
                     ));
                 }
+            }
+
+            // 验证用的注入点：让"启动警告"这条界面路径能被真的看到一次。
+            // 正常使用不会设这个变量 —— 它存在的唯一理由是
+            // "快捷键被占用"在开发机上没法按需复现。
+            if let Ok(msg) = std::env::var("MESSAGENOTE_TEST_WARNING") {
+                fatal::note_warning(&msg);
             }
 
             // ---- 后台自动同步 ----
@@ -260,6 +268,7 @@ pub fn run() {
             commands::get_sync_status,
             commands::test_sync_connection,
             commands::hide_capture,
+            commands::get_startup_warnings,
         ])
         .run(tauri::generate_context!());
 

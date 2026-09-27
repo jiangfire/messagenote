@@ -5,7 +5,7 @@ import type {
   HealthResponse,
   Message,
   MessagePage,
-  SearchHit,
+  SearchPage,
   SyncConfig,
   SyncStatus,
   TagCount,
@@ -45,7 +45,13 @@ export interface NoteApi {
   deleteMessage(id: string): Promise<void>;
   moveMessage(id: string, channelId: string): Promise<void>;
 
-  searchMessages(query: string, limit?: number): Promise<SearchHit[]>;
+  /**
+   * 检索。`offset` 是"加载更多结果"往后看的条数。
+   *
+   * 检索没有键集游标 —— 它的排序键是会随语料变化的 bm25 分数，
+   * 拿它做游标不稳。见 `SearchPage` 上的说明。
+   */
+  searchMessages(query: string, limit?: number, offset?: number): Promise<SearchPage>;
   listTags(): Promise<TagCount[]>;
   setMessageTags(messageId: string, tags: string[]): Promise<void>;
 }
@@ -58,6 +64,8 @@ export interface NoteApi {
  */
 export interface DesktopApi {
   hideCapture(): Promise<void>;
+  /** 本次启动记下的非致命警告（快捷键被占用之类）。挂载时读一次。 */
+  getStartupWarnings(): Promise<string[]>;
   getSyncConfig(): Promise<SyncConfig>;
   setSyncConfig(url: string, token: string): Promise<void>;
   syncNow(): Promise<void>;

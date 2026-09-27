@@ -13,6 +13,14 @@
 //! 判据很简单：**凡是"应用等于没启动"的失败，都必须走 [`report`]。**
 
 use std::path::PathBuf;
+use std::sync::Mutex;
+
+/// 本次启动期间记下的**非致命**警告。
+///
+/// 光写日志是不够的：用户不会去翻 `%APPDATA%` 下的 `startup-warnings.log`。
+/// 全局快捷键被别的程序占用这种事如果不显示在界面上，用户感受到的只是
+/// **"这个软件有时候按快捷键没反应"** —— 一个他永远查不出原因的现象。
+static STARTUP_WARNINGS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// 报告一个致命错误：弹原生消息框 + 尽力写日志，然后退出进程。
 pub fn report(message: &str) -> ! {
@@ -47,11 +55,29 @@ pub fn report(message: &str) -> ! {
 /// 覆盖写而不是追加：这里的语义是"本次启动的警告"，不是累积日志。
 pub fn note_warning(message: &str) {
     eprintln!("[MessageNote 警告] {message}");
+
+    // 除了日志，还要留给界面 —— 见 `STARTUP_WARNINGS` 上的说明
+    if let Ok(mut list) = STARTUP_WARNINGS.lock() {
+        list.push(message.to_string());
+    }
+
     let Some(path) = log_path("startup-warnings.log") else {
         return;
     };
     let _ = std::fs::create_dir_all(path.parent().unwrap_or(&path));
     let _ = std::fs::write(&path, format!("{message}\n"));
+}
+
+/// 取出本次启动记下的警告，供界面显示。
+///
+/// 前端挂载时**主动读一次**，不能只靠事件推送 —— 这些警告产生于 `setup` 阶段，
+/// 那时窗口还没加载完，事件发出去根本没人听。这和后台同步状态是同一个坑
+/// （见 `sync_worker::SyncWorker::last` 的注释）。
+pub fn startup_warnings() -> Vec<String> {
+    STARTUP_WARNINGS
+        .lock()
+        .map(|list| list.clone())
+        .unwrap_or_default()
 }
 
 /// 优先放在应用数据目录（跟库在一起，用户找得到）；
@@ -110,4 +136,22 @@ fn show_message_box(title: &str, body: &str) {
 #[cfg(not(target_os = "windows"))]
 fn show_message_box(_title: &str, body: &str) {
     eprintln!("{body}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn warnings_are_kept_for_the_ui() {
+        note_warning("测试警告甲");
+        note_warning("测试警告乙");
+
+        // 这里的是**进程级**全局状态，别的测试也可能往里写，
+        // 所以只断言"包含"和相对顺序，不断言总数。
+        let list = startup_warnings();
+        let a = list.iter().position(|w| w == "测试警告甲").expect("甲应当在");
+        let b = list.iter().position(|w| w == "测试警告乙").expect("乙应当在");
+        assert!(a < b, "警告应当按发生顺序保留：{list:?}");
+    }
 }

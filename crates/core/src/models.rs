@@ -48,6 +48,24 @@ pub struct SearchHit {
     pub channel_name: String,
 }
 
+/// 一页检索结果。
+///
+/// 检索的翻页语义和时间线**不一样**：时间线是"往前翻更早的"，可以用
+/// `(created_at, id)` 做键集游标；而检索是"更相关的"，排序键是 `bm25()` ——
+/// 一个会随语料变化的浮点分数。拿它做游标是不稳的，所以这里用 **offset**：
+/// 用户点"加载更多结果"，就是在同一次检索里往后多看几条。
+///
+/// 代价要知道：两次请求之间如果有新数据写入，偏移量可能让某一条重复出现或
+/// 被跳过。对"刚搜完正在往下翻"这个瞬态场景可以接受；时间线那边不行，
+/// 所以那边仍然用键集游标。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchPage {
+    pub items: Vec<SearchHit>,
+    pub has_more: bool,
+}
+
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TagCount {

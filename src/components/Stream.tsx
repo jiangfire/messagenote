@@ -21,6 +21,14 @@ interface Props {
   /** 空列表时说什么。不同视图的"空"含义完全不同，所以由调用方决定。 */
   emptyTitle?: string;
   emptyBody?: ReactNode;
+  /**
+   * "加载更多"放哪一头。
+   *
+   * - `top`（默认）：时间线。往上是**更早**的记录，滚到接近顶部就自动加载。
+   * - `bottom`：检索结果。更**相关**的在上面，往下才是更多，用一个明确的按钮 ——
+   *   检索是瞬态的，自动加载会让人以为"就这些"。
+   */
+  moreAt?: "top" | "bottom";
 }
 
 /** 距顶部多少像素开始预加载下一页。留出余量，用户不会撞到"墙"。 */
@@ -39,6 +47,7 @@ export function Stream({
   onLoadOlder,
   emptyTitle,
   emptyBody,
+  moreAt = "top",
 }: Props) {
   const scroller = useRef<HTMLDivElement>(null);
   const pinned = useRef(true);
@@ -113,17 +122,27 @@ export function Stream({
   let lastDay = "";
 
   return (
-    <div className="stream" ref={scroller} onScroll={onScroll}>
-      {hasMore || loadingOlder ? (
-        <div className="load-older">
-          {loadingOlder
-            ? "正在加载更早的记录…"
-            : `继续往上翻可以看更早的记录（已载入 ${messages.length} 条）`}
-        </div>
-      ) : (
-        <div className="load-older start">
-          —— 这里是你能回溯到的最早一条（共 {messages.length} 条）——
-        </div>
+    <div
+      className="stream"
+      ref={scroller}
+      // 只有时间线才"滚到顶自动加载"。检索结果是往下翻的，
+      // 滚回顶部去加载更多会让人一头雾水。
+      onScroll={moreAt === "top" ? onScroll : undefined}
+    >
+      {moreAt === "top" && (
+        <>
+          {hasMore || loadingOlder ? (
+            <div className="load-older">
+              {loadingOlder
+                ? "正在加载更早的记录…"
+                : `继续往上翻可以看更早的记录（已载入 ${messages.length} 条）`}
+            </div>
+          ) : (
+            <div className="load-older start">
+              —— 这里是你能回溯到的最早一条（共 {messages.length} 条）——
+            </div>
+          )}
+        </>
       )}
       {messages.map((m) => {
         const key = dayKey(m.createdAt);
@@ -149,6 +168,22 @@ export function Stream({
           </div>
         );
       })}
+
+      {moreAt === "bottom" && (
+        <div className="load-more-row">
+          {hasMore ? (
+            <button
+              className="btn"
+              onClick={() => void triggerLoadOlder()}
+              disabled={loadingOlder}
+            >
+              {loadingOlder ? "正在加载…" : "加载更多结果"}
+            </button>
+          ) : (
+            <span className="muted small">—— 没有更多了（共 {messages.length} 条）——</span>
+          )}
+        </div>
+      )}
     </div>
   );
 }

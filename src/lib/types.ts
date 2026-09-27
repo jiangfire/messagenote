@@ -40,6 +40,18 @@ export interface SearchHit extends Message {
   channelName: string;
 }
 
+/**
+ * 一页检索结果。
+ *
+ * 检索的翻页用 **offset** 而不是游标：时间线是"往前翻更早的"，可以拿
+ * `(createdAt, id)` 做键集游标；而检索是"更相关的"，排序键是 bm25 分数 ——
+ * 一个会随语料变化的浮点值，拿它做游标不稳。所以是"加载更多结果"。
+ */
+export interface SearchPage {
+  items: SearchHit[];
+  hasMore: boolean;
+}
+
 export interface TagCount {
   name: string;
   count: number;

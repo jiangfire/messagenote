@@ -1043,8 +1043,8 @@ mod tests {
 
         // B 上应该真的能搜到中文
         let conn = b.conn().unwrap();
-        assert_eq!(db::search(&conn, "笔记", 10).unwrap().len(), 1);
-        assert_eq!(db::search(&conn, "项目", 10).unwrap().len(), 1);
+        assert_eq!(db::search_page(&conn, "笔记", 10, 0).unwrap().items.len(), 1);
+        assert_eq!(db::search_page(&conn, "项目", 10, 0).unwrap().items.len(), 1);
     }
 
     /// 待上传批次必须按依赖顺序消耗预算。

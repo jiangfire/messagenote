@@ -22,6 +22,7 @@ export const tauriDesktop: DesktopApi = {
   syncNow: () => commands.syncNow(),
   getSyncStatus: () => commands.getSyncStatus(),
   testSyncConnection: (url, token) => commands.testSyncConnection(url, token),
+  getStartupWarnings: () => commands.getStartupWarnings(),
 
   onSyncStatus(handler) {
     let unlisten: (() => void) | null = null;

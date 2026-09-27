@@ -48,6 +48,10 @@ impl HttpServerApi {
         let config = ureq::Agent::config_builder()
             .timeout_connect(Some(CONNECT_TIMEOUT))
             .timeout_global(Some(OVERALL_TIMEOUT))
+            // 不让 4xx/5xx 直接变成"只有状态码"的错误：服务端在 400/401 里写的
+            // 是一句给人看的话（比如"消息 x 指向不存在的频道 y"）。丢掉它之后
+            // 用户只能看到 "服务端返回 HTTP 400" —— 对自建服务端的人毫无帮助。
+            .http_status_as_error(false)
             .build();
 
         Ok(Self {
@@ -74,7 +78,7 @@ impl HttpServerApi {
             .call()
             .map_err(map_err)?;
 
-        let out: HealthResponse = resp.into_body().read_json().map_err(map_err)?;
+        let out: HealthResponse = read_json(resp)?;
 
         // 显式比对协议版本，而不是"尽力而为地继续"。
         // 版本不一致时继续同步，可能把字段按错误的语义写进库 ——
@@ -100,7 +104,7 @@ impl ServerApi for HttpServerApi {
             .call()
             .map_err(map_err)?;
 
-        resp.into_body().read_json().map_err(map_err)
+        read_json(resp)
     }
 
     fn push(&self, changes: &[Change]) -> AppResult<PushResponse> {
@@ -114,13 +118,44 @@ impl ServerApi for HttpServerApi {
             .send_json(&body)
             .map_err(map_err)?;
 
-        resp.into_body().read_json().map_err(map_err)
+        read_json(resp)
     }
+}
+
+/// 把响应体读成 JSON；非 2xx 时**把服务端那句话带出来**。
+///
+/// 服务端对各种拒绝都写了一句给人看的原因（见 `ServerError::BadRequest` /
+/// `Unauthorized`），而 `ureq` 默认会把 4xx 变成一个只带状态码的错误、
+/// 顺手把响应体丢掉。同步失败时用户看到的就只剩 "HTTP 400"，
+/// 而真正的原因（哪一条、为什么）明明就在那句被丢掉的话里。
+fn read_json<T: serde::de::DeserializeOwned>(
+    resp: ureq::http::Response<ureq::Body>,
+) -> AppResult<T> {
+    let code = resp.status().as_u16();
+    if !(200..300).contains(&code) {
+        let detail = resp
+            .into_body()
+            .read_to_string()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+
+        return Err(if code == 401 {
+            AppError::Msg("同步令牌不对（服务端返回 401）".into())
+        } else if detail.is_empty() {
+            AppError::Msg(format!("服务端返回 HTTP {code}"))
+        } else {
+            AppError::Msg(format!("服务端返回 HTTP {code}：{detail}"))
+        });
+    }
+    resp.into_body().read_json().map_err(map_err)
 }
 
 /// 把网络层的错误翻译成用户能看懂的一句话。
 ///
-/// 尤其是 401：它只有一种含义（令牌不对），但裸的错误码对用户毫无帮助。
+/// 注意 `StatusCode` 这两条分支现在基本走不到了 —— agent 配了
+/// `http_status_as_error(false)`，4xx/5xx 会在 [`read_json`] 里处理。
+/// 留着是为了万一将来有别的调用路径没走那个函数。
 fn map_err(e: ureq::Error) -> AppError {
     match e {
         ureq::Error::StatusCode(401) => {

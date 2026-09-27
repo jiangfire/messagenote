@@ -9,7 +9,7 @@ use crate::db::{self, Db};
 use crate::error::{AppError, AppResult};
 use crate::sync_worker::{SyncStatus, SyncWorker};
 use messagenote_core::models::{
-    Channel, Message, MessagePage, SearchHit, SyncConfig, TagCount, TimelineStats,
+    Channel, Message, MessagePage, SearchPage, SyncConfig, TagCount, TimelineStats,
 };
 use messagenote_core::wire::HealthResponse;
 
@@ -110,9 +110,15 @@ pub fn search_messages(
     db: State<'_, Db>,
     query: String,
     limit: Option<i64>,
-) -> AppResult<Vec<SearchHit>> {
+    offset: Option<i64>,
+) -> AppResult<SearchPage> {
     let conn = db.conn()?;
-    Ok(db::search(&conn, &query, limit.unwrap_or(60))?)
+    Ok(db::search_page(
+        &conn,
+        &query,
+        limit.unwrap_or(60),
+        offset.unwrap_or(0),
+    )?)
 }
 
 #[tauri::command]
@@ -146,6 +152,15 @@ pub fn set_message_tags(
 #[tauri::command]
 pub fn hide_capture(app: tauri::AppHandle) {
     crate::hide_capture(&app);
+}
+
+/// 本次启动记下的**非致命**警告（比如全局快捷键被别的程序占用）。
+///
+/// 前端挂载时读一次。这些警告产生于 `setup` 阶段 —— 那时界面还没加载，
+/// 事件推送没人听得到，所以必须有一个"可查询"的入口。
+#[tauri::command]
+pub fn get_startup_warnings() -> Vec<String> {
+    crate::fatal::startup_warnings()
 }
 
 // ---------------------------------------------------------------- 同步

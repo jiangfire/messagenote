@@ -43,7 +43,7 @@ use axum::routing::{get, patch, post, put};
 use axum::{Json, Router};
 
 use messagenote_core::hlc::now_ms;
-use messagenote_core::models::{Channel, Message, MessagePage, SearchHit, TagCount, TimelineStats};
+use messagenote_core::models::{Channel, Message, MessagePage, SearchPage, TagCount, TimelineStats};
 use messagenote_core::wire::{
     CreateChannelRequest, CreateMessageRequest, EditMessageRequest, HealthResponse, LoginRequest,
     MoveMessageRequest, PullQuery, PullResponse, PushRequest, PushResponse, RenameChannelRequest,
@@ -272,12 +272,12 @@ async fn tags(State(state): State<Arc<AppState>>) -> ServerResult<Json<Vec<TagCo
 async fn search(
     State(state): State<Arc<AppState>>,
     Query(q): Query<SearchQuery>,
-) -> ServerResult<Json<Vec<SearchHit>>> {
-    Ok(Json(
-        state
-            .store
-            .search(&q.q, q.limit.unwrap_or(DEFAULT_SEARCH_LIMIT))?,
-    ))
+) -> ServerResult<Json<SearchPage>> {
+    Ok(Json(state.store.search(
+        &q.q,
+        q.limit.unwrap_or(DEFAULT_SEARCH_LIMIT),
+        q.offset.unwrap_or(0),
+    )?))
 }
 
 // ---------------------------------------------------------------- 写入
