@@ -513,18 +513,29 @@ fn a_bad_scope_is_a_400_with_a_readable_message() {
 
 // ---------------------------------------------------------------- 服务端代笔
 
-/// 发一个写请求，返回响应 JSON。
-///
-/// 刻意按方法分派而不是做成一个万能构造器：ureq 里 `get`/`delete` 和
-/// `post`/`put`/`patch` 的 builder 类型不同，只有后者能带 body。
+/// 发一个写请求（用长期令牌），返回响应 JSON。
 fn write_req(
     addr: SocketAddr,
     method: &str,
     path: &str,
     body: Option<&serde_json::Value>,
 ) -> serde_json::Value {
+    write_req_with(addr, method, path, body, TOKEN)
+}
+
+/// 同上，但可以指定用哪个凭据 —— 会话那条路径也要能写。
+///
+/// 刻意按方法分派而不是做成一个万能构造器：ureq 里 `get`/`delete` 和
+/// `post`/`put`/`patch` 的 builder 类型不同，只有后者能带 body。
+fn write_req_with(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    body: Option<&serde_json::Value>,
+    bearer_val: &str,
+) -> serde_json::Value {
     let url = format!("http://{addr}{path}");
-    let auth = format!("Bearer {TOKEN}");
+    let auth = format!("Bearer {bearer_val}");
 
     let resp = match (method, body) {
         ("POST", Some(b)) => ureq::post(&url).header("Authorization", &auth).send_json(b),
@@ -672,5 +683,131 @@ fn a_web_write_reaches_the_desktop_through_sync() {
         "一整轮网页端操作之后两端仍须收敛"
     );
 }
+
+// ---------------------------------------------------------------- 会话鉴权
+
+/// 用给定的 Bearer 值发一个 GET，返回 (HTTP 状态码, JSON)。
+fn try_get(addr: SocketAddr, path: &str, bearer_val: Option<&str>) -> (u16, serde_json::Value) {
+    let mut req = ureq::get(&format!("http://{addr}{path}"));
+    if let Some(b) = bearer_val {
+        req = req.header("Authorization", &format!("Bearer {b}"));
+    }
+    match req.call() {
+        Ok(r) => {
+            let code = r.status().as_u16();
+            let v = r.into_body().read_json().unwrap_or(serde_json::Value::Null);
+            (code, v)
+        }
+        Err(ureq::Error::StatusCode(c)) => (c, serde_json::Value::Null),
+        Err(e) => panic!("GET {path} 出错：{e}"),
+    }
+}
+
+/// 用长期令牌登录，返回 (HTTP 状态码, JSON)。
+fn login(addr: SocketAddr, token: &str) -> (u16, serde_json::Value) {
+    match ureq::post(&format!("http://{addr}/api/session"))
+        .send_json(serde_json::json!({ "token": token }))
+    {
+        Ok(r) => {
+            let code = r.status().as_u16();
+            let v = r.into_body().read_json().unwrap_or(serde_json::Value::Null);
+            (code, v)
+        }
+        Err(ureq::Error::StatusCode(c)) => (c, serde_json::Value::Null),
+        Err(e) => panic!("登录请求出错：{e}"),
+    }
+}
+
+/// 长期令牌换短期会话，换来的会话能用在**读写**两类端点上。
+///
+/// 为什么需要这一步：长期令牌放进浏览器的 localStorage，等于把整个库的读写
+/// 权限交给任何一次 XSS —— 而正文是要渲染用户 Markdown 的。会话会过期、
+/// 能吊销；长期令牌则一直待在用户手里，不必落到浏览器里。
+#[test]
+fn a_session_token_works_for_reads_and_writes() {
+    let addr = start_server();
+
+    // ---- 错的令牌换不到会话 ----
+    let (code, _) = login(addr, "wrong-token-aaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    assert_eq!(code, 401, "错的长期令牌必须回 401");
+
+    // ---- 对的令牌换得到 ----
+    let (code, body) = login(addr, TOKEN);
+    assert_eq!(code, 200, "登录应当成功");
+    let session = body["session"].as_str().expect("要有 session").to_string();
+    let expires_at = body["expiresAt"].as_i64().expect("要有 expiresAt");
+    assert!(expires_at > 0, "过期时间必须存在");
+
+    // ---- 会话能读 ----
+    let (code, chans) = try_get(addr, "/api/channels", Some(&session));
+    assert_eq!(code, 200, "会话应当能读");
+    assert!(
+        chans.as_array().is_some_and(|a| !a.is_empty()),
+        "服务端种下的收件箱应当在里面"
+    );
+
+    // ---- 会话也能写 ----
+    let created = write_req_with(addr, "POST", "/api/message", Some(&serde_json::json!({ "body": "用会话写的" })), &session);
+    assert_eq!(created["body"], "用会话写的");
+
+    // ---- 没带凭据仍然 401 ----
+    let (code, _) = try_get(addr, "/api/channels", None);
+    assert_eq!(code, 401, "不带凭据必须被拒绝");
+}
+
+/// 退出登录必须**立刻**让会话失效。
+///
+/// 这正是引入会话机制相对"无状态签名令牌"的收益 —— 签名令牌签发之后到期前
+/// 撤不掉，"退出登录"会变成一个骗人的按钮。
+#[test]
+fn logging_out_revokes_the_session_immediately() {
+    let addr = start_server();
+
+    let (_, body) = login(addr, TOKEN);
+    let session = body["session"].as_str().unwrap().to_string();
+    assert_eq!(try_get(addr, "/api/channels", Some(&session)).0, 200);
+
+    // 退出
+    let resp = ureq::delete(&format!("http://{addr}/api/session"))
+        .header("Authorization", &format!("Bearer {session}"))
+        .call()
+        .expect("退出登录应当成功");
+    assert_eq!(resp.status().as_u16(), 204);
+
+    assert_eq!(
+        try_get(addr, "/api/channels", Some(&session)).0,
+        401,
+        "退出之后这个会话必须立刻失效"
+    );
+
+    // 长期令牌不受影响 —— 它是用户的凭据，不是会话
+    assert_eq!(
+        try_get(addr, "/api/channels", Some(TOKEN)).0,
+        200,
+        "退出登录不该把桌面端也踢下线"
+    );
+}
+
+/// 桌面端的同步客户端仍然可以直接用长期令牌。
+///
+/// 让它改走登录没有收益：它本来就把令牌存在自己机器的数据库里。
+/// 这条测试是为了防止"加了会话之后顺手把长期令牌那条路删掉"。
+#[test]
+fn the_long_lived_token_still_works_directly() {
+    let addr = start_server();
+
+    for path in ["/api/channels", "/api/timeline/stats", "/api/tags"] {
+        assert_eq!(
+            try_get(addr, path, Some(TOKEN)).0,
+            200,
+            "{path} 应当接受长期令牌"
+        );
+    }
+
+    // 同步端点也一样
+    let api = api(addr);
+    assert!(api.handshake().is_ok());
+}
+
 
 

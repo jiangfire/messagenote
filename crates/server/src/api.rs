@@ -36,7 +36,7 @@
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, Request, State};
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::{get, patch, post, put};
@@ -45,9 +45,9 @@ use axum::{Json, Router};
 use messagenote_core::hlc::now_ms;
 use messagenote_core::models::{Channel, Message, MessagePage, SearchHit, TagCount, TimelineStats};
 use messagenote_core::wire::{
-    CreateChannelRequest, CreateMessageRequest, EditMessageRequest, HealthResponse,
+    CreateChannelRequest, CreateMessageRequest, EditMessageRequest, HealthResponse, LoginRequest,
     MoveMessageRequest, PullQuery, PullResponse, PushRequest, PushResponse, RenameChannelRequest,
-    SearchQuery, SetTagsRequest, TimelineQuery, PROTOCOL_VERSION,
+    SearchQuery, SessionResponse, SetTagsRequest, TimelineQuery, PROTOCOL_VERSION,
 };
 use messagenote_store::{Cursor, Scope};
 
@@ -104,8 +104,20 @@ pub fn router(state: Arc<AppState>) -> Router {
         // 泄露的信息只有"这里有个 MessageNote 服务端"。
         // 代价是它回答不了"我的令牌对不对" —— 所以另有 handshake。
         .route("/api/health", get(health))
+        // 登录**不能**挂在鉴权中间件后面 —— 它就是鉴权本身。
+        // 它在处理函数内部用常量时间比较校验长期令牌。
+        .route("/api/session", post(login).delete(logout))
         .merge(protected)
         .with_state(state)
+}
+
+/// 从请求头里取出 Bearer 凭据。取不到就是空串。
+fn bearer(headers: &HeaderMap) -> &str {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or("")
 }
 
 /// 定长比较，避免通过响应时间逐字节猜 token。
@@ -122,25 +134,55 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+/// 鉴权：**长期令牌**（桌面端的同步客户端）或**短期会话**（网页端）都放行。
+///
+/// 两条路并存是刻意的：桌面端本来就把令牌存在自己机器的数据库里，让它改走
+/// 登录没有收益；网页端才需要"会过期、能吊销"的凭据。
 async fn require_token(
     State(state): State<Arc<AppState>>,
     req: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    let presented = req
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .unwrap_or("");
+    let presented = bearer(req.headers());
 
-    if constant_time_eq(presented.as_bytes(), state.token.as_bytes()) {
+    // `||` 短路：长期令牌命中时不会白查一次数据库
+    let ok = constant_time_eq(presented.as_bytes(), state.token.as_bytes())
+        || state.store.session_is_valid(presented).unwrap_or(false);
+
+    if ok {
         Ok(next.run(req).await)
     } else {
-        // 记日志但**不回显任何细节**：不告诉对方 token 是对是错、格式对不对。
+        // 记日志但**不回显任何细节**：不告诉对方凭据是对是错、格式对不对。
         tracing::warn!("鉴权失败，已拒绝请求");
         Err(StatusCode::UNAUTHORIZED)
     }
+}
+
+// ---------------------------------------------------------------- 会话
+
+/// 用长期令牌换一个短期会话。
+async fn login(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<LoginRequest>,
+) -> ServerResult<Json<SessionResponse>> {
+    if !constant_time_eq(req.token.as_bytes(), state.token.as_bytes()) {
+        // 和中间件一样不透露细节，但要记日志 —— 这可能是有人在试令牌
+        tracing::warn!("登录失败：长期令牌不对");
+        return Err(ServerError::Unauthorized("令牌不对".into()));
+    }
+    Ok(Json(state.store.create_session()?))
+}
+
+/// 退出登录：吊销当前会话。
+///
+/// 一律回 204，不告诉调用方"这个会话到底存不存在" —— 那是一个没必要的
+/// 探测面。长期令牌不受影响（它是用户的凭据，不是会话）。
+async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> StatusCode {
+    let presented = bearer(&headers);
+    if !presented.is_empty() && !constant_time_eq(presented.as_bytes(), state.token.as_bytes()) {
+        let _ = state.store.drop_session(presented);
+    }
+    StatusCode::NO_CONTENT
 }
 
 async fn health() -> Json<HealthResponse> {

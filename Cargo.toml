@@ -16,7 +16,9 @@ serde_json = "1.0"
 thiserror = "2.0"
 
 # v7：UUID 按时间单调递增，客户端离线也能自己生成排序友好的主键
-uuid = { version = "1.20", features = ["v7"] }
+# v4：纯随机。会话令牌必须用它 —— v7 是可预测的（前 48 位就是时间戳），
+#     拿它当凭据等于把令牌强度降到"猜时间戳"
+uuid = { version = "1.20", features = ["v7", "v4"] }
 
 # bundled：把 SQLite 源码一起编译，保证 FTS5 一定可用，
 # 且不依赖目标机器上有没有 sqlite3.dll

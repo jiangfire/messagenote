@@ -29,12 +29,21 @@ use messagenote_core::payload::{
     message_tag_key, ChannelPayload, MessagePayload, MessageTagPayload, TagPayload,
 };
 use messagenote_core::search;
-use messagenote_core::wire::{Change, EntityKind, PullResponse, PushOutcome, PushResponse};
+use messagenote_core::wire::{
+    Change, EntityKind, PullResponse, PushOutcome, PushResponse, SessionResponse,
+};
 use messagenote_store::{clock, normalize, Cursor, Scope};
 
 use crate::error::{ServerError, ServerResult};
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
+
+/// 网页端会话的有效期。
+///
+/// 这是"不用反复登录"和"令牌被偷之后的暴露窗口"之间的折中。改这一个常量
+/// 就能调整。注意它**必须**存在：长期令牌放进 localStorage 是永不过期的，
+/// 再怎么定都比那个强。
+const SESSION_TTL_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 
 const SCHEMA: &str = r#"
 -- 单行计数器。seq 必须全局单调，不能按实体各自计数，
@@ -123,6 +132,23 @@ CREATE TABLE IF NOT EXISTS meta (
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
+
+-- 网页端的短期会话。
+--
+-- **为什么是数据库表，而不是内存里的 Map**：重启就掉线，多进程部署也会失效。
+-- 早期笔记里写的是"倾向签名令牌（无状态）"，这里改了主意，理由是签名令牌
+-- **签发之后到期前无法撤销** —— "退出登录"会变成一个骗人的按钮，而
+-- 撤销恰恰是引入会话机制的主要收益之一。签名的另一条路要引一整套对称加密
+-- 依赖，而这条只需要一张表。
+--
+-- **令牌原文直接存，没有哈希。** 哈希只有在"库比令牌更容易泄露"时才有意义，
+-- 而这份库里躺着用户的全部笔记 —— 能拿到库的人已经不需要令牌了。
+CREATE TABLE IF NOT EXISTS session (
+  token      TEXT PRIMARY KEY,
+  created_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_session_expires ON session(expires_at);
 "#;
 
 pub struct Store {
@@ -681,6 +707,58 @@ impl Store {
         let mut p = self.channel_payload(id)?;
         p.updated_at = now_ms();
         self.author(EntityKind::Channel, id.to_string(), true, to_json(p)?)
+    }
+
+    // ---------------------------------------------------------------- 会话
+
+    /// 签发一个短期会话。
+    ///
+    /// 令牌用 **v4（纯随机）** 而不是 v7：v7 的前 48 位就是时间戳，
+    /// 拿它当凭据等于把强度降到"猜时间戳"。
+    pub fn create_session(&self) -> ServerResult<SessionResponse> {
+        let conn = self.conn()?;
+        let now = now_ms();
+        let expires_at = now + SESSION_TTL_MS;
+
+        // 顺手清掉过期的。这是这张表唯一会产生垃圾的地方，
+        // 就在产生垃圾的地方清 —— 不需要额外的定时任务。
+        conn.execute("DELETE FROM session WHERE expires_at <= ?1", params![now])?;
+
+        let session = uuid::Uuid::new_v4().to_string();
+        conn.execute(
+            "INSERT INTO session (token, created_at, expires_at) VALUES (?1, ?2, ?3)",
+            params![session, now, expires_at],
+        )?;
+        Ok(SessionResponse {
+            session,
+            expires_at,
+        })
+    }
+
+    /// 这个会话现在有效吗。
+    ///
+    /// 注意这里的比较**不是常量时间的**（SQLite 的主键查找会在第一个不同的
+    /// 字节处短路）。之所以可以接受：令牌是 122 位随机值，要通过 HTTP 观测到
+    /// 亚微秒级的差异来逐字节还原它，不现实。长期令牌那条路径仍然走
+    /// `constant_time_eq`，因为那个是人选的、熵低得多。
+    pub fn session_is_valid(&self, token: &str) -> ServerResult<bool> {
+        if token.is_empty() {
+            return Ok(false);
+        }
+        let conn = self.conn()?;
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM session WHERE token = ?1 AND expires_at > ?2",
+            params![token, now_ms()],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// 吊销一个会话。这是引入会话机制的主要收益 —— 签名令牌做不到这件事。
+    pub fn drop_session(&self, token: &str) -> ServerResult<()> {
+        let conn = self.conn()?;
+        conn.execute("DELETE FROM session WHERE token = ?1", params![token])?;
+        Ok(())
     }
 }
 
@@ -1682,5 +1760,68 @@ mod tests {
             tags.iter().all(|t| t.count == 0),
             "标签行还在（不回收孤儿标签），但计数要为 0"
         );
+    }
+
+    #[test]
+    fn a_session_can_be_revoked() {
+        let s = store();
+        let sess = s.create_session().unwrap();
+        assert!(s.session_is_valid(&sess.session).unwrap());
+        assert!(sess.expires_at > now_ms(), "过期时间必须在将来");
+
+        s.drop_session(&sess.session).unwrap();
+        assert!(
+            !s.session_is_valid(&sess.session).unwrap(),
+            "吊销之后必须**立刻**失效 —— 这正是会话相对签名令牌的收益，\
+             也决定了我们不能用无状态签名令牌"
+        );
+    }
+
+    #[test]
+    fn an_expired_session_is_rejected() {
+        let s = store();
+        let sess = s.create_session().unwrap();
+        assert!(s.session_is_valid(&sess.session).unwrap());
+
+        {
+            let conn = s.conn().unwrap();
+            conn.execute(
+                "UPDATE session SET expires_at = 0 WHERE token = ?1",
+                params![sess.session],
+            )
+            .unwrap();
+        }
+        assert!(
+            !s.session_is_valid(&sess.session).unwrap(),
+            "过期会话必须失效"
+        );
+
+        // 签发新会话时顺手清掉过期的 —— 否则这张表会一直长
+        let _ = s.create_session().unwrap();
+        let n: i64 = s
+            .conn()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM session", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "签发新会话时应当顺手把过期的删掉");
+    }
+
+    #[test]
+    fn session_tokens_are_random_not_time_ordered() {
+        let s = store();
+        let a = s.create_session().unwrap().session;
+        let b = s.create_session().unwrap().session;
+        assert_ne!(a, b);
+
+        // v7 UUID 的前 48 位就是时间戳，几乎同时生成的两个会共享前缀 ——
+        // 拿它当凭据等于把令牌强度降到"猜时间戳"。这里钉住用的是 v4。
+        for t in [&a, &b] {
+            let u = uuid::Uuid::parse_str(t).expect("会话令牌应当是 UUID");
+            assert_eq!(
+                u.get_version_num(),
+                4,
+                "会话令牌必须用 v4（纯随机），不能用 v7"
+            );
+        }
     }
 }

@@ -21,6 +21,13 @@ pub enum ServerError {
     #[error("{0}")]
     BadRequest(String),
 
+    /// 凭据不对、会话不存在或已过期。
+    ///
+    /// 单独一类是为了让它回 **401** 而不是 400 —— 客户端（尤其是网页端）
+    /// 要靠状态码区分"我要重新登录"和"我这个请求写错了"。
+    #[error("{0}")]
+    Unauthorized(String),
+
     #[error("{0}")]
     Msg(String),
 }
@@ -34,6 +41,7 @@ impl IntoResponse for ServerError {
         match self {
             // 客户端自己发错的东西，说清楚比藏起来有用
             ServerError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
+            ServerError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, msg).into_response(),
             other => {
                 tracing::error!(error = %other, "请求处理失败");
                 (StatusCode::INTERNAL_SERVER_ERROR, "服务端内部错误").into_response()

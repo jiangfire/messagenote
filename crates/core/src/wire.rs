@@ -195,3 +195,27 @@ pub struct RenameChannelRequest {
     pub name: String,
 }
 
+// ---------------------------------------------------------------- 会话
+
+/// `POST /api/session`：用长期令牌换一个短期会话。
+///
+/// 为什么需要这一步：长期令牌放进浏览器的 localStorage，等于把整个库的读写
+/// 权限交给任何一次 XSS —— 而正文是要渲染用户 Markdown 的。换来的会话可以
+/// 过期、可以被单独吊销，长期令牌则一直待在用户手里（或者干脆不落盘）。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoginRequest {
+    /// `MESSAGENOTE_TOKEN` 那个长期凭据
+    pub token: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionResponse {
+    /// 之后所有请求带这个（同样走 `Authorization: Bearer`）
+    pub session: String,
+    /// 过期时刻（毫秒时间戳）。客户端据此决定什么时候重新登录。
+    pub expires_at: i64,
+}
+
+
