@@ -2031,6 +2031,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -2039,6 +2040,7 @@ version = "1.0.0"
 dependencies = [
  "messagenote-core",
  "rusqlite",
+ "uuid",
 ]
 
 [[package]]

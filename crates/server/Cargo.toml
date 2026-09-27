@@ -26,3 +26,4 @@ thiserror = { workspace = true }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "signal"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+uuid = { workspace = true }

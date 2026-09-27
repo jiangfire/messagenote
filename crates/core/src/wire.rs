@@ -145,3 +145,53 @@ pub struct SearchQuery {
     #[serde(default)]
     pub limit: Option<i64>,
 }
+
+// ---------------------------------------------------------------- 写入请求
+//
+// 网页端的写操作走这些端点，由**服务端代笔**：服务端以一台设备的身份生成
+// HLC、写进变更日志、分配 seq，桌面端下次同步照常拉到。浏览器因此完全不需要
+// HLC、合并和冲突处理 —— 裁定权仍然只有 `core::merge` 那一份。
+//
+// 这些类型放在线缆协议里，是因为**网页端也要构造它们**。字段名各写一份的话，
+// 前端发 `channelId` 而服务端读 `channel_id` 会静默地退化成别的含义。
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateMessageRequest {
+    pub body: String,
+    /// 省略时落到收件箱 —— 这是「捕获不做决策」的入口。
+    #[serde(default)]
+    pub channel_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditMessageRequest {
+    pub body: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MoveMessageRequest {
+    pub channel_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetTagsRequest {
+    /// 整体替换语义：传 `[]` 就是清空标签。
+    pub tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateChannelRequest {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenameChannelRequest {
+    pub name: String,
+}
+

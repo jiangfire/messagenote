@@ -511,3 +511,166 @@ fn a_bad_scope_is_a_400_with_a_readable_message() {
     }
 }
 
+// ---------------------------------------------------------------- 服务端代笔
+
+/// 发一个写请求，返回响应 JSON。
+///
+/// 刻意按方法分派而不是做成一个万能构造器：ureq 里 `get`/`delete` 和
+/// `post`/`put`/`patch` 的 builder 类型不同，只有后者能带 body。
+fn write_req(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    body: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let url = format!("http://{addr}{path}");
+    let auth = format!("Bearer {TOKEN}");
+
+    let resp = match (method, body) {
+        ("POST", Some(b)) => ureq::post(&url).header("Authorization", &auth).send_json(b),
+        ("PUT", Some(b)) => ureq::put(&url).header("Authorization", &auth).send_json(b),
+        ("PATCH", Some(b)) => ureq::patch(&url).header("Authorization", &auth).send_json(b),
+        ("DELETE", _) => ureq::delete(&url).header("Authorization", &auth).call(),
+        _ => panic!("这里不支持 {method}（或者忘了给 body）"),
+    }
+    .unwrap_or_else(|e| panic!("{method} {path} 失败：{e}"));
+
+    // 删除类端点回 204，没有 body
+    if resp.status().as_u16() == 204 {
+        return serde_json::Value::Null;
+    }
+    resp.into_body().read_json().expect("响应不是合法 JSON")
+}
+
+/// **网页端写的东西，桌面端必须能通过同步正常拿到。**
+///
+/// 这就是"服务端代笔"的全部意义：服务端把自己当一台设备，生成 HLC、写进
+/// 变更日志、分配 seq。桌面端不需要知道这条笔记是网页端写的还是另一台桌面端
+/// 写的 —— 走的完全是同一条路。也正因如此，裁定权仍然只有 `core::merge`
+/// 那一份，浏览器里没有第二套合并规则。
+#[test]
+fn a_web_write_reaches_the_desktop_through_sync() {
+    let addr = start_server();
+    let a = db::open_memory("e2e-web-a").expect("建 A 库");
+    let b = db::open_memory("e2e-web-b").expect("建 B 库");
+    let api = api(addr);
+
+    // ---- 网页端：建频道、记一条 ----
+    let ch = write_req(
+        addr,
+        "POST",
+        "/api/channel",
+        Some(&serde_json::json!({ "name": "网页建的" })),
+    );
+    let ch_id = ch["id"].as_str().expect("频道要有 id").to_string();
+
+    let m = write_req(
+        addr,
+        "POST",
+        "/api/message",
+        Some(&serde_json::json!({ "body": "网页端记的一条", "channelId": ch_id })),
+    );
+    let m_id = m["id"].as_str().expect("消息要有 id").to_string();
+    assert_eq!(m["body"], "网页端记的一条");
+
+    // ---- 两台桌面端都同步下来 ----
+    sync_until_quiet(&a, &api);
+    sync_until_quiet(&b, &api);
+
+    for (name, d) in [("A", &a), ("B", &b)] {
+        let conn = d.conn().unwrap();
+        let bodies: Vec<String> = conn
+            .prepare("SELECT body FROM message WHERE deleted_at IS NULL")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert!(
+            bodies.iter().any(|x| x == "网页端记的一条"),
+            "{name} 端没拿到网页端写的笔记：{bodies:?}"
+        );
+        assert!(
+            db::list_channels(&conn)
+                .unwrap()
+                .iter()
+                .any(|c| c.name == "网页建的"),
+            "{name} 端没拿到网页端建的频道"
+        );
+        assert_eq!(
+            db::search(&conn, "网页端", 10).unwrap().len(),
+            1,
+            "{name} 端的本地检索索引也要跟着建起来"
+        );
+    }
+
+    assert_eq!(
+        snapshot(&a.conn().unwrap()),
+        snapshot(&b.conn().unwrap()),
+        "代笔写入之后两端仍须收敛"
+    );
+
+    // ---- 网页端改正文，桌面端跟着更新 ----
+    write_req(
+        addr,
+        "PATCH",
+        &format!("/api/message/{m_id}"),
+        Some(&serde_json::json!({ "body": "网页端改过了" })),
+    );
+    sync_until_quiet(&a, &api);
+    {
+        let conn = a.conn().unwrap();
+        let body: String = conn
+            .query_row("SELECT body FROM message WHERE id = ?1", [&m_id], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(body, "网页端改过了");
+        assert_eq!(
+            db::search(&conn, "改过", 10).unwrap().len(),
+            1,
+            "改了正文之后，本端索引也要跟着重建"
+        );
+    }
+
+    // ---- 网页端打标签，桌面端跟着变 ----
+    write_req(
+        addr,
+        "PUT",
+        &format!("/api/message/{m_id}/tags"),
+        Some(&serde_json::json!({ "tags": ["网页标签"] })),
+    );
+    sync_until_quiet(&a, &api);
+    {
+        let conn = a.conn().unwrap();
+        let hits = db::search(&conn, "改过", 10).unwrap();
+        assert_eq!(
+            hits[0].message.tags,
+            vec!["网页标签".to_string()],
+            "网页端打的标签要出现在桌面端"
+        );
+    }
+
+    // ---- 网页端删除，桌面端也删掉 ----
+    write_req(addr, "DELETE", &format!("/api/message/{m_id}"), None);
+    sync_until_quiet(&a, &api);
+    sync_until_quiet(&b, &api);
+    {
+        let conn = a.conn().unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM message WHERE deleted_at IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 0, "网页端删掉的笔记，桌面端也该消失");
+    }
+    assert_eq!(
+        snapshot(&a.conn().unwrap()),
+        snapshot(&b.conn().unwrap()),
+        "一整轮网页端操作之后两端仍须收敛"
+    );
+}
+
+

@@ -52,3 +52,10 @@ impl Serialize for ServerError {
 }
 
 pub type ServerResult<T> = Result<T, ServerError>;
+
+impl ServerError {
+    /// 请求方自己发错了东西。会原样回给客户端（400）。
+    pub fn bad_request(text: impl Into<String>) -> Self {
+        ServerError::BadRequest(text.into())
+    }
+}

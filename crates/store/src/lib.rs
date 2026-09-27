@@ -33,6 +33,8 @@
 //! 这一层不定义错误，也不需要知道谁在调用它。
 
 pub mod browse;
+pub mod clock;
+pub mod normalize;
 
 pub use browse::{
     attach_tags, list_channels, list_messages, list_tags, row_to_message, search, timeline_stats,

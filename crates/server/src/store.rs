@@ -22,19 +22,19 @@ use std::sync::{Mutex, MutexGuard};
 
 use rusqlite::{params, Connection, OptionalExtension};
 
-use messagenote_core::hlc::Hlc;
+use messagenote_core::hlc::{now_ms, Hlc};
 use messagenote_core::merge;
-use messagenote_core::models::{Channel, MessagePage, SearchHit, TagCount, TimelineStats};
+use messagenote_core::models::{Channel, Message, MessagePage, SearchHit, TagCount, TimelineStats};
 use messagenote_core::payload::{
     message_tag_key, ChannelPayload, MessagePayload, MessageTagPayload, TagPayload,
 };
 use messagenote_core::search;
 use messagenote_core::wire::{Change, EntityKind, PullResponse, PushOutcome, PushResponse};
-use messagenote_store::{Cursor, Scope};
+use messagenote_store::{clock, normalize, Cursor, Scope};
 
 use crate::error::{ServerError, ServerResult};
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 const SCHEMA: &str = r#"
 -- 单行计数器。seq 必须全局单调，不能按实体各自计数，
@@ -111,6 +111,17 @@ CREATE VIRTUAL TABLE IF NOT EXISTS message_fts USING fts5(
   search_text,
   message_id UNINDEXED,
   tokenize = 'unicode61 remove_diacritics 2'
+);
+
+-- 服务端自己的身份与时钟。
+--
+-- 代笔写入需要它：服务端在这里**就是一台普通设备**，要有自己唯一的 device_id
+-- 和一份会推进的 HLC。和客户端那张 `meta` 表同形，推进逻辑也是同一份
+-- （`messagenote_store::clock`）—— 那段逻辑一旦两端分叉，"谁更新"的结论就会
+-- 分叉，而且是静默的。
+CREATE TABLE IF NOT EXISTS meta (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
 );
 "#;
 
@@ -290,6 +301,392 @@ impl Store {
         let conn = self.conn()?;
         Ok(messagenote_store::search(&conn, query, limit)?)
     }
+
+    // ---------------------------------------------------------------- 代笔写入
+    //
+    // 服务端在这里**就是一台普通设备**：拿自己的 HLC、写进变更日志、分配 seq。
+    // 桌面端下次同步照常拉到，没有任何特殊路径 —— 也正因如此，裁定权仍然
+    // 只有一份（`merge::should_accept_push`）。
+    //
+    // 为什么不给浏览器也做一套同步引擎：那意味着在 JS 里再实现一遍 HLC 和
+    // 合并规则。两份实现漂移起来的症状是"两边各自认为自己赢"，不报错，
+    // 只是最终收敛不到同一个状态。
+    //
+    // 代价很明确：**网页端写入需要联网**。离线捕获留给 S3 的 outbox。
+
+    /// 落一条以服务端身份发起的变更。
+    ///
+    /// 走的是和 `push` 完全同一套 `should_accept_push` + `upsert`，
+    /// 所以索引维护、墓碑规则、seq 分配都不会有第二份实现。
+    fn author(
+        &self,
+        kind: EntityKind,
+        id: String,
+        deleted: bool,
+        data: serde_json::Value,
+    ) -> ServerResult<()> {
+        let conn = self.conn()?;
+        let tx = conn.unchecked_transaction()?;
+
+        // 时钟推进必须和变更落库在同一个事务里：崩在中间会让重启后的时钟回退，
+        // 此后代笔的每一条都比已有的更旧、在裁定里持续判负 ——
+        // 表现成"网页端写的东西全都不见了"，而且不报任何错。
+        let hlc = clock::clock_next(&tx)?;
+        let change = Change {
+            seq: None,
+            kind,
+            id,
+            hlc,
+            deleted,
+            data: Some(data),
+        };
+
+        if !merge::should_accept_push(&change.hlc, read_stored_hlc(&tx, kind, &change.id)?.as_ref())
+        {
+            // 极少见：某台设备的时钟比本机还超前，于是它那一版更"新"。
+            // 按 LWW 保留它 —— 但**绝不静默**，否则用户会以为自己的修改保存了。
+            let wall = read_change(&tx, kind, &change.id)?
+                .map(|w| w.hlc.wall)
+                .unwrap_or(0);
+            tx.commit()?;
+            return Err(ServerError::Msg(format!(
+                "这次修改被另一台设备上更新的版本覆盖了（对方时间戳 {wall}），请刷新后重试"
+            )));
+        }
+
+        let seq = next_seq(&tx)?;
+        upsert(&tx, &change, seq)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// 读出某条消息当前的完整 payload。
+    ///
+    /// 编辑/移动/删除都要在它基础上改：线上的变更传的是**整份快照**而不是差分，
+    /// 少填一个字段，`upsert` 里对应的 `excluded.*` 就会把它写成空值。
+    fn message_payload(&self, id: &str) -> ServerResult<MessagePayload> {
+        let conn = self.conn()?;
+        Ok(conn
+            .query_row(
+                "SELECT channel_id, body, created_at FROM message
+                  WHERE id = ?1 AND deleted_at IS NULL",
+                params![id],
+                |r| {
+                    Ok(MessagePayload {
+                        channel_id: r.get(0)?,
+                        body: r.get(1)?,
+                        created_at: r.get(2)?,
+                        updated_at: 0,
+                    })
+                },
+            )
+            .optional()?
+            .ok_or_else(|| ServerError::bad_request("消息不存在"))?)
+    }
+
+    fn channel_payload(&self, id: &str) -> ServerResult<ChannelPayload> {
+        let conn = self.conn()?;
+        Ok(conn
+            .query_row(
+                "SELECT name, kind, sort_order, created_at FROM channel
+                  WHERE id = ?1 AND deleted_at IS NULL",
+                params![id],
+                |r| {
+                    Ok(ChannelPayload {
+                        name: r.get(0)?,
+                        kind: r.get(1)?,
+                        sort_order: r.get(2)?,
+                        created_at: r.get(3)?,
+                        updated_at: 0,
+                    })
+                },
+            )
+            .optional()?
+            .ok_or_else(|| ServerError::bad_request("频道不存在"))?)
+    }
+
+    fn message(&self, id: &str) -> ServerResult<Message> {
+        let conn = self.conn()?;
+        let mut msg = conn
+            .query_row(
+                "SELECT id, channel_id, body, created_at, updated_at
+                   FROM message WHERE id = ?1 AND deleted_at IS NULL",
+                params![id],
+                messagenote_store::row_to_message,
+            )
+            .optional()?
+            .ok_or_else(|| ServerError::bad_request("消息不存在"))?;
+        messagenote_store::attach_tags(&conn, std::slice::from_mut(&mut msg))?;
+        Ok(msg)
+    }
+
+    fn channel(&self, id: &str) -> ServerResult<Channel> {
+        let conn = self.conn()?;
+        Ok(conn
+            .query_row(
+                "SELECT c.id, c.name, c.kind, c.sort_order, c.created_at, c.updated_at,
+                        (SELECT COUNT(*) FROM message m
+                          WHERE m.channel_id = c.id AND m.deleted_at IS NULL)
+                   FROM channel c WHERE c.id = ?1 AND c.deleted_at IS NULL",
+                params![id],
+                |r| {
+                    Ok(Channel {
+                        id: r.get(0)?,
+                        name: r.get(1)?,
+                        kind: r.get(2)?,
+                        sort_order: r.get(3)?,
+                        created_at: r.get(4)?,
+                        updated_at: r.get(5)?,
+                        message_count: r.get(6)?,
+                    })
+                },
+            )
+            .optional()?
+            .ok_or_else(|| ServerError::bad_request("频道不存在"))?)
+    }
+
+    fn require_channel(&self, id: &str) -> ServerResult<()> {
+        let _ = self.channel_payload(id)?;
+        Ok(())
+    }
+
+    // ---- 消息 ----
+
+    pub fn create_message(&self, body: &str, channel_id: Option<&str>) -> ServerResult<Message> {
+        let body = normalize::body(body).map_err(ServerError::bad_request)?;
+        let channel_id = channel_id.unwrap_or(messagenote_store::INBOX_ID);
+        self.require_channel(channel_id)?;
+
+        let now = now_ms();
+        let id = uuid::Uuid::now_v7().to_string();
+        self.author(
+            EntityKind::Message,
+            id.clone(),
+            false,
+            to_json(MessagePayload {
+                channel_id: channel_id.to_string(),
+                body,
+                created_at: now,
+                updated_at: now,
+            })?,
+        )?;
+        self.message(&id)
+    }
+
+    pub fn edit_message(&self, id: &str, body: &str) -> ServerResult<Message> {
+        let body = normalize::body(body).map_err(ServerError::bad_request)?;
+        let mut p = self.message_payload(id)?;
+        p.body = body;
+        p.updated_at = now_ms();
+        self.author(EntityKind::Message, id.to_string(), false, to_json(p)?)?;
+        self.message(id)
+    }
+
+    pub fn remove_message(&self, id: &str) -> ServerResult<()> {
+        let mut p = self.message_payload(id)?;
+        // 墓碑时间取自 payload 的 `updated_at`，所以这里必须设成"现在"。
+        // 服务端另取一个时间的话，两台设备对同一条墓碑会写出不同的
+        // `deleted_at`，状态永远收敛不了 —— 而且不报错。
+        p.updated_at = now_ms();
+        self.author(EntityKind::Message, id.to_string(), true, to_json(p)?)
+    }
+
+    pub fn move_message(&self, id: &str, channel_id: &str) -> ServerResult<()> {
+        self.require_channel(channel_id)?;
+        let mut p = self.message_payload(id)?;
+        p.channel_id = channel_id.to_string();
+        p.updated_at = now_ms();
+        self.author(EntityKind::Message, id.to_string(), false, to_json(p)?)
+    }
+
+    /// 用「标签名列表」整体替换一条消息的标签。
+    ///
+    /// **只发必要的变更**：该加的加、该删的删、没动的不发。
+    /// 按"全部标删再全部重建"来写会产生一堆无意义的变更，让所有设备白重放一遍。
+    pub fn set_message_tags(&self, message_id: &str, names: &[String]) -> ServerResult<()> {
+        let _ = self.message_payload(message_id)?; // 消息必须存在
+        let wanted = normalize::tags(names);
+
+        // 现有关系（带原始 created_at —— 墓碑不能改这个值，
+        // 否则各设备对同一行的快照会不一致）
+        let current: Vec<(String, i64, i64)> = {
+            let conn = self.conn()?;
+            let mut stmt = conn.prepare(
+                "SELECT tag_name, created_at, updated_at FROM message_tag
+                  WHERE message_id = ?1 AND deleted_at IS NULL",
+            )?;
+            let it = stmt.query_map(params![message_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?;
+            it.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        // 删掉不再需要的
+        for (name, created_at, _) in &current {
+            if wanted.contains(name) {
+                continue;
+            }
+            self.author(
+                EntityKind::MessageTag,
+                message_tag_key::encode(message_id, name),
+                true,
+                to_json(MessageTagPayload {
+                    message_id: message_id.to_string(),
+                    tag_name: name.clone(),
+                    created_at: *created_at,
+                    updated_at: now_ms(),
+                })?,
+            )?;
+        }
+
+        // 加上新要的
+        for name in &wanted {
+            if current.iter().any(|(n, _, _)| n == name) {
+                continue;
+            }
+            // 标签本身也得存在：`load_tags` 会 JOIN tag 表，
+            // 缺了这一行的话，所有设备上都看不到这个标签。
+            self.ensure_tag(name)?;
+            self.author(
+                EntityKind::MessageTag,
+                message_tag_key::encode(message_id, name),
+                false,
+                to_json(MessageTagPayload {
+                    message_id: message_id.to_string(),
+                    tag_name: name.clone(),
+                    created_at: now_ms(),
+                    updated_at: now_ms(),
+                })?,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// 保证标签行存在且未被删。已经好好的就什么都不发。
+    fn ensure_tag(&self, name: &str) -> ServerResult<()> {
+        let existing: Option<(i64, Option<i64>)> = {
+            let conn = self.conn()?;
+            conn.query_row(
+                "SELECT created_at, deleted_at FROM tag WHERE name = ?1",
+                params![name],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?
+        };
+        let now = now_ms();
+
+        match existing {
+            // 已经存在且活着 —— 发一条内容相同的变更只会让所有设备白重放一遍
+            Some((_, None)) => Ok(()),
+            // 是墓碑：复活它，并**沿用原来的 created_at**
+            Some((created_at, Some(_))) => self.author(
+                EntityKind::Tag,
+                name.to_string(),
+                false,
+                to_json(TagPayload {
+                    created_at,
+                    updated_at: now,
+                })?,
+            ),
+            // 全新的标签
+            None => self.author(
+                EntityKind::Tag,
+                name.to_string(),
+                false,
+                to_json(TagPayload {
+                    created_at: now,
+                    updated_at: now,
+                })?,
+            ),
+        }
+    }
+
+    // ---- 频道 ----
+
+    pub fn create_channel(&self, name: &str) -> ServerResult<Channel> {
+        let name = normalize::channel_name(name).map_err(ServerError::bad_request)?;
+        {
+            let conn = self.conn()?;
+            let exists: Option<String> = conn
+                .query_row(
+                    "SELECT id FROM channel WHERE name = ?1 AND deleted_at IS NULL",
+                    params![name],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if exists.is_some() {
+                return Err(ServerError::bad_request(format!("频道「{name}」已存在")));
+            }
+        }
+
+        // 排在最后。用 MAX+1 而不是 COUNT+1：删过频道之后 COUNT 会撞上已有的
+        // 值，两个频道排序相同、顺序变得不确定。
+        let next_order: i64 = {
+            let conn = self.conn()?;
+            conn.query_row(
+                "SELECT COALESCE(MAX(sort_order), 0) + 1 FROM channel",
+                [],
+                |r| r.get(0),
+            )?
+        };
+
+        let now = now_ms();
+        let id = uuid::Uuid::now_v7().to_string();
+        self.author(
+            EntityKind::Channel,
+            id.clone(),
+            false,
+            to_json(ChannelPayload {
+                name,
+                // 服务端只代笔普通频道：收件箱是常量实体，不存在"创建"这个动作
+                kind: "normal".into(),
+                sort_order: next_order,
+                created_at: now,
+                updated_at: now,
+            })?,
+        )?;
+        self.channel(&id)
+    }
+
+    pub fn rename_channel(&self, id: &str, name: &str) -> ServerResult<()> {
+        let name = normalize::channel_name(name).map_err(ServerError::bad_request)?;
+        let mut p = self.channel_payload(id)?;
+        p.name = name;
+        p.updated_at = now_ms();
+        self.author(EntityKind::Channel, id.to_string(), false, to_json(p)?)
+    }
+
+    /// 删除频道，**连同它里面的所有消息**。
+    ///
+    /// 和客户端 `delete_channel` 的语义必须一致 —— 不一致的话，同一个操作
+    /// 在桌面端和网页端会留下不同的结果，而用户会以为其中一边丢了东西。
+    pub fn remove_channel(&self, id: &str) -> ServerResult<()> {
+        if id == messagenote_store::INBOX_ID {
+            return Err(ServerError::bad_request("收件箱是默认捕获目标，不能删除"));
+        }
+        let _ = self.channel_payload(id)?;
+
+        let ids: Vec<String> = {
+            let conn = self.conn()?;
+            let mut stmt = conn.prepare(
+                "SELECT id FROM message WHERE channel_id = ?1 AND deleted_at IS NULL",
+            )?;
+            let it = stmt.query_map(params![id], |r| r.get::<_, String>(0))?;
+            it.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for mid in ids {
+            self.remove_message(&mid)?;
+        }
+
+        let mut p = self.channel_payload(id)?;
+        p.updated_at = now_ms();
+        self.author(EntityKind::Channel, id.to_string(), true, to_json(p)?)
+    }
+}
+
+/// 序列化 payload。失败只可能是 serde 本身出了意外，不是为用户准备的消息。
+fn to_json<T: serde::Serialize>(value: T) -> ServerResult<serde_json::Value> {
+    serde_json::to_value(value).map_err(|e| ServerError::Msg(format!("payload 序列化失败：{e}")))
 }
 
 // ---------------------------------------------------------------- seq
@@ -677,6 +1074,10 @@ fn collect_message_tags(
 /// 这一条是被 `desktop_and_server_agree_on_browse_and_search` 抓出来的：
 /// 那个测试逐字段比对两端的频道列表，桌面端两个、服务端只有一个。
 fn seed_constants(conn: &Connection) -> ServerResult<()> {
+    // 服务端也是一台设备，也要有自己唯一的 id ——
+    // HLC 是 (wall, counter, device)，device 那一层用来打破平局。
+    clock::ensure_device_id(conn)?;
+
     conn.execute(
         "INSERT OR IGNORE INTO channel
            (id, name, kind, sort_order, created_at, updated_at, device_id,
@@ -1179,5 +1580,107 @@ mod tests {
         let hits = s.search("升级", 10).unwrap();
         assert_eq!(hits.len(), 1, "回填之后，升级前就有的数据也要搜得到");
         assert_eq!(hits[0].message.id, "old-1");
+    }
+
+    /// 代笔写入 = 服务端把自己当一台设备。
+    ///
+    /// 核心断言是**代笔产生的变更必须进变更流**：桌面端不需要知道这条笔记是
+    /// "网页端写的"还是"另一台桌面端写的" —— 走的完全是同一条路。
+    #[test]
+    fn authoring_writes_into_the_change_log() {
+        let s = store();
+
+        let m = s.create_message("网页端记的一条", None).unwrap();
+        assert_eq!(m.body, "网页端记的一条");
+        assert_eq!(m.channel_id, "inbox", "省略频道时落到收件箱");
+
+        // 拉取能看到它 —— 这就是"服务端当一台设备"的全部含义
+        let pulled = s.pull(0, 100).unwrap();
+        assert!(
+            pulled.changes.iter().any(|c| c.id == m.id),
+            "代笔的变更必须进变更流，否则桌面端永远看不到"
+        );
+
+        // 索引维护走的是和 push 同一条路径，所以立刻能搜到
+        assert_eq!(s.search("网页端", 10).unwrap().len(), 1);
+
+        // 改正文：旧词消失、新词出现、变更流里多一条
+        let edited = s.edit_message(&m.id, "改成了别的").unwrap();
+        assert_eq!(edited.body, "改成了别的");
+        assert!(s.search("网页端", 10).unwrap().is_empty(), "旧正文要从索引里摘掉");
+        assert_eq!(s.search("别的", 10).unwrap().len(), 1);
+        assert_eq!(edited.created_at, m.created_at, "改正文不该动 created_at");
+
+        // 删除：墓碑要进变更流，且带上 payload 的 updated_at
+        s.remove_message(&m.id).unwrap();
+        let tomb = s
+            .pull(0, 100)
+            .unwrap()
+            .changes
+            .into_iter()
+            .find(|c| c.id == m.id && c.deleted)
+            .expect("墓碑必须进变更流");
+        let p: MessagePayload = decode(&tomb).unwrap();
+        assert!(tomb.deleted);
+        assert!(p.updated_at > 0, "墓碑时间取自 payload 的 updatedAt");
+        assert!(s.search("别的", 10).unwrap().is_empty(), "墓碑要从索引里摘掉");
+    }
+
+    /// 校验规则和桌面端**共用同一份**（`messagenote_store::normalize`）。
+    ///
+    /// 不共用的话会变成"桌面端拒绝、网页端接受" —— 用户看到的是
+    /// "这个软件时好时坏"，而没有任何一处报错指向真正的原因。
+    #[test]
+    fn authoring_rejects_what_the_desktop_rejects() {
+        let s = store();
+
+        assert!(s.create_message("   ", None).is_err(), "空内容要拒绝");
+        assert!(s.create_message("\n\t\n", None).is_err(), "只有空白的也要拒绝");
+        assert!(s.create_channel("  ",).is_err(), "空频道名要拒绝");
+
+        let m = s.create_message("正常内容", None).unwrap();
+        assert!(
+            s.move_message(&m.id, "不存在的频道").is_err(),
+            "目标频道不存在要拒绝"
+        );
+        assert!(s.edit_message(&m.id, "  ").is_err(), "改成空要拒绝");
+        assert!(s.rename_channel(&m.channel_id, "  ").is_err(), "频道名改成空要拒绝");
+        assert!(
+            s.remove_channel(&m.channel_id).is_err(),
+            "收件箱是默认捕获目标，不能删除"
+        );
+    }
+
+    /// 标签是「整体替换」语义，而且**只发必要的变更**。
+    ///
+    /// 按"全部标删再全部重建"写会产生一堆无意义的变更让所有设备白重放一遍。
+    #[test]
+    fn setting_tags_emits_only_the_changes_that_are_needed() {
+        let s = store();
+        let m = s.create_message("带标签的一条", None).unwrap();
+        let before = s.max_seq().unwrap();
+
+        s.set_message_tags(&m.id, &["水果".into(), " 水果 ".into(), "".into()]).unwrap();
+        let after_add = s.max_seq().unwrap();
+        // 一个 tag 行 + 一个 message_tag 行
+        assert_eq!(after_add - before, 2, "新增两个标签应当只产生两条变更");
+
+        // 重复设置同样的标签：一条变更都不该产生
+        s.set_message_tags(&m.id, &["水果".into()]).unwrap();
+        assert_eq!(
+            s.max_seq().unwrap(),
+            after_add,
+            "标签没变化时不该产生任何变更 —— 否则每次保存都会让所有设备重放一遍"
+        );
+
+        // 清空
+        s.set_message_tags(&m.id, &[]).unwrap();
+        assert_eq!(s.max_seq().unwrap(), after_add + 1, "清空只需一条墓碑");
+
+        let tags = messagenote_store::list_tags(&s.conn().unwrap()).unwrap();
+        assert!(
+            tags.iter().all(|t| t.count == 0),
+            "标签行还在（不回收孤儿标签），但计数要为 0"
+        );
     }
 }

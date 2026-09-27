@@ -7,3 +7,4 @@ description = "MessageNote 共享存储层：只放「在客户端与服务端�
 [dependencies]
 messagenote-core = { workspace = true }
 rusqlite = { workspace = true }
+uuid = { workspace = true }

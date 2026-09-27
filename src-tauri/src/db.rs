@@ -19,7 +19,6 @@ use std::sync::Mutex;
 
 use rusqlite::{params, Connection, OptionalExtension};
 
-use messagenote_core::hlc::Hlc;
 use messagenote_core::models::{Channel, Message, SyncConfig};
 // 别名是因为下面要转出 store 的 `search` **函数**，而这里用的是 core 的
 // `search` **模块**。两者分属不同的命名空间，技术上能共存 —— 但读代码的人
@@ -32,6 +31,10 @@ pub use messagenote_store::{
     attach_tags, list_channels, list_messages, list_tags, row_to_message, search, timeline_stats,
     Cursor, Scope, INBOX_ID,
 };
+// 时钟推进同理：它决定"谁更新"，两端必须逐字一致。
+pub use messagenote_store::clock::{clock_next, clock_observe, device_id};
+
+use messagenote_store::{clock, normalize};
 
 use crate::error::{AppError, AppResult};
 
@@ -250,9 +253,7 @@ pub fn open_memory(device_id: &str) -> AppResult<Db> {
 }
 
 fn seed(conn: &Connection) -> AppResult<()> {
-    if get_meta(conn, "device_id")?.is_none() {
-        set_meta(conn, "device_id", &uuid::Uuid::now_v7().to_string())?;
-    }
+    clock::ensure_device_id(conn)?;
     // 收件箱是**常量实体**：每台设备都独立创建同样的它，且 dirty = 0 永不推送。
     //
     // 时间戳刻意写死 0，而不是 now_ms()。用本机时间的话，两台设备的收件箱
@@ -268,28 +269,6 @@ fn seed(conn: &Connection) -> AppResult<()> {
     Ok(())
 }
 
-fn get_meta(conn: &Connection, key: &str) -> AppResult<Option<String>> {
-    let v = conn
-        .query_row("SELECT value FROM meta WHERE key = ?1", params![key], |r| {
-            r.get(0)
-        })
-        .optional()?;
-    Ok(v)
-}
-
-fn set_meta(conn: &Connection, key: &str, value: &str) -> AppResult<()> {
-    conn.execute(
-        "INSERT INTO meta (key, value) VALUES (?1, ?2)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        params![key, value],
-    )?;
-    Ok(())
-}
-
-pub fn device_id(conn: &Connection) -> AppResult<String> {
-    Ok(get_meta(conn, "device_id")?.unwrap_or_default())
-}
-
 // ---------------------------------------------------------------- 同步配置
 
 const SYNC_URL_KEY: &str = "sync_url";
@@ -297,65 +276,23 @@ const SYNC_TOKEN_KEY: &str = "sync_token";
 
 pub fn get_sync_config(conn: &Connection) -> AppResult<SyncConfig> {
     Ok(SyncConfig {
-        url: get_meta(conn, SYNC_URL_KEY)?.unwrap_or_default(),
-        token: get_meta(conn, SYNC_TOKEN_KEY)?.unwrap_or_default(),
+        url: clock::get(conn, SYNC_URL_KEY)?.unwrap_or_default(),
+        token: clock::get(conn, SYNC_TOKEN_KEY)?.unwrap_or_default(),
     })
 }
 
 pub fn set_sync_config(conn: &Connection, url: &str, token: &str) -> AppResult<()> {
     // 在这里归一化一次，免得后面每处拼接 URL 都要自己处理末尾斜杠
     let url = url.trim().trim_end_matches('/');
-    set_meta(conn, SYNC_URL_KEY, url)?;
-    set_meta(conn, SYNC_TOKEN_KEY, token.trim())?;
+    clock::set(conn, SYNC_URL_KEY, url)?;
+    clock::set(conn, SYNC_TOKEN_KEY, token.trim())?;
     Ok(())
-}
-
-// ---------------------------------------------------------------- 时钟
-
-fn read_clock(conn: &Connection, device: &str) -> AppResult<Hlc> {
-    let wall = get_meta(conn, "hlc_wall")?
-        .and_then(|v| v.parse::<i64>().ok())
-        .unwrap_or(0);
-    let counter = get_meta(conn, "hlc_counter")?
-        .and_then(|v| v.parse::<u32>().ok())
-        .unwrap_or(0);
-    Ok(Hlc::new(wall, counter, device))
-}
-
-fn write_clock(conn: &Connection, hlc: &Hlc) -> AppResult<()> {
-    set_meta(conn, "hlc_wall", &hlc.wall.to_string())?;
-    set_meta(conn, "hlc_counter", &hlc.counter.to_string())?;
-    Ok(())
-}
-
-/// 推进本机时钟，返回本次变更应使用的时间戳。
-///
-/// 必须在调用方的**同一个事务内**调用：时钟前进和数据落盘要么一起成功、
-/// 要么一起失败。
-pub fn clock_next(conn: &Connection) -> AppResult<Hlc> {
-    let device = device_id(conn)?;
-    let mut hlc = read_clock(conn, &device)?;
-    hlc.tick(messagenote_core::now_ms());
-    write_clock(conn, &hlc)?;
-    Ok(hlc)
-}
-
-/// 观察到远端时间戳后校正本机时钟。收到比本机更超前的时间戳时，
-/// 把本地时钟拉前，避免此后持续落后、每次冲突都输。
-pub fn clock_observe(conn: &Connection, remote: &Hlc) -> AppResult<()> {
-    let device = device_id(conn)?;
-    let mut hlc = read_clock(conn, &device)?;
-    hlc.observe(remote, messagenote_core::now_ms());
-    write_clock(conn, &hlc)
 }
 
 // ---------------------------------------------------------------- 频道
 
 pub fn create_channel(conn: &Connection, name: &str) -> AppResult<Channel> {
-    let name = name.trim();
-    if name.is_empty() {
-        return Err(AppError::Msg("频道名不能为空".into()));
-    }
+    let name = normalize::channel_name(name).map_err(AppError::msg)?;
     let exists: Option<String> = conn
         .query_row(
             "SELECT id FROM channel WHERE name = ?1 AND deleted_at IS NULL",
@@ -397,10 +334,7 @@ pub fn create_channel(conn: &Connection, name: &str) -> AppResult<Channel> {
 }
 
 pub fn rename_channel(conn: &Connection, id: &str, name: &str) -> AppResult<()> {
-    let name = name.trim();
-    if name.is_empty() {
-        return Err(AppError::Msg("频道名不能为空".into()));
-    }
+    let name = normalize::channel_name(name).map_err(AppError::msg)?;
     let tx = conn.unchecked_transaction()?;
     let hlc = clock_next(&tx)?;
     let n = tx.execute(
@@ -456,10 +390,7 @@ pub fn append_message(
     body: &str,
     channel_id: Option<&str>,
 ) -> AppResult<Message> {
-    let body = body.trim_end();
-    if body.trim().is_empty() {
-        return Err(AppError::Msg("内容不能为空".into()));
-    }
+    let body = normalize::body(body).map_err(AppError::msg)?;
     let channel_id = channel_id.unwrap_or(INBOX_ID);
 
     let exists: Option<String> = conn
@@ -486,7 +417,7 @@ pub fn append_message(
     )?;
     tx.execute(
         "INSERT INTO message_fts (search_text, message_id) VALUES (?1, ?2)",
-        params![core_search::to_index_text(body), id],
+        params![core_search::to_index_text(&body), id],
     )?;
     tx.commit()?;
 
@@ -501,10 +432,7 @@ pub fn append_message(
 }
 
 pub fn update_message(conn: &Connection, id: &str, body: &str) -> AppResult<Message> {
-    let body = body.trim_end();
-    if body.trim().is_empty() {
-        return Err(AppError::Msg("内容不能为空".into()));
-    }
+    let body = normalize::body(body).map_err(AppError::msg)?;
     let now = messagenote_core::now_ms();
 
     let tx = conn.unchecked_transaction()?;
@@ -522,7 +450,7 @@ pub fn update_message(conn: &Connection, id: &str, body: &str) -> AppResult<Mess
     tx.execute("DELETE FROM message_fts WHERE message_id = ?1", params![id])?;
     tx.execute(
         "INSERT INTO message_fts (search_text, message_id) VALUES (?1, ?2)",
-        params![core_search::to_index_text(body), id],
+        params![core_search::to_index_text(&body), id],
     )?;
     tx.commit()?;
 
@@ -598,14 +526,7 @@ pub fn move_message(conn: &Connection, id: &str, channel_id: &str) -> AppResult<
 /// 而 B 那边的关联还指着它。
 /// 标签是极小的数据，宁可让列表里出现使用数为 0 的条目。
 pub fn set_message_tags(conn: &Connection, message_id: &str, names: &[String]) -> AppResult<()> {
-    // 去重 + 去空 + 去首尾空格，同时保持用户给出的顺序
-    let mut cleaned: Vec<String> = Vec::new();
-    for n in names {
-        let n = n.trim().to_string();
-        if !n.is_empty() && !cleaned.contains(&n) {
-            cleaned.push(n);
-        }
-    }
+    let cleaned = normalize::tags(names);
 
     let now = messagenote_core::now_ms();
     let tx = conn.unchecked_transaction()?;
@@ -672,6 +593,9 @@ pub fn set_message_tags(conn: &Connection, message_id: &str, names: &[String]) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // 主代码里不再直接构造 Hlc（推进逻辑已经搬进共享层），只有测试需要
+    use messagenote_core::hlc::Hlc;
 
     /// 内存库。这些测试同时承担两个职责：
     /// 1. 验证 SQLite 的 FTS5 扩展确实被编译进来了（`bundled` 特性的关键前提）

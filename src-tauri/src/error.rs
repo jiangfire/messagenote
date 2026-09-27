@@ -33,3 +33,14 @@ impl Serialize for AppError {
 }
 
 pub type AppResult<T> = Result<T, AppError>;
+
+impl AppError {
+    /// 把一句话包成客户端错误。
+    ///
+    /// 主要是给共享层用的：`messagenote-store` 的规范化和解析函数返回
+    /// `&'static str` 或实现了 `Display` 的小错误，各自只需要一句话说明
+    /// "哪里不合法"，由两端包成自己的错误类型。
+    pub fn msg(text: impl Into<String>) -> Self {
+        AppError::Msg(text.into())
+    }
+}

@@ -16,23 +16,38 @@
 //! 这些读取全部走 `messagenote-store`，和桌面端是**同一份**查询实现 ——
 //! 网页端看到的不是"另一个长得像的时间线"。
 //!
+//! 写入（网页端用，**由服务端代笔**）：
+//! - `POST   /api/message`              记一条
+//! - `PATCH  /api/message/{id}`         改正文
+//! - `DELETE /api/message/{id}`
+//! - `POST   /api/message/{id}/move`    换频道
+//! - `PUT    /api/message/{id}/tags`    整体替换标签
+//! - `POST   /api/channel`              建频道
+//! - `PATCH  /api/channel/{id}`         改名
+//! - `DELETE /api/channel/{id}`         删频道（连同里面的消息）
+//!
+//! 代笔的意思是：服务端以**一台设备的身份**生成 HLC、写进变更日志、分配 seq，
+//! 桌面端下次同步照常拉到。浏览器因此完全不需要 HLC、合并和冲突处理 ——
+//! 裁定权仍然只有 `core::merge` 那一份。代价是网页端写入需要联网。
+//!
 //! 刻意用朴素的 REST 而不是 WebSocket：同步是"客户端主动推拉"的模型，
 //! REST 更好调试（curl 就能复现问题），而实时推送（SSE）等 S4 再说。
 
 use std::sync::Arc;
 
-use axum::extract::{Query, Request, State};
+use axum::extract::{Path, Query, Request, State};
 use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::Response;
-use axum::routing::{get, post};
+use axum::routing::{get, patch, post, put};
 use axum::{Json, Router};
 
 use messagenote_core::hlc::now_ms;
-use messagenote_core::models::{Channel, MessagePage, SearchHit, TagCount, TimelineStats};
+use messagenote_core::models::{Channel, Message, MessagePage, SearchHit, TagCount, TimelineStats};
 use messagenote_core::wire::{
-    HealthResponse, PullQuery, PullResponse, PushRequest, PushResponse, SearchQuery, TimelineQuery,
-    PROTOCOL_VERSION,
+    CreateChannelRequest, CreateMessageRequest, EditMessageRequest, HealthResponse,
+    MoveMessageRequest, PullQuery, PullResponse, PushRequest, PushResponse, RenameChannelRequest,
+    SearchQuery, SetTagsRequest, TimelineQuery, PROTOCOL_VERSION,
 };
 use messagenote_store::{Cursor, Scope};
 
@@ -66,6 +81,19 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/channels", get(channels))
         .route("/api/tags", get(tags))
         .route("/api/search", get(search))
+        // 写入。全部由服务端代笔 —— 见文件头的说明。
+        .route("/api/message", post(create_message))
+        .route(
+            "/api/message/{id}",
+            patch(edit_message).delete(remove_message),
+        )
+        .route("/api/message/{id}/move", post(move_message))
+        .route("/api/message/{id}/tags", put(set_message_tags))
+        .route("/api/channel", post(create_channel))
+        .route(
+            "/api/channel/{id}",
+            patch(rename_channel).delete(remove_channel),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_token,
@@ -208,6 +236,82 @@ async fn search(
             .store
             .search(&q.q, q.limit.unwrap_or(DEFAULT_SEARCH_LIMIT))?,
     ))
+}
+
+// ---------------------------------------------------------------- 写入
+//
+// 全部由服务端代笔：它把自己当一台设备。下面这些函数只做参数搬运 ——
+// 真正的规则（校验、HLC、seq、索引维护、墓碑时间）都在 `Store` 里，
+// 和 `push` 共用同一条路径。
+
+async fn create_message(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CreateMessageRequest>,
+) -> ServerResult<Json<Message>> {
+    Ok(Json(
+        state
+            .store
+            .create_message(&req.body, req.channel_id.as_deref())?,
+    ))
+}
+
+async fn edit_message(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<EditMessageRequest>,
+) -> ServerResult<Json<Message>> {
+    Ok(Json(state.store.edit_message(&id, &req.body)?))
+}
+
+/// 删除回 204：没什么可回的，而且客户端本来就要重新拉一次时间线。
+async fn remove_message(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> ServerResult<StatusCode> {
+    state.store.remove_message(&id)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn move_message(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<MoveMessageRequest>,
+) -> ServerResult<StatusCode> {
+    state.store.move_message(&id, &req.channel_id)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn set_message_tags(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<SetTagsRequest>,
+) -> ServerResult<StatusCode> {
+    state.store.set_message_tags(&id, &req.tags)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn create_channel(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CreateChannelRequest>,
+) -> ServerResult<Json<Channel>> {
+    Ok(Json(state.store.create_channel(&req.name)?))
+}
+
+async fn rename_channel(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<RenameChannelRequest>,
+) -> ServerResult<StatusCode> {
+    state.store.rename_channel(&id, &req.name)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn remove_channel(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> ServerResult<StatusCode> {
+    state.store.remove_channel(&id)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[cfg(test)]
