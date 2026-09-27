@@ -202,6 +202,55 @@ MESSAGENOTE_DB=/var/lib/messagenote/server.sqlite ./messagenote-server
   把 SQLite 持续复制到对象存储，恢复就是拉回一个文件。
   客户端虽然各有一份完整副本，但在网页端写入的内容只存在于服务端。
 
+## 网页端
+
+浏览器里能看、能搜、**也能记**。和桌面端跑的是同一套界面 —— 区别只在数据从
+哪儿来（`NoteApi` 的两个实现：Tauri `invoke` vs HTTP）。
+
+```bash
+pnpm build
+# 产物在 dist/，把 dist/web.html 和 dist/assets/ 一起放到静态托管上即可
+```
+
+打开页面后填**服务端地址 + 长期令牌**，登录一次。
+
+几点值得知道：
+
+- **长期令牌不会留在浏览器里。** 它只用来换一个 7 天有效的**会话**；之后所有
+  请求带的是会话。会话能过期、能吊销（`DELETE /api/session`）——
+  这是相对"把长期令牌塞进 localStorage"的主要收益。
+- **写入由服务端代笔。** 服务端以一台设备的身份生成 HLC、写进变更日志、分配 seq，
+  桌面端下次同步照常拉到。所以浏览器里**没有第二套合并规则** —— 裁定权仍然
+  只有 `core::merge` 那一份。
+- **代价：网页端写入需要联网。** 浏览器里没有本地库，离线队列留给 S3。
+- **没有捕获快捷键和置顶浮层**（浏览器里做不到）。所以网页端的重心是查和整理；
+  真正的"随手记"仍然只有桌面端能做。
+
+### 服务端 HTTP 接口
+
+| 方法 | 路径 | 用途 |
+| --- | --- | --- |
+| GET | `/api/health` | 存活探针，**不鉴权** |
+| GET | `/api/sync/handshake` | 鉴权过的握手（桌面端"测试连接"用这个） |
+| GET | `/api/sync/pull` | 拉取变更（`since` 游标） |
+| POST | `/api/sync/push` | 推送变更 |
+| POST | `/api/session` | 长期令牌换短期会话 |
+| DELETE | `/api/session` | 退出登录 |
+| GET | `/api/timeline` | 时间线（scope + 键集游标） |
+| GET | `/api/timeline/stats` | 侧边栏那两个计数 |
+| GET | `/api/channels` / `/api/tags` | |
+| GET | `/api/search` | 检索 |
+| POST | `/api/message` | 记一条 |
+| PATCH / DELETE | `/api/message/{id}` | 改正文 / 删除 |
+| POST | `/api/message/{id}/move` | 换频道 |
+| PUT | `/api/message/{id}/tags` | 整体替换标签 |
+| POST | `/api/channel` | 建频道 |
+| PATCH / DELETE | `/api/channel/{id}` | 改名 / 删除（连同里面的消息） |
+
+除 `/api/health` 和 `POST /api/session` 外，全部需要
+`Authorization: Bearer <长期令牌或会话>`。读取和写入**都走 `crates/store`**，
+和桌面端是同一份查询实现 —— 有测试逐字段比对两端的 JSON。
+
 ## 架构
 
 ```
@@ -227,13 +276,18 @@ MESSAGENOTE_DB=/var/lib/messagenote/server.sqlite ./messagenote-server
   search（bigram 分词）· hlc · merge（谁赢的裁定）· wire/payload（协议）· models
 ```
 
-Cargo workspace 三个成员。**共享内核的取舍标准是"一旦两份实现分歧就会静默出错"**：
+Cargo workspace **四个**成员。**共享内核的取舍标准是"一旦两份实现分歧就会静默出错"**：
 中文分词、HLC 比较、合并裁定、协议字段名都属于这类 —— 写读两端不一致就是检索
 静默失效、状态永不收敛，而且都不会报错。
 
-反过来，两边的**存储实现刻意不共享**：客户端有 `dirty` 标记和本地检索索引，
-服务端有 `server_seq`，硬凑成一个抽象只会得到一个到处是分支的怪物。
-服务端也不维护 FTS 索引（那是 S2 网页端的事）。
+`crates/store` 是后加的一层，契约只有一句：**只放"在客户端与服务端两种 schema
+上都成立"的查询**。浏览和检索属于这类（服务端的表是客户端同名表的超集），
+写入不属于（客户端有 `dirty`，服务端有 `server_seq`）。这条前提有测试钉着
+（`shared_browse_queries_work_on_the_server_schema`），不是读一遍 schema 的推断。
+
+`core` 因此保持**纯逻辑、不依赖 rusqlite**。`clock`（HLC 推进）和 `normalize`
+（内容校验）也在 `store` 里 —— 这两段各写一份必然分叉：前者决定"谁更新"，
+后者决定"什么算合法输入"。
 
 **Rust 独占数据库，前端不碰 SQL。** 前端只通过 `src/lib/api.ts` 那层类型化封装
 调用命令。中文检索需要在 Rust 侧对正文做预处理，如果让前端直接写 SQL，
@@ -371,11 +425,13 @@ cargo test -p messagenote -- --ignored --nocapture
 
 诚实地列出来，避免误判成熟度：
 
-- **网页端 / PWA 未做**（S2/S3）。
-- **服务端不做检索**：网页端要检索时需要在服务端也建一份 FTS 索引。
+- **PWA / 离线未做**（S3）。网页端**写入需要联网** —— 浏览器里没有本地库，
+  离线捕获队列留给 S3 的 outbox。
+- **网页端没有捕获快捷键和置顶浮层。** 这两样在浏览器里都不存在，所以网页端
+  的重心是查和整理，写入够用即可。真正的"随手记"仍然只有桌面端能做。
 - **没有附件**（图片/文件）。
 - **检索结果不分页**：按 bm25 排序后截断，精确过滤还可能让实际返回条数少于请求条数。
-  时间线是可以一直往前翻的，检索还只给前 60 条。
+  时间线是可以一直往前翻的，检索（桌面端和网页端都一样）还只给前 60 条。
 - **WebView 的 CSP 是关闭的**（`tauri.conf.json` 里 `"csp": null`）。渲染笔记正文
   靠 DOMPurify 挡住脚本注入（粘贴进来的内容可能夹带 HTML），但少了一层纵深防御。
   收紧 CSP 要同时处理开发期的 HMR 连接和内联脚本，没有放进 1.0.0。
@@ -391,10 +447,11 @@ cargo test -p messagenote -- --ignored --nocapture
 **接下来的计划、已知但未修的问题、以及每项的理由，都在 [`ROADMAP.md`](ROADMAP.md)。**
 那份文件是项目的工作记忆，这里只留一个索引：
 
-- **S2 网页端 + 服务端检索** —— 抽出共享 UI 组件，把 `TauriApi` / `HttpApi` 藏到
-  同一个 `NoteApi` 接口后面（桌面端本地优先、网页端直连服务端），
-  服务端补上 FTS 索引（复用 `core::search`，保证与桌面端检索语义一致）。
-- **S3 PWA + 离线捕获 outbox** —— 瘦客户端离线时只能"记录"不能浏览，
+- **S2 网页端 —— 已完成。** 浏览语义下沉到 `crates/store`（两端同一份查询）、
+  服务端补 FTS 索引与只读 API、**服务端代笔写入**（服务端当一台设备，浏览器里
+  没有第二套合并规则）、会话鉴权、前端 `NoteApi` 抽象 + 网页端外壳。
+  细节和踩过的坑见 ROADMAP。
+- **S3 PWA + 离线捕获 outbox** —— 网页端离线时只能"记录"不能浏览，
   用 IndexedDB 排队、联网重放，即可覆盖手机上最痛的场景（地铁里想记一笔），
   不必为此在浏览器里重建整个同步引擎。
 - **S4 附件（内容寻址）与跨设备实时推送（SSE）。**
