@@ -16,6 +16,16 @@
 //!
 //! 注意 seq 的分配和"谁赢"是两件事：即使一条变更被拒绝（HLC 更旧），
 //! 也不分配新的 seq，因为服务端的状态没有变化。
+//!
+//! ## 测试里的一条纪律
+//!
+//! `Store::conn()` 拿到的是 `std::sync::Mutex` 的 guard，而它**不可重入**。
+//! 所以测试里一旦握住了 guard，就不要再调 `Store` 的方法 ——
+//! 那些方法会再拿一次同一把锁。**那不是变慢，是直接挂住**，而且挂住的测试
+//! 会被当成"跑得慢"，没人会去查。
+//!
+//! 要用共享查询就直接调接受 `&Connection` 的那些函数，比如
+//! `messagenote_store::search(&conn, …)`、`messagenote_store::list_messages(&conn, …)`。
 
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
@@ -270,6 +280,19 @@ impl Store {
             if merge::should_accept_push(&c.hlc, stored.as_ref()) {
                 let seq = next_seq(&tx)?;
                 upsert(&tx, c, seq)?;
+
+                // **观察客户端的时间戳，把本机时钟拉到两者最大值。**
+                //
+                // 漏了这一步，服务端就永远学不到客户端的时间。一台时钟超前的
+                // 设备（VPS 上 NTP 挂掉、容器时钟漂移都算）改过某一行之后，
+                // 服务端此后**代笔的每一次修改**都会因为 HLC 更旧而被判负 ——
+                // 表现是"新建能成功、改已有的永远失败，说被另一台设备覆盖了"，
+                // 而且刷新也没用。
+                //
+                // 客户端之间本来就会互相 observe（拉取远端变更时），所以补上
+                // 这一步只是让服务端不再落后于所有人，不会让时钟更容易被带偏。
+                clock::clock_observe(&tx, &c.hlc)?;
+
                 results.push(PushOutcome {
                     kind: c.kind,
                     id: c.id.clone(),
@@ -682,10 +705,13 @@ impl Store {
         self.author(EntityKind::Channel, id.to_string(), false, to_json(p)?)
     }
 
-    /// 删除频道，**连同它里面的所有消息**。
+    /// 删除频道，**把它里面的记录移回收件箱**。
     ///
     /// 和客户端 `delete_channel` 的语义必须一致 —— 不一致的话，同一个操作
     /// 在桌面端和网页端会留下不同的结果，而用户会以为其中一边丢了东西。
+    ///
+    /// 注意**不是**删掉里面的消息：界面上那句「其中的记录会回到收件箱」是承诺，
+    /// 不是描述。一个"删除频道"顺带毁掉里面所有笔记，是这个项目最不能接受的事。
     pub fn remove_channel(&self, id: &str) -> ServerResult<()> {
         if id == messagenote_store::INBOX_ID {
             return Err(ServerError::bad_request("收件箱是默认捕获目标，不能删除"));
@@ -701,7 +727,7 @@ impl Store {
             it.collect::<rusqlite::Result<Vec<_>>>()?
         };
         for mid in ids {
-            self.remove_message(&mid)?;
+            self.move_message(&mid, messagenote_store::INBOX_ID)?;
         }
 
         let mut p = self.channel_payload(id)?;
@@ -746,12 +772,34 @@ impl Store {
             return Ok(false);
         }
         let conn = self.conn()?;
-        let n: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM session WHERE token = ?1 AND expires_at > ?2",
-            params![token, now_ms()],
-            |r| r.get(0),
-        )?;
-        Ok(n > 0)
+        let now = now_ms();
+
+        let expires_at: Option<i64> = conn
+            .query_row(
+                "SELECT expires_at FROM session WHERE token = ?1 AND expires_at > ?2",
+                params![token, now],
+                |r| r.get(0),
+            )
+            .optional()?;
+
+        let Some(expires_at) = expires_at else {
+            return Ok(false);
+        };
+
+        // **滑动续期**：剩余寿命不足一半时把它推满。
+        //
+        // 不这么做的话，一个每天都在用的人也会在第 7 天被踢回登录页 ——
+        // 而且很可能是在他正写到一半的时候。会话该过期的是"不再使用的"，
+        // 不是"用了很久的"。
+        //
+        // 只续到一半以下才写库：每个请求都 UPDATE 一次是纯粹的浪费。
+        if expires_at - now < SESSION_TTL_MS / 2 {
+            conn.execute(
+                "UPDATE session SET expires_at = ?2 WHERE token = ?1",
+                params![token, now + SESSION_TTL_MS],
+            )?;
+        }
+        Ok(true)
     }
 
     /// 吊销一个会话。这是引入会话机制的主要收益 —— 签名令牌做不到这件事。
@@ -1823,5 +1871,144 @@ mod tests {
                 "会话令牌必须用 v4（纯随机），不能用 v7"
             );
         }
+    }
+
+    /// 会话在**被使用**时向前滑动。
+    ///
+    /// 不滑动的话，一个每天都在用的人也会在第 7 天被踢回登录页 ——
+    /// 而且很可能是在他正写到一半的时候。会话该过期的是"不再使用的"，
+    /// 不是"用了很久的"。
+    #[test]
+    fn an_active_session_slides_forward() {
+        let s = store();
+        let sess = s.create_session().unwrap();
+
+        // 把它改到"只剩一小时"
+        let nearly_done = now_ms() + 60 * 60 * 1000;
+        {
+            let conn = s.conn().unwrap();
+            conn.execute(
+                "UPDATE session SET expires_at = ?2 WHERE token = ?1",
+                params![sess.session, nearly_done],
+            )
+            .unwrap();
+        }
+
+        assert!(s.session_is_valid(&sess.session).unwrap(), "还没过期，应当有效");
+
+        let after: i64 = s
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT expires_at FROM session WHERE token = ?1",
+                params![sess.session],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(after > nearly_done, "用过的会话应当被续期");
+        assert!(
+            after >= now_ms() + SESSION_TTL_MS / 2,
+            "续期应当推到接近满寿命，而不是只加一点点"
+        );
+
+        // 刚续过期的不该被反复写库
+        let before_second = after;
+        assert!(s.session_is_valid(&sess.session).unwrap());
+        let after_second: i64 = s
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT expires_at FROM session WHERE token = ?1",
+                params![sess.session],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(after_second, before_second, "寿命还很足时不该再写库");
+    }
+
+    /// **服务端必须观察客户端的时间戳。**
+    ///
+    /// 不观察的话，一台时钟超前的设备改过某一行之后，服务端此后代笔的每一次
+    /// 修改都会因为 HLC 更旧而被判负 —— 表现是"新建能成功、改已有的永远失败，
+    /// 说被另一台设备覆盖了"，刷新也没用。这种一半好一半坏的症状最难查。
+    #[test]
+    fn the_server_learns_from_client_clocks() {
+        let s = store();
+        let m = s.create_message("原始内容", None).unwrap();
+
+        // 模拟一台时钟严重超前的设备改了这条
+        let far_future = now_ms() + 86_400_000; // 一天之后
+        s.push(&[msg(&m.id, far_future, 0, "fast-device", "来自未来的修改")])
+            .unwrap();
+
+        // 现在服务端代笔改这条 —— 必须成功
+        let edited = s
+            .edit_message(&m.id, "网页端改的")
+            .expect("服务端代笔不该被自己的时钟拖累：它应当已经观察到客户端的时间戳");
+        assert_eq!(edited.body, "网页端改的");
+
+        // 而且代笔产出的 HLC 确实比那个未来时间戳更新
+        let latest = s
+            .pull(0, 1000)
+            .unwrap()
+            .changes
+            .into_iter()
+            .filter(|c| c.id == m.id)
+            .max_by_key(|c| c.seq)
+            .expect("应当能拉到这条");
+        assert!(
+            latest.hlc.wall >= far_future,
+            "服务端的时钟应当已经跟上了客户端（当前 {} vs 客户端 {}）",
+            latest.hlc.wall,
+            far_future
+        );
+    }
+
+    /// 删除频道**不能**把里面的笔记一起删掉。
+    ///
+    /// 界面上的确认框写的是「其中的记录会回到收件箱」—— 那是**承诺**。
+    /// 早先的实现是把它们一起软删了：一个"删除频道"的动作毁掉所有相关笔记，
+    /// 而这个项目的底线是绝不静默丢弃用户写下的内容。
+    ///
+    /// 这条是打开浏览器跑端到端时抓出来的：删频道前时间线 4 条、删完 3 条。
+    #[test]
+    fn deleting_a_channel_moves_its_messages_to_the_inbox() {
+        let s = store();
+        let ch = s.create_channel("临时频道").unwrap();
+        let m = s.create_message("频道里的一条", Some(&ch.id)).unwrap();
+
+        {
+            let conn = s.conn().unwrap();
+            assert_eq!(
+                messagenote_store::list_messages(&conn, Scope::Channel(&ch.id), 50, None)
+                    .unwrap()
+                    .items
+                    .len(),
+                1,
+                "测试不能空跑：记录得真的在频道里"
+            );
+        }
+
+        s.remove_channel(&ch.id).unwrap();
+
+        let conn = s.conn().unwrap();
+        assert!(
+            messagenote_store::list_channels(&conn)
+                .unwrap()
+                .iter()
+                .all(|c| c.id != ch.id),
+            "频道本身应当被删掉"
+        );
+
+        let unfiled = messagenote_store::list_messages(&conn, Scope::Unfiled, 50, None).unwrap();
+        assert_eq!(unfiled.items.len(), 1, "记录必须还在，而且回到收件箱");
+        assert_eq!(unfiled.items[0].id, m.id);
+        assert_eq!(unfiled.items[0].channel_id, "inbox");
+
+        // 正文没变，所以检索也还找得到。
+        // 注意这里走 `messagenote_store::search(&conn, …)` 而不是 `s.search(…)`：
+        // 上面那个 `conn` 还握着锁，`Store` 的方法会再拿一次同一把锁 ——
+        // `std::sync::Mutex` 不可重入，那不是变慢，是直接死锁。
+        assert_eq!(messagenote_store::search(&conn, "频道里", 10).unwrap().len(), 1);
     }
 }

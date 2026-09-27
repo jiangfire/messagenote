@@ -207,18 +207,33 @@ MESSAGENOTE_DB=/var/lib/messagenote/server.sqlite ./messagenote-server
 浏览器里能看、能搜、**也能记**。和桌面端跑的是同一套界面 —— 区别只在数据从
 哪儿来（`NoteApi` 的两个实现：Tauri `invoke` vs HTTP）。
 
+### 部署：必须和 API **同源**
+
+服务端**不带任何 CORS 头**。把网页端放在和 `/api` 不同的域名下，浏览器会直接
+拦掉所有请求 —— 所以用同一个域名：Caddy 既托管静态文件、又反代 `/api/*`。
+[`deploy/Caddyfile`](deploy/Caddyfile) 里是现成的配置。
+
 ```bash
 pnpm build
-# 产物在 dist/，把 dist/web.html 和 dist/assets/ 一起放到静态托管上即可
+# 只拷网页端需要的那两样。
+# **不要**拷 dist/index.html —— 那是 Tauri 主窗口的壳，依赖 window.__TAURI__，
+# 在浏览器里打开只会白屏。
+install -d /var/lib/messagenote/web
+cp -r dist/assets dist/web.html /var/lib/messagenote/web/
 ```
 
-打开页面后填**服务端地址 + 长期令牌**，登录一次。
+打开页面，填**长期令牌**，登录一次。服务端地址已经默认填好了（就是页面自己的
+origin）—— 同源部署下那个输入框本来就是多余的。
 
-几点值得知道：
+### 几点值得知道
 
-- **长期令牌不会留在浏览器里。** 它只用来换一个 7 天有效的**会话**；之后所有
-  请求带的是会话。会话能过期、能吊销（`DELETE /api/session`）——
-  这是相对"把长期令牌塞进 localStorage"的主要收益。
+- **长期令牌不会留在浏览器里。** 它只用来换一个**会话**；之后所有请求带的是
+  会话。会话能过期、能吊销（`DELETE /api/session`）—— 这是相对"把长期令牌
+  塞进 localStorage"的主要收益。
+- **会话会在你用它的时候自动续期**，所以天天用的人不会被踢掉。会话该过期的是
+  "不再使用的"，不是"用了很久的"。
+- **万一真的过期了，你正在写的东西不会丢。** 重新登录是个浮层，界面不会卸载 ——
+  下面那段没发出去的文字还在。
 - **写入由服务端代笔。** 服务端以一台设备的身份生成 HLC、写进变更日志、分配 seq，
   桌面端下次同步照常拉到。所以浏览器里**没有第二套合并规则** —— 裁定权仍然
   只有 `core::merge` 那一份。
@@ -421,7 +436,7 @@ $env:MESSAGENOTE_MIGRATE_TEST_DB = "…\副本.sqlite"
 cargo test -p messagenote -- --ignored --nocapture
 ```
 
-## 当前限制（v1.0.0）
+## 当前限制（v1.1.0）
 
 诚实地列出来，避免误判成熟度：
 
@@ -434,7 +449,7 @@ cargo test -p messagenote -- --ignored --nocapture
   时间线是可以一直往前翻的，检索（桌面端和网页端都一样）还只给前 60 条。
 - **WebView 的 CSP 是关闭的**（`tauri.conf.json` 里 `"csp": null`）。渲染笔记正文
   靠 DOMPurify 挡住脚本注入（粘贴进来的内容可能夹带 HTML），但少了一层纵深防御。
-  收紧 CSP 要同时处理开发期的 HMR 连接和内联脚本，没有放进 1.0.0。
+  收紧 CSP 要同时处理开发期的 HMR 连接和内联脚本，到现在还没做。
 - **应用图标是程序生成的**（`scripts/gen-icon.mjs`，纯 Node 手写 PNG 编码），
   不是设计稿。要换图标就改那个脚本后重跑 `pnpm tauri icon scripts/app-icon.png`。
 - **安装包未做代码签名。** Windows SmartScreen 会对未签名的安装程序弹警告 ——

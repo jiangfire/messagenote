@@ -350,7 +350,14 @@ pub fn rename_channel(conn: &Connection, id: &str, name: &str) -> AppResult<()> 
     Ok(())
 }
 
-/// 删除频道：连同其消息一起软删除，并把它们从检索索引里摘掉。
+/// 删除频道，**把它里面的记录移回收件箱**。
+///
+/// 早先的实现是把这些消息一起软删掉。那是错的，而且错得很危险：
+/// 界面上的确认框写的是「其中的记录会回到收件箱」—— 那是**承诺**，不是描述。
+/// 一个"删除频道"的动作顺带毁掉里面所有笔记，而这个项目的底线是
+/// **绝不静默丢弃用户写下的内容**。
+///
+/// 现在行为和那句承诺一致：频道没了，记录回到收件箱等着重新归档。
 pub fn delete_channel(conn: &Connection, id: &str) -> AppResult<()> {
     if id == INBOX_ID {
         return Err(AppError::Msg("收件箱是默认捕获目标，不能删除".into()));
@@ -360,15 +367,13 @@ pub fn delete_channel(conn: &Connection, id: &str) -> AppResult<()> {
     let tx = conn.unchecked_transaction()?;
     let hlc = clock_next(&tx)?;
 
-    tx.execute(
-        "DELETE FROM message_fts WHERE message_id IN (SELECT id FROM message WHERE channel_id = ?1)",
-        params![id],
-    )?;
+    // 只改 channel_id，正文没变 —— 所以检索索引不用动
+    // （`message_fts` 是按 message_id 索引的，与频道无关）。
     tx.execute(
         "UPDATE message
-            SET deleted_at = ?2, updated_at = ?2, device_id = ?3, hlc_wall = ?4, hlc_counter = ?5, dirty = 1
+            SET channel_id = ?2, updated_at = ?3, device_id = ?4, hlc_wall = ?5, hlc_counter = ?6, dirty = 1
           WHERE channel_id = ?1 AND deleted_at IS NULL",
-        params![id, now, hlc.device, hlc.wall, hlc.counter],
+        params![id, INBOX_ID, now, hlc.device, hlc.wall, hlc.counter],
     )?;
     let n = tx.execute(
         "UPDATE channel
@@ -1211,5 +1216,53 @@ mod tests {
             let (id, body, wall, dirty) = m.unwrap();
             println!("  {id} hlc_wall={wall} dirty={dirty}  {body}");
         }
+    }
+
+    /// 删除频道**不能**把里面的笔记一起删掉。
+    ///
+    /// 确认框写的是「其中的记录会回到收件箱」—— 那是**承诺**，不是描述。
+    /// 早先的实现是把它们一起软删了：一个"删除频道"的动作毁掉所有相关笔记。
+    /// 这条是在真实浏览器里跑端到端时抓出来的（删频道前 4 条、删完 3 条）。
+    #[test]
+    fn deleting_a_channel_moves_its_messages_to_the_inbox() {
+        let db = mem();
+        let conn = db.conn().unwrap();
+
+        let ch = create_channel(&conn, "临时频道").unwrap();
+        let m = append_message(&conn, "频道里的一条", Some(&ch.id)).unwrap();
+
+        assert_eq!(
+            list_messages(&conn, Scope::Channel(&ch.id), 50, None)
+                .unwrap()
+                .items
+                .len(),
+            1,
+            "测试不能空跑：记录得真的在频道里"
+        );
+
+        delete_channel(&conn, &ch.id).unwrap();
+
+        assert!(
+            list_channels(&conn).unwrap().iter().all(|c| c.id != ch.id),
+            "频道本身应当被删掉"
+        );
+
+        let unfiled = list_messages(&conn, Scope::Unfiled, 50, None).unwrap();
+        assert_eq!(unfiled.items.len(), 1, "记录必须还在，而且回到收件箱");
+        assert_eq!(unfiled.items[0].id, m.id);
+
+        // 正文没变，所以检索索引不用动，也还找得到
+        assert_eq!(search(&conn, "频道里", 10).unwrap().len(), 1);
+
+        // 这次移动**必须同步出去**（dirty=1），否则别的设备上这条记录还挂在一个
+        // 已经不存在的频道下 —— 那边看起来就像"记录丢了"。
+        let dirty: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM message WHERE id = ?1 AND dirty = 1",
+                params![m.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(dirty, 1, "移动必须置 dirty，否则别的设备看不到这次归档");
     }
 }

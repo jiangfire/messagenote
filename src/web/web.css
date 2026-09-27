@@ -9,6 +9,17 @@
   background: var(--bg);
 }
 
+/*
+  会话中途失效时盖在界面之上，而不是把界面卸载掉 —— 那样会连用户正在写的
+  草稿一起丢掉。所以这里**必须半透明**：让人看得见自己那段没发出去的文字
+  还在下面，而不只是一句"内容还在"的空口保证。
+*/
+.login-overlay {
+  z-index: 100;
+  background: color-mix(in srgb, var(--bg) 78%, transparent);
+  backdrop-filter: blur(3px);
+}
+
 .login-card {
   width: 100%;
   max-width: 380px;
