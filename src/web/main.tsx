@@ -1,9 +1,8 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
-import App from "./App";
-import { ApiProvider } from "./lib/apiContext";
-import { tauriApi, tauriDesktop } from "./lib/tauriApi";
-import "./styles.css";
+import WebApp from "./WebApp";
+import "../styles.css";
+import "./web.css";
 
 const root = document.getElementById("root");
 if (!root) {
@@ -12,8 +11,6 @@ if (!root) {
 
 ReactDOM.createRoot(root).render(
   <React.StrictMode>
-    <ApiProvider api={tauriApi} desktop={tauriDesktop}>
-      <App />
-    </ApiProvider>
+    <WebApp />
   </React.StrictMode>
 );

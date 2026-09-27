@@ -8,7 +8,8 @@ import {
 } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { LogicalSize } from "@tauri-apps/api/dpi";
-import { api, errorText } from "../lib/api";
+import { useApi } from "../lib/apiContext";
+import { errorText } from "../lib/errors";
 
 /** 浮层宽度固定，高度随内容增长（见下面的自适应逻辑）。 */
 const WINDOW_W = 680;
@@ -26,6 +27,10 @@ const MAX_INPUT_H = 260;
  * 比多留一行文字讨厌得多。
  */
 export default function CaptureApp() {
+  // 浮层只存在于桌面端，所以 `desktop` 一定不为 null。
+  // 用 `?.` 是因为类型上它可以是 null —— 而且万一哪天真在网页端复用它，
+  // 少收起一次窗口远好过整个界面崩掉。
+  const { api, desktop } = useApi();
   const [draft, setDraft] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
@@ -85,7 +90,7 @@ export default function CaptureApp() {
       await api.appendMessage(body, null);
       setDraft("");
       setError(null);
-      await api.hideCapture();
+      await desktop?.hideCapture();
     } catch (e) {
       setError(errorText(e));
     } finally {
@@ -97,7 +102,7 @@ export default function CaptureApp() {
     if (e.key === "Escape") {
       e.preventDefault();
       // 保留草稿，只收起窗口
-      void api.hideCapture();
+      void desktop?.hideCapture();
       return;
     }
 

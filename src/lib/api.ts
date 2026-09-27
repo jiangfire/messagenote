@@ -103,9 +103,6 @@ export const api = {
     invoke<HealthResponse>("test_sync_connection", { url, token }),
 };
 
-/** 把后端抛出的错误整理成能直接显示的一句话。 */
-export function errorText(e: unknown): string {
-  if (typeof e === "string") return e;
-  if (e instanceof Error) return e.message;
-  return String(e);
-}
+// `errorText` 搬去了 `./errors` —— 网页端不该为了一个错误格式化函数
+// 把 @tauri-apps/api 拉进 bundle。这里转出一次，免得老调用点全要改。
+export { errorText } from "./errors";

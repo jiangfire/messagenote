@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
-import { api, errorText } from "../lib/api";
+import { useApi } from "../lib/apiContext";
+import { errorText } from "../lib/errors";
 
 interface Props {
   onClose: () => void;
@@ -7,7 +8,17 @@ interface Props {
   onSaved: () => void;
 }
 
+/**
+ * 同步设置。**只有桌面端有** —— 网页端的同步是服务端自己在做，
+ * 浏览器里没有需要用户配置的东西。
+ *
+ * 这里用注入的 `desktop` 而不是直接 import `lib/api`：后者会把
+ * `@tauri-apps/api` 拖进模块图，而 App.tsx 是静态引入本组件的 ——
+ * 结果是**网页端的 bundle 里也带上了 Tauri 的 IPC 代码**。
+ * 一个只在桌面端渲染的组件，不该让另一个入口多背这一份。
+ */
 export function SyncSettings({ onClose, onSaved }: Props) {
+  const { desktop } = useApi();
   const [url, setUrl] = useState("");
   const [token, setToken] = useState("");
   const [busy, setBusy] = useState(false);
@@ -15,9 +26,10 @@ export function SyncSettings({ onClose, onSaved }: Props) {
   const [note, setNote] = useState<{ ok: boolean; text: string } | null>(null);
 
   useEffect(() => {
+    if (!desktop) return;
     void (async () => {
       try {
-        const cfg = await api.getSyncConfig();
+        const cfg = await desktop.getSyncConfig();
         setUrl(cfg.url);
         setToken(cfg.token);
       } catch (e) {
@@ -26,14 +38,15 @@ export function SyncSettings({ onClose, onSaved }: Props) {
         setLoaded(true);
       }
     })();
-  }, []);
+  }, [desktop]);
 
   async function test() {
+    if (!desktop) return;
     setBusy(true);
     setNote(null);
     try {
       // 打的是鉴权过的 handshake 端点，所以令牌不对时会真的失败
-      const h = await api.testSyncConnection(url, token);
+      const h = await desktop.testSyncConnection(url, token);
       setNote({ ok: true, text: `连接成功 · 协议版本 ${h.protocol}` });
     } catch (e) {
       setNote({ ok: false, text: errorText(e) });
@@ -43,10 +56,11 @@ export function SyncSettings({ onClose, onSaved }: Props) {
   }
 
   async function save() {
+    if (!desktop) return;
     setBusy(true);
     setNote(null);
     try {
-      await api.setSyncConfig(url, token);
+      await desktop.setSyncConfig(url, token);
       setNote({ ok: true, text: "已保存，正在同步…" });
       onSaved();
     } catch (e) {
@@ -55,6 +69,9 @@ export function SyncSettings({ onClose, onSaved }: Props) {
       setBusy(false);
     }
   }
+
+  // 网页端渲染不到这里（App 只在 desktop 存在时才挂载本组件），兜一下而已
+  if (!desktop) return null;
 
   return (
     <div className="modal-backdrop" onMouseDown={onClose}>

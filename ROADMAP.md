@@ -158,15 +158,32 @@
 短路）。可以接受的理由写在代码里：122 位随机值上通过 HTTP 观测亚微秒差异
 不现实；长期令牌那条路仍然走 `constant_time_eq`，那个是人选的、熵低得多。
 
-#### ⑤ 前端 `NoteApi` 抽象 + 网页端外壳
+#### ⑤ 前端 `NoteApi` 抽象 + 网页端外壳 ✅
 
-`src/lib/api.ts` 已经是唯一的收口点（全部调用都是一行 `invoke`，没有组件直接
-碰 Tauri），所以换数据层很便宜：定义 `NoteApi` 接口，`TauriApi` 就是现在这份，
-`HttpApi` 走 `fetch`，注入点在根组件，**组件一行不用改**。
+`src/lib/apiContext.tsx` 定义 `NoteApi`（笔记读写）和 `DesktopApi`（同步配置、
+同步状态、捕获浮层）。`useApi()` 注入；`TauriApi` 就是原来那份 `api.ts`，
+`HttpApi` 走 fetch。**组件一行没改语义**，只是 `api.xxx` 换成了从 context 取。
 
-一个产品层面的现实：桌面端的核心价值是全局快捷键 + 置顶捕获浮层，这两样在
-浏览器里都不存在。所以网页端的重心应该是**查和整理**（它在这两件事上不比桌面
-差），写入做成够用即可。
+`src/web/` 是网页端入口（登录页 + 复用同一个 `App`），`web.html` 是第三个
+Vite 入口。
+
+**踩到的坑（值得记下来）：网页端的 bundle 里混进了 Tauri。**
+`SyncSettings.tsx` 直接 import 了 `lib/api`，而 App.tsx 是**静态**引入它的 ——
+于是 `@tauri-apps/api` 进了模块图，网页端凭空多背 220 KB 的 IPC 代码。
+构建照样成功、类型检查照样通过，只有去看产物才发现。
+修法：`SyncSettings` 改用注入的 `desktop`；`errorText` 从 `api.ts` 搬到中立的
+`lib/errors.ts`。现在有验证手段 —— 检查 `web.html` 可达的每个 chunk 里
+没有 `__TAURI` 字样。
+
+一个产品层面的现实（没变）：桌面端的核心价值是全局快捷键 + 置顶捕获浮层，
+这两样在浏览器里都不存在。所以网页端把 `SyncBadge` / `SyncSettings` 整个隐藏，
+重心放在**查和整理**上，写入够用即可。
+
+验证：`pnpm build` 通过、产物里网页端 bundle 干净；用**真实的 `httpApi`**
+（`src/lib/httpApi.ts` 只 import 类型，Node 24 能直接跑）对着**真实的 release
+服务端**跑了 24 项检查 —— 登录、会话、四种 scope、中文标签过查询串、
+双字/单字两条检索路径、键集分页、校验规则与桌面端一致、401 触发
+`onUnauthorized`。桌面端重建并冒烟通过。
 
 ### S3 · PWA + 离线捕获 outbox
 

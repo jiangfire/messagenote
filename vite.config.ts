@@ -5,8 +5,9 @@ import react from "@vitejs/plugin-react";
 // Tauri 在开发期会注入 TAURI_DEV_HOST（仅移动端调试时非空）
 const host = process.env.TAURI_DEV_HOST;
 
-// 多入口：主窗口和捕获浮层是两个独立的 HTML。
+// 多入口：主窗口、捕获浮层、网页端是三个独立的 HTML。
 // 浮层单独打包是有意的 —— 它必须在主界面还没渲染出来之前就能用。
+// 网页端也单独打包：它注入的是 HTTP 实现，而且不该把 Tauri 的 API 带进去。
 const root = fileURLToPath(new URL(".", import.meta.url));
 
 export default defineConfig({
@@ -50,6 +51,7 @@ export default defineConfig({
       input: {
         main: `${root}index.html`,
         capture: `${root}capture.html`,
+        web: `${root}web.html`,
       },
     },
   },

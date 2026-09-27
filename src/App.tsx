@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { listen } from "@tauri-apps/api/event";
-import { api, errorText } from "./lib/api";
+import { errorText } from "./lib/errors";
+import { useApi, type NoteApi } from "./lib/apiContext";
 import type {
   Channel,
   Cursor,
@@ -20,11 +20,13 @@ import { SyncSettings } from "./components/SyncSettings";
 const PAGE_SIZE = 200;
 const SEARCH_DEBOUNCE_MS = 160;
 
-/** 后台同步线程推上来的状态事件名，与 `src-tauri/src/sync_worker.rs` 保持一致。 */
-const SYNC_STATUS_EVENT = "sync://status";
-
-/** 把视图映射成时间线的 scope 参数。 */
-function fetchPage(v: View, limit: number, before: Cursor | null) {
+/**
+ * 把视图映射成时间线的 scope 参数。
+ *
+ * `api` 从外面传进来而不是从模块里 import：这个应用要同时跑在桌面端（Tauri
+ * invoke）和网页端（HTTP）上，数据从哪儿来只有注入点知道。
+ */
+function fetchPage(api: NoteApi, v: View, limit: number, before: Cursor | null) {
   switch (v.type) {
     case "timeline":
       // 时间线是主视图；"未归档"只是它上方的一个筛选，不是另一个导航项
@@ -37,6 +39,10 @@ function fetchPage(v: View, limit: number, before: Cursor | null) {
 }
 
 export default function App() {
+  // `desktop` 在网页端是 null —— 同步配置、同步状态、捕获浮层在浏览器里
+  // 都没有对应物（网页端的同步是服务端自己在做）。
+  const { api, desktop } = useApi();
+
   const [stats, setStats] = useState<TimelineStats>({ total: 0, unfiled: 0 });
   const [channels, setChannels] = useState<Channel[]>([]);
   const [tags, setTags] = useState<TagCount[]>([]);
@@ -57,13 +63,14 @@ export default function App() {
   const searchRef = useRef<HTMLInputElement>(null);
 
   const refreshSyncConfig = useCallback(async () => {
+    if (!desktop) return;
     try {
-      const cfg = await api.getSyncConfig();
+      const cfg = await desktop.getSyncConfig();
       setSyncConfigured(cfg.url.trim() !== "" && cfg.token.trim() !== "");
     } catch {
       setSyncConfigured(false);
     }
-  }, []);
+  }, [desktop]);
 
   const refreshMeta = useCallback(async () => {
     const [st, ch, tg] = await Promise.all([
@@ -74,7 +81,7 @@ export default function App() {
     setStats(st);
     setChannels(ch);
     setTags(tg);
-  }, []);
+  }, [api]);
 
   /**
    * 当前已载入的条数。
@@ -88,16 +95,19 @@ export default function App() {
     loadedCount.current = messages.length;
   }, [messages.length]);
 
-  const loadMessages = useCallback(async (v: View) => {
-    // 重取时**保持已展开的窗口大小**。否则用户往回翻了很久、随手改一条记录，
-    // 列表会立刻缩回最近 200 条，滚动位置也跟着跳 ——
-    // 编辑一条不该让你丢掉正在看的那段历史。
-    const limit = Math.max(PAGE_SIZE, loadedCount.current);
-    const page = await fetchPage(v, limit, null);
-    // 后端按时间倒序返回（便于分页），界面按正序渲染
-    setMessages([...page.items].reverse());
-    setHasMore(page.hasMore);
-  }, []);
+  const loadMessages = useCallback(
+    async (v: View) => {
+      // 重取时**保持已展开的窗口大小**。否则用户往回翻了很久、随手改一条记录，
+      // 列表会立刻缩回最近 200 条，滚动位置也跟着跳 ——
+      // 编辑一条不该让你丢掉正在看的那段历史。
+      const limit = Math.max(PAGE_SIZE, loadedCount.current);
+      const page = await fetchPage(api, v, limit, null);
+      // 后端按时间倒序返回（便于分页），界面按正序渲染
+      setMessages([...page.items].reverse());
+      setHasMore(page.hasMore);
+    },
+    [api]
+  );
 
   /**
    * 往前翻一页。
@@ -113,7 +123,7 @@ export default function App() {
     setLoadingOlder(true);
     try {
       const cursor = { createdAt: oldest.createdAt, id: oldest.id };
-      const page = await fetchPage(view, PAGE_SIZE, cursor);
+      const page = await fetchPage(api, view, PAGE_SIZE, cursor);
       // 追加到**前面**：时间线是正序渲染的
       setMessages((prev) => [...[...page.items].reverse(), ...prev]);
       setHasMore(page.hasMore);
@@ -122,7 +132,7 @@ export default function App() {
     } finally {
       setLoadingOlder(false);
     }
-  }, [loadingOlder, hasMore, messages, view]);
+  }, [api, loadingOlder, hasMore, messages, view]);
 
   /** 数据变了就重取。单机 + SQLite，直接重取比维护本地缓存更不容易出 bug。 */
   const refresh = useCallback(
@@ -159,7 +169,7 @@ export default function App() {
       }
     }, SEARCH_DEBOUNCE_MS);
     return () => clearTimeout(timer);
-  }, [query]);
+  }, [api, query]);
 
   async function run(action: () => Promise<unknown>) {
     try {
@@ -213,23 +223,21 @@ export default function App() {
   // 同步状态：启动时读一次配置和**最近一次同步结果**，然后持续监听后台
   // 线程推上来的状态。两个都要：启动时那次同步的事件通常在前端挂好监听器
   // 之前就已经发出了，只靠事件的话界面会一直停在"待同步"。
+  //
+  // 网页端整段跳过 —— 浏览器里没有后台同步线程，同步是服务端自己的事。
   useEffect(() => {
+    if (!desktop) return;
     void refreshSyncConfig();
     void (async () => {
       try {
-        const s = await api.getSyncStatus();
+        const s = await desktop.getSyncStatus();
         if (s) setSyncStatus(s);
       } catch {
         // 读不到状态不影响使用，界面会显示"待同步"
       }
     })();
-    const pending = listen<SyncStatus>(SYNC_STATUS_EVENT, (event) => {
-      setSyncStatus(event.payload);
-    });
-    return () => {
-      void pending.then((unlisten) => unlisten());
-    };
-  }, [refreshSyncConfig]);
+    return desktop.onSyncStatus(setSyncStatus);
+  }, [desktop, refreshSyncConfig]);
 
   // 捕获永远落收件箱：按快捷键、打字、回车，没有"去哪儿"这一步。
   const targetLabel = "📥 收件箱";
@@ -298,11 +306,13 @@ export default function App() {
       <main className="main">
         <header className="topbar">
           <h1 className="title">{title}</h1>
-          <SyncBadge
-            configured={syncConfigured}
-            status={syncStatus}
-            onOpen={() => setSettingsOpen(true)}
-          />
+          {desktop && (
+            <SyncBadge
+              configured={syncConfigured}
+              status={syncStatus}
+              onOpen={() => setSettingsOpen(true)}
+            />
+          )}
           <div className="search-wrap">
             <input
               ref={searchRef}
@@ -396,13 +406,13 @@ export default function App() {
         />
       </main>
 
-      {settingsOpen && (
+      {desktop && settingsOpen && (
         <SyncSettings
           onClose={() => setSettingsOpen(false)}
           onSaved={() => {
             void refreshSyncConfig();
             // 刚配好就立刻同步一次，用户不必等下一个自动周期
-            void api.syncNow();
+            void desktop.syncNow();
           }}
         />
       )}

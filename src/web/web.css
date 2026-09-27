@@ -1,0 +1,75 @@
+/* 网页端登录页。只有这一屏是网页端独有的 —— 进去之后就是同一套界面。 */
+
+.login-wrap {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: var(--bg);
+}
+
+.login-card {
+  width: 100%;
+  max-width: 380px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 28px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--panel);
+}
+
+.login-card h1 {
+  margin: 0;
+  font-size: 20px;
+}
+
+.login-card p {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.login-card label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.login-card input {
+  padding: 9px 11px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 14px;
+}
+
+.login-card button {
+  margin-top: 4px;
+  padding: 10px;
+  border: 0;
+  border-radius: 7px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.login-card button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.login-error {
+  padding: 8px 10px;
+  border: 1px solid var(--danger);
+  border-radius: 7px;
+  /* 只用边框和文字色，不铺底色 —— 深浅两套主题下都不用再定义一对变量 */
+  color: var(--danger);
+  font-size: 13px;
+}
