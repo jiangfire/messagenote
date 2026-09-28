@@ -658,6 +658,14 @@ kbd {
   box-shadow: 0 0 0 3px var(--accent-soft);
 }
 
+/* 拖拽悬停。
+   刻意只换边框和底色、不做缩放或动画：拖拽时用户盯的是鼠标指针，
+   界面这边只需要回答一个问题——"松手会不会掉在这儿"。 */
+.composer.drop-active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
 .composer-input {
   display: block;
   width: 100%;
@@ -684,6 +692,11 @@ kbd {
 .composer-target {
   font-size: 12px;
   color: var(--muted);
+}
+
+.composer-hint {
+  color: var(--muted);
+  opacity: 0.8;
 }
 
 .send-btn {
@@ -789,8 +802,38 @@ kbd {
 }
 
 .md img {
+  /* 笔记里贴的常常是全屏截图，原尺寸能把时间线撑破。
+     宽高都不锁死，小图（图标、表情）保持原样不被拉伸。 */
   max-width: 100%;
+  height: auto;
   border-radius: 8px;
+  vertical-align: bottom;
+}
+
+/* 附件字节还没到手时，正文里的 <img> 还带着 `attachment:` 开头的 src。
+   那不是一个浏览器认得的地址，不藏起来就会先画一个破图，等字节到了再被
+   换成真图 —— 快的时候是一闪，慢的时候用户会以为图坏了。
+   `useAttachmentImages` 会在第一次绘制之前就试着改写 src，这条是给
+   "取字节慢"（本地文件大、网页端还要走网络）的情况兜底。 */
+.md img[src^="attachment:"] {
+  visibility: hidden;
+}
+
+/* 字节确定取不到时的占位块（见 attachmentUrl.ts 的 placeholderFor）。
+   虚线而不是实线的意思是"这里缺东西"，而不是"这里有个装饰元素"，
+   和正文里真正的图片块一眼能分开。 */
+.md-img-placeholder {
+  display: inline-block;
+  max-width: 100%;
+  padding: 10px 14px;
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  background: var(--panel-2);
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+  /* 同一个占位块可能很长（会把 alt 带上），太长就换行而不是横向撑开 */
+  overflow-wrap: anywhere;
 }
 
 .md hr {

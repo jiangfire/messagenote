@@ -486,6 +486,9 @@ export default function App() {
           targetLabel={targetLabel}
           focusSignal={focusSignal}
           disabled={busy}
+          // 图片存不进本地库时就地说一声。复用页面上那条 error-bar，
+          // 不另造一套提示 —— 用户已经知道红色横条是什么意思了。
+          onError={setError}
         />
       </main>
 

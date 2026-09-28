@@ -1,4 +1,11 @@
-import { useEffect, useRef, type KeyboardEvent } from "react";
+import { useEffect, useRef, useState, type ClipboardEvent, type KeyboardEvent } from "react";
+import { useApi } from "../lib/apiContext";
+import { errorText } from "../lib/errors";
+import {
+  imageFilesFromClipboard,
+  insertImages,
+  makeImageDropHandlers,
+} from "../lib/imageInsert";
 
 interface Props {
   draft: string;
@@ -8,6 +15,8 @@ interface Props {
   /** 数值变化即请求一次聚焦（发送后、切换频道后） */
   focusSignal: number;
   disabled?: boolean;
+  /** 图片入库失败之类要说给用户听的话。由 App 统一显示，见那边的 error-bar。 */
+  onError?: (message: string) => void;
 }
 
 /**
@@ -15,6 +24,9 @@ interface Props {
  *
  * 它存在的意义就是把「记录」的启动成本压到接近零：没有标题、没有目录、
  * 没有保存按钮，写完了按回车就结束。所有整理都发生在事后。
+ *
+ * 图片走同一个原则：贴进来就存下、就在光标处出现引用，不问"存哪儿"。
+ * 字节进本地库（网页端进服务端），正文里只留 `attachment:<sha256>`。
  */
 export function Composer({
   draft,
@@ -23,8 +35,12 @@ export function Composer({
   targetLabel,
   focusSignal,
   disabled,
+  onError,
 }: Props) {
+  const { api } = useApi();
   const ref = useRef<HTMLTextAreaElement>(null);
+  /** 拖拽悬停中。只用来加高亮类名 —— 拖拽的判定全在 dataTransfer 上。 */
+  const [dropActive, setDropActive] = useState(false);
 
   useEffect(() => {
     ref.current?.focus();
@@ -51,20 +67,59 @@ export function Composer({
     if (!disabled && draft.trim()) onSend();
   }
 
+  /**
+   * 粘贴图片。
+   *
+   * 只在剪贴板里真的有图片时才 `preventDefault`：如果是普通文字，
+   * 让浏览器按默认行为插到光标处就好 —— 自己接管纯文本粘贴会丢掉
+   * 富文本转换、撤销栈这些我们没打算重写的东西。
+   */
+  function handlePaste(e: ClipboardEvent<HTMLTextAreaElement>) {
+    const files = imageFilesFromClipboard(e.clipboardData?.items ?? null);
+    if (files.length === 0 || disabled) return;
+    e.preventDefault(); // 不挡的话 WebView 会自己插一段它理解的图片 HTML
+    void insertImages(api, e.currentTarget, files, setDraft).catch((err) =>
+      onError?.(errorText(err))
+    );
+  }
+
+  const drop = makeImageDropHandlers(
+    api,
+    ref,
+    setDraft,
+    setDropActive,
+    (err) => onError?.(errorText(err))
+  );
+
   return (
-    <div className="composer">
+    // 拖拽事件挂在整个 composer 上而不是 textarea 上：用户瞄的是"这个输入框"，
+    // 落在它周边一圈的边距里也该算数。
+    <div
+      className={`composer${dropActive ? " drop-active" : ""}`}
+      onDragOver={disabled ? undefined : drop.onDragOver}
+      onDragLeave={disabled ? undefined : drop.onDragLeave}
+      onDrop={disabled ? undefined : drop.onDrop}
+    >
       <textarea
         ref={ref}
         className="composer-input"
         rows={1}
         value={draft}
-        placeholder={`记点什么…（Enter 发送，Shift+Enter 换行）`}
+        placeholder={`记点什么…（Enter 发送，Shift+Enter 换行，也可以直接粘贴或拖进图片）`}
         onChange={(e) => setDraft(e.target.value)}
         onKeyDown={handleKeyDown}
+        onPaste={handlePaste}
       />
       <div className="composer-bar">
         <span className="composer-target">
-          发送到 <strong>{targetLabel}</strong>
+          {dropActive ? (
+            "松手就把图片存进来"
+          ) : (
+            <>
+              发送到 <strong>{targetLabel}</strong>
+              <span className="composer-hint"> · 可以粘贴或拖进图片</span>
+            </>
+          )}
         </span>
         <button
           className="send-btn"

@@ -43,6 +43,12 @@ body {
   padding: 12px 16px 8px;
 }
 
+/* 拖拽悬停。浮层没有圆角也没有外边距（见文件顶部的说明），
+   所以高亮只能靠底色——顶部那条强调线本来就是 accent，再变色就分不出来了。 */
+.cap-panel.drop-active {
+  background: var(--accent-soft);
+}
+
 .cap-input {
   display: block;
   width: 100%;

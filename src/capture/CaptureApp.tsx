@@ -4,12 +4,18 @@ import {
   useMemo,
   useRef,
   useState,
+  type ClipboardEvent,
   type KeyboardEvent,
 } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { LogicalSize } from "@tauri-apps/api/dpi";
 import { useApi } from "../lib/apiContext";
 import { errorText } from "../lib/errors";
+import {
+  imageFilesFromClipboard,
+  insertImages,
+  makeImageDropHandlers,
+} from "../lib/imageInsert";
 
 /** 浮层宽度固定，高度随内容增长（见下面的自适应逻辑）。 */
 const WINDOW_W = 680;
@@ -34,6 +40,8 @@ export default function CaptureApp() {
   const [draft, setDraft] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
+  // 拖拽悬停中（加一条高亮）。判定完全在 dataTransfer 上，这里只是外观。
+  const [dropActive, setDropActive] = useState(false);
 
   const taRef = useRef<HTMLTextAreaElement>(null);
   const shellRef = useRef<HTMLDivElement>(null);
@@ -118,18 +126,44 @@ export default function CaptureApp() {
     void send();
   }
 
+  /**
+   * 粘贴图片。浮层里这一步尤其值钱：截图之后按快捷键唤起、直接 Ctrl+V，
+   * 中间不需要"先保存成文件"。
+   *
+   * 只在剪贴板里确实有图片时才接管，纯文本粘贴近乎是同一个输入框的主用途，
+   * 不能因为我们想支持图片就把它也拦下来。
+   */
+  function onPaste(e: ClipboardEvent<HTMLTextAreaElement>) {
+    const files = imageFilesFromClipboard(e.clipboardData?.items ?? null);
+    if (files.length === 0) return;
+    e.preventDefault();
+    void insertImages(api, e.currentTarget, files, setDraft).catch((err) =>
+      setError(errorText(err))
+    );
+  }
+
+  const drop = makeImageDropHandlers(api, taRef, setDraft, setDropActive, (err) =>
+    setError(errorText(err))
+  );
+
   return (
     <div className="cap-shell" ref={shellRef}>
-      <div className="cap-panel">
+      <div
+        className={`cap-panel${dropActive ? " drop-active" : ""}`}
+        onDragOver={drop.onDragOver}
+        onDragLeave={drop.onDragLeave}
+        onDrop={drop.onDrop}
+      >
         <textarea
           ref={taRef}
           className="cap-input"
           rows={1}
           value={draft}
-          placeholder="记点什么…"
+          placeholder="记点什么…（图片可以直接粘贴或拖进来）"
           spellCheck={false}
           onChange={(e) => setDraft(e.target.value)}
           onKeyDown={onKeyDown}
+          onPaste={onPaste}
         />
         <div className="cap-foot">
           <span className="cap-keys">
@@ -140,6 +174,8 @@ export default function CaptureApp() {
             <span className="cap-error" title={error}>
               {error}
             </span>
+          ) : dropActive ? (
+            <span className="cap-target">松手就把图片存进来</span>
           ) : (
             <span className="cap-target">📥 收件箱</span>
           )}
