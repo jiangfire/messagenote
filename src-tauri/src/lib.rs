@@ -17,6 +17,7 @@ pub mod sync;
 
 mod commands;
 mod fatal;
+mod sse;
 mod sync_worker;
 
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -229,6 +230,13 @@ pub fn run() {
             // ---- 后台自动同步 ----
             // 同步必须是自动的：需要用户记得手动点的同步，等于没有同步。
             sync_worker::spawn(app.handle().clone());
+
+            // ---- 实时推送 ----
+            // 服务端一有写入就把同步线程叫醒，不用干等 45 秒。
+            // **轮询保留**：这条长连接随时可能被中间某一层悄悄掐掉，
+            // 而"掐掉了"和"没有新数据"在客户端看起来一模一样。
+            // 推送负责快，轮询负责兜底。
+            sse::spawn(app.handle().clone());
 
             Ok(())
         })
