@@ -359,6 +359,49 @@ await evaluate(
 await sleep(500);
 await screenshot(s, `${SHOTS}/web-09-image.png`);
 
+// ---------------------------------------------------------------- 实时推送
+console.log("== 实时推送：别处写入，这里自己出现 ==");
+
+// 从**页面之外**写一条。这样测的是"服务端推过来、界面自己更新"，
+// 而不是"本地的某次操作触发了刷新" —— 后者在没有任何推送的情况下也会通过。
+const marker = `推送验证${Date.now()}`;
+{
+  const r = await fetch(`${new URL(APP).origin}/api/message`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${TOKEN}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ body: marker }),
+  });
+  if (!r.ok) throw new Error(`写入失败：HTTP ${r.status}`);
+}
+
+// 接下来**不做任何操作**，只等。
+//
+// 网页端**没有轮询** —— 它原先要用户手动刷新才能看到别人的改动。所以这条
+// 记录出现只可能来自推送。给 10 秒是为了和"碰巧赶上了别的刷新"区分开：
+// 真的是推送的话通常几百毫秒就到。
+await waitFor(
+  s,
+  `document.body.innerText.includes(${JSON.stringify(marker)})`,
+  "推送把新记录带到了页面上",
+  10000
+);
+ok(
+  "别处写入的记录**未经任何操作**就出现了（网页端没有轮询，只可能是推送）",
+  (await text()).includes(marker)
+);
+await screenshot(s, `${SHOTS}/web-10-push.png`);
+
+// 顺带确认这条连接是**一条**，不是每次刷新都新建一堆 ——
+// 订阅写在 effect 里，依赖没写对的话切视图会不停重连。
+ok(
+  "推送没有把页面搞出错（连接断了会重连，不该冒到控制台）",
+  s.consoleErrors.length === 0,
+  s.consoleErrors.join(" | ")
+);
+
 // ---------------------------------------------------------------- 收尾
 console.log("== 页面健康 ==");
 ok(

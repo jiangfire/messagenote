@@ -30,7 +30,19 @@ notes.example.com {
 
 	# API 走服务端
 	handle /api/* {
-		reverse_proxy 127.0.0.1:8787
+		reverse_proxy 127.0.0.1:8787 {
+			# **必须关掉响应缓冲，否则实时推送整个不工作。**
+			#
+			# `/api/events` 是一条永不结束的 SSE 流。反代默认会把响应攒在
+			# 缓冲区里再往下发，而一条永远不结束的响应意味着**永远攒不满** ——
+			# 表现是浏览器那边连接建好了、却一条事件都收不到，
+			# 而且两端都不报错（服务端认为写成功了，客户端认为在等）。
+			#
+			# 这个坑我在端到端测试的同源代理里先踩到了一次：
+			# 那里用 `await upstream.arrayBuffer()` 把整条流缓冲下来，
+			# SSE 就再也没通过过。见 scripts/web-e2e/serve.mjs。
+			flush_interval -1
+		}
 	}
 
 	# 打包产物

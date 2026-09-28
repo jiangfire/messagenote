@@ -11,6 +11,7 @@
 import { createServer } from "node:http";
 import { readFile, stat } from "node:fs/promises";
 import { extname, join, normalize, resolve } from "node:path";
+import { Readable } from "node:stream";
 
 const DIST = resolve(process.argv[2]);
 const API = process.argv[3];
@@ -54,16 +55,29 @@ createServer(async (req, res) => {
       body: req.method === "GET" || req.method === "HEAD" ? undefined : req,
       duplex: "half",
     });
-    const buf = Buffer.from(await upstream.arrayBuffer());
+
     const headers = {};
     for (const [k, v] of upstream.headers) {
       // 这几个由我们自己重算，转发过去反而会不一致
       if (["content-encoding", "content-length", "transfer-encoding"].includes(k)) continue;
       headers[k] = v;
     }
-    headers["Content-Length"] = buf.length;
+
     res.writeHead(upstream.status, headers);
-    res.end(buf);
+
+    // **必须流式转发，不能先 arrayBuffer 再一次性写出去。**
+    //
+    // `/api/events` 是一条**永不结束**的 SSE 流，`await upstream.arrayBuffer()`
+    // 在它上面永远不 resolve —— 表现是浏览器那边连接建立了却一条事件都收不到，
+    // 而且两边都不报错。
+    //
+    // 真实部署的反向代理是同一回事（Caddy 那边要 `flush_interval -1`，
+    // 见 deploy/Caddyfile），所以这里也必须按代理的真实行为来，不能图省事缓冲。
+    if (upstream.body) {
+      Readable.fromWeb(upstream.body).pipe(res);
+    } else {
+      res.end();
+    }
     return;
   }
 

@@ -106,6 +106,16 @@ export interface DesktopApi {
 export interface ApiBundle {
   api: NoteApi;
   desktop: DesktopApi | null;
+  /**
+   * 订阅"服务端有变更了"。返回取消订阅的函数。
+   *
+   * 两端实现方式完全不同：网页端是 SSE（`web/sse.ts`），桌面端由 Rust 侧的
+   * SSE 线程推一个 Tauri 事件上来。但对界面来说都是同一件事 ——
+   * **别的地方改动了数据，去重取一次**。
+   *
+   * 没有推送能力的实现传 `undefined`，界面就退回原来的行为（靠操作后自己刷新）。
+   */
+  subscribeChanges?: (handler: () => void) => () => void;
 }
 
 const Ctx = createContext<ApiBundle | null>(null);
@@ -113,15 +123,20 @@ const Ctx = createContext<ApiBundle | null>(null);
 export function ApiProvider({
   api,
   desktop = null,
+  subscribeChanges,
   children,
 }: {
   api: NoteApi;
   desktop?: DesktopApi | null;
+  subscribeChanges?: (handler: () => void) => () => void;
   children: ReactNode;
 }) {
   // 记住这个 bundle：不然每次渲染都换一个新对象，
   // 所有把 `api` 放进依赖数组的 effect 都会反复重跑。
-  const value = useMemo(() => ({ api, desktop }), [api, desktop]);
+  const value = useMemo(
+    () => ({ api, desktop, subscribeChanges }),
+    [api, desktop, subscribeChanges]
+  );
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }
 

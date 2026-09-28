@@ -153,6 +153,35 @@ export default function App() {
     [refreshMeta, loadMessages]
   );
 
+  /**
+   * 订阅推送时要用"当前视图"，但**不该因为视图变化而重建订阅** ——
+   * 那会每切一次视图就断线重连一次 SSE，中间那几十毫秒的推送就丢了。
+   */
+  const viewRef = useRef(view);
+  useEffect(() => {
+    viewRef.current = view;
+  }, [view]);
+
+  /**
+   * 服务端说"有东西变了"就重取一次。
+   *
+   * **必须防重入。** 一次同步可能连着推好几个信号（每批变更一个），
+   * 而每次都完整重取一遍是白费 —— 后一次取到的一定包含前一次的结果。
+   * 已经在跑的时候直接跳过即可，正在跑的那次本来就会读到最新状态。
+   */
+  const refreshingByPush = useRef(false);
+  const { subscribeChanges } = useApi();
+  useEffect(() => {
+    if (!subscribeChanges) return;
+    return subscribeChanges(() => {
+      if (refreshingByPush.current) return;
+      refreshingByPush.current = true;
+      void refresh(viewRef.current).finally(() => {
+        refreshingByPush.current = false;
+      });
+    });
+  }, [subscribeChanges, refresh]);
+
   useEffect(() => {
     void refresh(view);
     // 切换视图时把焦点交还输入框：用户的下一个动作几乎总是"写"

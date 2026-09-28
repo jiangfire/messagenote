@@ -3,6 +3,7 @@ import App from "../App";
 import { ApiProvider } from "../lib/apiContext";
 import { errorText } from "../lib/errors";
 import { httpApi, login, type Session } from "../lib/httpApi";
+import { subscribeChanges as subscribeEvents } from "./sse";
 
 /**
  * 网页端入口：登录 → 复用同一套界面。
@@ -70,6 +71,26 @@ export default function WebApp() {
     [stored, onUnauthorized]
   );
 
+  /**
+   * 服务端推送的订阅。
+   *
+   * 用 `new URL` 而不是字符串拼接：用户填的服务端地址末尾有没有斜杠都可能，
+   * 而 `//api/events` 这种地址的失败方式是一个 404，看起来和推送无关。
+   */
+  const subscribeChanges = useMemo(
+    () =>
+      stored
+        ? (handler: () => void) =>
+            subscribeEvents({
+              url: new URL("/api/events", stored.baseUrl).toString(),
+              session: stored.session,
+              onChanged: handler,
+              onUnauthorized,
+            })
+        : undefined,
+    [stored, onUnauthorized]
+  );
+
   // 首次使用：连服务端地址都还没有，只能整屏登录
   if (!stored || !api) {
     return <LoginScreen onSuccess={accept} />;
@@ -86,7 +107,7 @@ export default function WebApp() {
         另外：重登录会让 `stored` 变化 → `api` 换新 → App 的 effect 依赖它，
         所以数据会自动重取一遍，不需要额外通知。
       */}
-      <ApiProvider api={api}>
+      <ApiProvider api={api} subscribeChanges={subscribeChanges}>
         <App />
       </ApiProvider>
 
