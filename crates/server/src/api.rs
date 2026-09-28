@@ -404,11 +404,11 @@ async fn create_message(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateMessageRequest>,
 ) -> ServerResult<Json<Message>> {
-    Ok(Json(
-        state
-            .store
-            .create_message(&req.body, req.channel_id.as_deref())?,
-    ))
+    Ok(Json(state.store.create_message(
+        &req.body,
+        req.channel_id.as_deref(),
+        req.id.as_deref(),
+    )?))
 }
 
 async fn edit_message(

@@ -1,4 +1,5 @@
 import type { NoteApi } from "./apiContext";
+import { uuidV4 } from "./ids";
 
 /**
  * 网页端实现：走 HTTP。
@@ -110,7 +111,12 @@ export function httpApi(opts: HttpApiOptions): NoteApi {
     },
     timelineStats: () => req("GET", "/api/timeline/stats"),
 
-    appendMessage: (body, channelId) => req("POST", "/api/message", { body, channelId }),
+    // **每次都带 id。** 不给的话服务端自己生成一个，那这条写入就不幂等 ——
+    // 而"不幂等"的代价在一次网络抖动里就会兑现：请求发出去了、响应没回来、
+    // 客户端重试，于是同一条记录出现两遍，且没有任何地方报错。
+    // 现在就把 id 定下来，重试多少次都只落一条。
+    appendMessage: (body, channelId, id) =>
+      req("POST", "/api/message", { body, channelId, id: id ?? uuidV4() }),
     updateMessage: (id, body) => req("PATCH", msg(id), { body }),
     deleteMessage: (id) => req("DELETE", msg(id)),
     moveMessage: (id, channelId) => req("POST", `${msg(id)}/move`, { channelId }),

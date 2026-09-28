@@ -40,7 +40,17 @@ export interface NoteApi {
   ): Promise<MessagePage>;
   timelineStats(): Promise<TimelineStats>;
 
-  appendMessage(body: string, channelId: string | null): Promise<Message>;
+  /**
+   * 记一条。
+   *
+   * `id` 是**幂等键**，只有网页端用得上：它没有本地库，离线时要把"要记什么"
+   * 排进队列、联网后重放，而重放天然会重试。给了 id 之后，同一条请求重放
+   * 多少遍都只会落一条记录，且不会产生多余的变更日志。
+   *
+   * 桌面端忽略这个参数 —— 它在本地就生成了 id，再通过同步协议推上来，
+   * 走的不是这条路径。
+   */
+  appendMessage(body: string, channelId: string | null, id?: string): Promise<Message>;
   updateMessage(id: string, body: string): Promise<Message>;
   deleteMessage(id: string): Promise<void>;
   moveMessage(id: string, channelId: string): Promise<void>;

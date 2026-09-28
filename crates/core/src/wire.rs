@@ -166,6 +166,16 @@ pub struct CreateMessageRequest {
     /// 省略时落到收件箱 —— 这是「捕获不做决策」的入口。
     #[serde(default)]
     pub channel_id: Option<String>,
+    /// 客户端自己生成的消息 id。给了它就是**幂等写入**：同一条请求重放多少遍，
+    /// 库里也只有一条。
+    ///
+    /// 这是给网页端的离线队列准备的：断网时先把"要记什么"排队，联网后重放，
+    /// 而重放天然会重试。没有它，一次重试就是一条重复记录 ——
+    /// 用户只会看到"我的笔记莫名其妙变多了"，且没有任何地方报错。
+    ///
+    /// 桌面端不走这条路：它在本地生成 id，再用同步协议推上来。
+    #[serde(default)]
+    pub id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -1341,3 +1341,111 @@ fn a_downloaded_blob_is_not_re_uploaded() {
     assert_eq!(again.blobs_up, 0, "从服务端取回来的字节不该再传回去");
     assert_eq!(again.blobs_down, 0, "已经有了就不该再取一次");
 }
+
+// ---------------------------------------------------------------- 幂等写入
+
+/// 网页端写入是幂等的：同一条请求（同一个 id）重放多少遍，只落**一条**记录，
+/// 而且**不产生额外的变更日志条目**。
+///
+/// 这是 S3 离线队列的地基。没有它，一次网络抖动 = 一条重复记录，
+/// 而用户看到的是"我的笔记莫名其妙变多了"，且没有任何地方报错。
+///
+/// 第二半（变更日志）比第一半更重要：只查"库里几条"会漏掉"服务端每次都
+/// 老实写了一遍变更、只是被别的东西挡住了"这种情况 —— 那样别的设备会看到
+/// 一次幽灵更新，而本地的条数检查照样通过。
+#[test]
+fn reposting_the_same_client_id_writes_exactly_one_change() {
+    let addr = start_server();
+    let id = "e2e-idempotent-1";
+    let body = serde_json::json!({ "body": "只该出现一次", "id": id });
+
+    let first = write_req(addr, "POST", "/api/message", Some(&body));
+    assert_eq!(first["id"], id, "应当采用客户端给的 id，而不是另生成一个");
+    assert_eq!(first["body"], "只该出现一次");
+
+    // 原样重放三次 —— 模拟"响应丢了、客户端重试"
+    for round in 0..3 {
+        let again = write_req(addr, "POST", "/api/message", Some(&body));
+        assert_eq!(again["id"], id, "第 {round} 次重放应当拿回同一条");
+        assert_eq!(again["body"], "只该出现一次");
+    }
+
+    // 库里只有一条
+    let (_, timeline) = try_get(addr, "/api/timeline?scope=all&limit=100", Some(TOKEN));
+    assert_eq!(
+        timeline["items"].as_array().unwrap().len(),
+        1,
+        "重放不该产生第二条记录：{timeline}"
+    );
+
+    // 变更日志里也只有一条 —— 否则别的设备会看到一次幽灵更新
+    let (_, pull) = try_get(addr, "/api/sync/pull?since=0&limit=200", Some(TOKEN));
+    let ids: Vec<&str> = pull["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c["kind"] == "message")
+        .map(|c| c["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        vec![id],
+        "变更日志里只该有一条消息变更，重放不能往里追加"
+    );
+}
+
+/// **重放不能把用户删掉的记录复活。**
+///
+/// 判"这个 id 用过没有"时必须**不管墓碑**。判成"有没有没被删的那一行"的话，
+/// "删除 → 队列重放"就会把记录变回来，而删除是用户明确表达过的意图。
+#[test]
+fn replaying_a_create_for_a_deleted_message_does_not_resurrect_it() {
+    let addr = start_server();
+    let id = "e2e-idempotent-2";
+    let body = serde_json::json!({ "body": "准备被删掉的", "id": id });
+
+    write_req(addr, "POST", "/api/message", Some(&body));
+    write_req(addr, "DELETE", &format!("/api/message/{id}"), None);
+
+    let (_, after_delete) = try_get(addr, "/api/timeline?scope=all&limit=100", Some(TOKEN));
+    assert_eq!(
+        after_delete["items"].as_array().unwrap().len(),
+        0,
+        "先确认真的删掉了"
+    );
+
+    // 队列重放
+    write_req(addr, "POST", "/api/message", Some(&body));
+
+    let (_, after_replay) = try_get(addr, "/api/timeline?scope=all&limit=100", Some(TOKEN));
+    assert_eq!(
+        after_replay["items"].as_array().unwrap().len(),
+        0,
+        "重放**不能**让删掉的记录复活：{after_replay}"
+    );
+}
+
+/// 形状不合法的幂等键要拒绝（400），不能当成"没给"。
+///
+/// 当成"没给"的话，一个传空串的客户端会得到**非幂等**的写入，而它以为自己
+/// 传了幂等键 —— 最坏的一类失败：行为与契约不符，且不报错。
+#[test]
+fn a_malformed_client_id_is_a_400_not_a_silent_new_id() {
+    let addr = start_server();
+    for bad in ["", "   ", &"z".repeat(129)] {
+        match ureq::post(&format!("http://{addr}/api/message"))
+            .header("Authorization", &format!("Bearer {TOKEN}"))
+            .send_json(serde_json::json!({ "body": "x", "id": bad }))
+        {
+            Err(ureq::Error::StatusCode(400)) => {}
+            other => panic!("不合法的 id 应当 400，实际：{other:?}"),
+        }
+    }
+
+    let (_, timeline) = try_get(addr, "/api/timeline?scope=all&limit=100", Some(TOKEN));
+    assert_eq!(
+        timeline["items"].as_array().unwrap().len(),
+        0,
+        "被拒绝的请求一条也不该落库"
+    );
+}

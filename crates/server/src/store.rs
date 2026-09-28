@@ -531,6 +531,26 @@ impl Store {
         Ok(msg)
     }
 
+    /// 按 id 读一条消息，**不管它是不是墓碑**。
+    ///
+    /// 和 [`Self::message`] 只差一个地方：不过滤 `deleted_at`。幂等检查要用它，
+    /// 因为"已经删掉了"也必须算"这个 id 用过了"。
+    fn existing_message(&self, id: &str) -> ServerResult<Option<Message>> {
+        let conn = self.conn()?;
+        let mut found = conn
+            .query_row(
+                "SELECT id, channel_id, body, created_at, updated_at
+                   FROM message WHERE id = ?1",
+                params![id],
+                messagenote_store::row_to_message,
+            )
+            .optional()?;
+        if let Some(msg) = found.as_mut() {
+            messagenote_store::attach_tags(&conn, std::slice::from_mut(msg))?;
+        }
+        Ok(found)
+    }
+
     fn channel(&self, id: &str) -> ServerResult<Channel> {
         let conn = self.conn()?;
         conn.query_row(
@@ -562,13 +582,37 @@ impl Store {
 
     // ---- 消息 ----
 
-    pub fn create_message(&self, body: &str, channel_id: Option<&str>) -> ServerResult<Message> {
+    /// 新建一条消息。
+    ///
+    /// `id` 是**幂等键**：给了它就保证"同一条请求重放多少遍，库里也只有一条"。
+    /// 见 `CreateMessageRequest::id` 的说明。
+    pub fn create_message(
+        &self,
+        body: &str,
+        channel_id: Option<&str>,
+        id: Option<&str>,
+    ) -> ServerResult<Message> {
         let body = normalize::body(body).map_err(ServerError::bad_request)?;
         let channel_id = channel_id.unwrap_or(messagenote_store::INBOX_ID);
         self.require_channel(channel_id)?;
 
+        let id = match id {
+            Some(given) => {
+                let given = validate_client_id(given)?;
+                if let Some(existing) = self.existing_message(&given)? {
+                    // 已经有这一行：**一个字都不写**，把当前那一版原样还回去。
+                    //
+                    // 这里判的是"有没有这一行"，**不是**"有没有没被删的那一行"。
+                    // 已经删掉的也算数 —— 否则离线队列的一次重放会把用户删掉的
+                    // 记录**复活**。宁可少写一条，也不能让删除失效。
+                    return Ok(existing);
+                }
+                given
+            }
+            None => uuid::Uuid::now_v7().to_string(),
+        };
+
         let now = now_ms();
-        let id = uuid::Uuid::now_v7().to_string();
         self.author(
             EntityKind::Message,
             id.clone(),
@@ -1367,6 +1411,22 @@ fn row_exists(conn: &Connection, table: &str, column: &str, value: &str) -> Serv
     Ok(found.is_some())
 }
 
+/// 客户端提供的幂等键只做最基本的形状校验。
+///
+/// 它直接当主键用，所以不能是空串、不能长到离谱。**刻意不要求它长得像 UUID**：
+/// 将来换个 id 生成方式（比如带上设备前缀，便于排查"这条是谁写的"）
+/// 不该让服务端突然开始拒绝写入。
+fn validate_client_id(id: &str) -> ServerResult<String> {
+    let id = id.trim();
+    if id.is_empty() {
+        return Err(ServerError::bad_request("消息 id 不能是空的"));
+    }
+    if id.len() > 128 {
+        return Err(ServerError::bad_request("消息 id 太长（上限 128 字节）"));
+    }
+    Ok(id.to_string())
+}
+
 /// 把一条已接受的变更落库，并打上新的 seq。
 ///
 /// 时间字段一律取自变更本身（含墓碑的 `deleted_at`，用 payload 的
@@ -1879,7 +1939,7 @@ mod tests {
     fn authoring_writes_into_the_change_log() {
         let s = store();
 
-        let m = s.create_message("网页端记的一条", None).unwrap();
+        let m = s.create_message("网页端记的一条", None, None).unwrap();
         assert_eq!(m.body, "网页端记的一条");
         assert_eq!(m.channel_id, "inbox", "省略频道时落到收件箱");
 
@@ -1929,14 +1989,14 @@ mod tests {
     fn authoring_rejects_what_the_desktop_rejects() {
         let s = store();
 
-        assert!(s.create_message("   ", None).is_err(), "空内容要拒绝");
+        assert!(s.create_message("   ", None, None).is_err(), "空内容要拒绝");
         assert!(
-            s.create_message("\n\t\n", None).is_err(),
+            s.create_message("\n\t\n", None, None).is_err(),
             "只有空白的也要拒绝"
         );
         assert!(s.create_channel("  ",).is_err(), "空频道名要拒绝");
 
-        let m = s.create_message("正常内容", None).unwrap();
+        let m = s.create_message("正常内容", None, None).unwrap();
         assert!(
             s.move_message(&m.id, "不存在的频道").is_err(),
             "目标频道不存在要拒绝"
@@ -1958,7 +2018,7 @@ mod tests {
     #[test]
     fn setting_tags_emits_only_the_changes_that_are_needed() {
         let s = store();
-        let m = s.create_message("带标签的一条", None).unwrap();
+        let m = s.create_message("带标签的一条", None, None).unwrap();
         let before = s.max_seq().unwrap();
 
         s.set_message_tags(&m.id, &["水果".into(), " 水果 ".into(), "".into()])
@@ -2113,7 +2173,7 @@ mod tests {
     #[test]
     fn the_server_learns_from_client_clocks() {
         let s = store();
-        let m = s.create_message("原始内容", None).unwrap();
+        let m = s.create_message("原始内容", None, None).unwrap();
 
         // 模拟一台时钟严重超前的设备改了这条
         let far_future = now_ms() + 86_400_000; // 一天之后
@@ -2154,7 +2214,9 @@ mod tests {
     fn deleting_a_channel_moves_its_messages_to_the_inbox() {
         let s = store();
         let ch = s.create_channel("临时频道").unwrap();
-        let m = s.create_message("频道里的一条", Some(&ch.id)).unwrap();
+        let m = s
+            .create_message("频道里的一条", Some(&ch.id), None)
+            .unwrap();
 
         {
             let conn = s.conn().unwrap();
@@ -2228,7 +2290,7 @@ mod tests {
         // 频道被删了（墓碑还在）不算"不存在" —— 外键仍然满足，
         // 判成错误会把"频道删了但消息还没同步到"这种正常时序卡住
         let ch = s.create_channel("临时").unwrap();
-        let m = s.create_message("里面的一条", Some(&ch.id)).unwrap();
+        let m = s.create_message("里面的一条", Some(&ch.id), None).unwrap();
         s.remove_channel(&ch.id).unwrap();
         let again = s.push(&[msg_in("m2", &ch.id, 300, "往墓碑频道里写")]);
         assert!(
@@ -2236,5 +2298,93 @@ mod tests {
             "频道的墓碑行还在，外键满足，不该当成引用错误：{again:?}"
         );
         let _ = m;
+    }
+
+    // ------------------------------------------------------------ 幂等写入
+    //
+    // 这一组是给网页端的离线队列准备的：断网时把"要记什么"排队，联网后重放，
+    // 而重放天然会重试。没有幂等键的话，一次重试就是一条重复记录。
+
+    /// 同一个 id 的创建请求重放多少遍，库里也只有一条，而且**不产生额外的变更**。
+    #[test]
+    fn creating_with_the_same_id_twice_writes_once() {
+        let s = store();
+        let id = "client-supplied-1";
+
+        let first = s.create_message("第一版内容", None, Some(id)).unwrap();
+        assert_eq!(first.id, id, "要用客户端给的 id，而不是服务端另生成一个");
+
+        let seq = s.max_seq().unwrap();
+        let log_len = s.pull(0, 1000).unwrap().changes.len();
+
+        // 原样重放
+        let again = s.create_message("第一版内容", None, Some(id)).unwrap();
+        assert_eq!(again.id, id);
+        assert_eq!(again.body, "第一版内容");
+
+        assert_eq!(s.max_seq().unwrap(), seq, "重放不该占用新的 seq");
+        assert_eq!(
+            s.pull(0, 1000).unwrap().changes.len(),
+            log_len,
+            "重放不该往变更日志里再写一条 —— 否则别的设备会看到两次改动"
+        );
+        assert_eq!(s.timeline_stats().unwrap().total, 1, "库里只该有一条");
+    }
+
+    /// **重放不能把用户删掉的记录复活。**
+    ///
+    /// 这是幂等检查里最容易写错的一处：如果判的是"有没有**没被删**的那一行"，
+    /// 那么"删除 → 队列重放"就会把记录变回来。删除是用户明确表达过的意图，
+    /// 任何让它失效的路径都是数据完整性问题。
+    #[test]
+    fn replaying_a_deleted_create_does_not_resurrect_it() {
+        let s = store();
+        let id = "client-supplied-2";
+
+        s.create_message("准备被删掉的", None, Some(id)).unwrap();
+        s.remove_message(id).unwrap();
+        assert_eq!(s.timeline_stats().unwrap().total, 0, "先确认真的删掉了");
+
+        // 队列重放同一条请求
+        let replayed = s.create_message("准备被删掉的", None, Some(id)).unwrap();
+        assert_eq!(replayed.id, id, "调用方仍然该拿回它要的那条记录");
+        assert_eq!(
+            s.timeline_stats().unwrap().total,
+            0,
+            "重放**不能**让删掉的记录复活"
+        );
+    }
+
+    /// 不给 id 时每次都是新记录 —— 老行为不能被这次改动碰坏。
+    #[test]
+    fn creating_without_an_id_always_makes_a_new_message() {
+        let s = store();
+        let a = s.create_message("完全一样的内容", None, None).unwrap();
+        let b = s.create_message("完全一样的内容", None, None).unwrap();
+        assert_ne!(a.id, b.id, "没给 id 就该各生成一个");
+        assert_eq!(s.timeline_stats().unwrap().total, 2);
+    }
+
+    /// 形状不合法的幂等键要**拒绝**，不能当成"没给"。
+    ///
+    /// 当成"没给"的话，一个传空串的客户端会得到**非幂等**的写入，
+    /// 而它以为自己传了幂等键 —— 最坏的一类失败：行为与契约不符，且不报错。
+    #[test]
+    fn a_malformed_client_id_is_rejected_not_ignored() {
+        let s = store();
+        assert!(s.create_message("x", None, Some("")).is_err(), "空串要拒绝");
+        assert!(
+            s.create_message("x", None, Some("   ")).is_err(),
+            "全是空白也算空"
+        );
+        assert!(
+            s.create_message("x", None, Some(&"z".repeat(129))).is_err(),
+            "过长要拒绝"
+        );
+        assert_eq!(
+            s.timeline_stats().unwrap().total,
+            0,
+            "被拒绝的请求一条也不该落库"
+        );
     }
 }
