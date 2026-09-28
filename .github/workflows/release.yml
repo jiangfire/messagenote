@@ -223,9 +223,23 @@ jobs:
         with:
           ref: ${{ inputs.tag || github.ref_name }}
 
+      # **必须指定 pattern。** 不带 `pattern` 会把**所有** artifact 都拉下来，
+      # 包括 `docker/build-push-action` 留下的那些构建缓存
+      # （名字长这样：`owner~repo~ABC123.dockerbuild`）—— 它们是临时的，
+      # 而且镜像那步失败时会留下不完整的，一次下载失败就让整个发布 job 挂掉。
+      # （实测踩到过：镜像 job 失败 → 发布 job 报
+      # "Unable to download and extract artifact ... failed after 5 retries"。）
+      #
+      # 分成两步、每个 pattern 都是简单 glob：花括号展开那种写法在不同版本
+      # 的行为不完全一致，不值得赌。
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
+          pattern: desktop-windows
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: server-*
 
       # 产物名要让人一眼看出"这是什么、给哪个平台"。
       # messagenote.exe / messagenote-server 这种名字下载下来就分不清了。

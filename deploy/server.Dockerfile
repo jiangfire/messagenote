@@ -9,25 +9,21 @@
 # ---------------------------------------------------------------- 构建
 FROM rust:1-slim-bookworm AS build
 
-# rusqlite 用的是 bundled 特性（SQLite 源码一起编），所以需要一个 C 编译器。
-# rust:slim 镜像里已经有 gcc，这里不用额外装。
+# 不用额外装 gcc：`rust:slim` 自带 C 编译器，rusqlite 的 bundled SQLite
+# 在这里编得过（这是实测的，不是猜的 —— 第一次镜像构建就是这么过的）。
 WORKDIR /src
 
-# 先只复制清单，让依赖层能被缓存 —— 改一行源码不该重编 400 个 crate。
-COPY Cargo.toml Cargo.lock ./
-COPY crates ./crates
-COPY src-tauri/Cargo.toml ./src-tauri/Cargo.toml
+# 整份源码一起拷。`.dockerignore` 已经把 target/、node_modules/、dist/ 排除了，
+# 所以上下文很小。
+#
+# **不做"先拷清单、再拷源码"那套缓存分层。** 试过的写法是"先拷各成员清单 →
+# 编一遍依赖 → 删掉 src-tauri → 再拷真源码"，但删掉 src-tauri 会让 workspace
+# 解析失败（根 Cargo.toml 的 members 里有它），第二次构建直接报
+# "failed to load manifest for workspace member"。为省一层缓存把构建搞得
+# 这么脆不值得 —— 代价只是改一行源码要重编一遍依赖。
+COPY . .
 
-# 上面那步复制的 crates 只有清单不够，真正的构建要全部源码。
-# 分两次 COPY 是为了让依赖编译这一层在"只改源码"时命中缓存。
-RUN mkdir -p src-tauri/src && echo 'fn main() {}' > src-tauri/src/main.rs \
-    && echo '' > src-tauri/src/lib.rs \
-    && cargo build --release --locked -p messagenote-server \
-    && rm -rf src-tauri
-
-COPY crates ./crates
-# 源码变了，但依赖没变 —— 这一次只会重编我们自己的 crate。
-RUN touch crates/server/src/main.rs && cargo build --release --locked -p messagenote-server
+RUN cargo build --release --locked -p messagenote-server
 
 # ---------------------------------------------------------------- 运行
 FROM debian:bookworm-slim
