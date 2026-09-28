@@ -89,6 +89,23 @@ export interface SyncConfig {
   token: string;
 }
 
+/**
+ * 有一个可用的新版本。
+ *
+ * 只有桌面端用得上：网页端每次打开都是最新版，"装在机器上的旧版本"这件事
+ * 在浏览器里不存在。
+ */
+export interface UpdateInfo {
+  version: string;
+  /**
+   * 发行说明。清单文件（`latest.json`）里叫 `notes`，
+   * 而更新插件在 JS 侧把它暴露成 `body` —— 名字错位在那边，不在我们这边。
+   */
+  notes: string | null;
+  /** 发布日期，可能没有。 */
+  date: string | null;
+}
+
 /** 服务端 handshake 的返回。`protocol` 与客户端不一致时必须拒绝同步。 */
 export interface HealthResponse {
   ok: boolean;

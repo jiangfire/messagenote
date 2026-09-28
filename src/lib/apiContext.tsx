@@ -10,6 +10,7 @@ import type {
   SyncStatus,
   TagCount,
   TimelineStats,
+  UpdateInfo,
 } from "./types";
 
 /**
@@ -101,6 +102,25 @@ export interface DesktopApi {
   testSyncConnection(url: string, token: string): Promise<HealthResponse>;
   /** 订阅后台同步状态，返回取消订阅函数。 */
   onSyncStatus(handler: (status: SyncStatus) => void): () => void;
+
+  // ------------------------------------------------------------ 自动更新
+  //
+  // 桌面端已经分发出去了。没有这套东西，用户手上那份就是**死版本** ——
+  // 每次发新版都得让人重新下载安装包。
+
+  /**
+   * 查有没有新版本。没有就返回 `null`。
+   *
+   * 拿到结果之后必须调 [`installUpdate`](DesktopApi.installUpdate) ——
+   * 更新的句柄留在实现里，不从这里透出去（那会把 Tauri 的类型泄漏到
+   * 共享的界面代码里）。
+   */
+  checkForUpdate(): Promise<UpdateInfo | null>;
+  /**
+   * 下载、校验签名、安装、重启。**中途会换掉当前进程**，所以调用方
+   * 之后不该再假设自己还在跑。
+   */
+  installUpdate(): Promise<void>;
 }
 
 export interface ApiBundle {

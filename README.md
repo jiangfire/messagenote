@@ -30,10 +30,29 @@ Windows 上还需要 WebView2（Win10/11 自带）。
 ```bash
 pnpm install
 pnpm tauri dev      # 开发（会拉起 Vite + 编译 Rust + 打开窗口）
-pnpm tauri build    # 打 Windows 安装包 (NSIS)
+pnpm tauri build    # 打 Windows 安装包 (NSIS) —— 需要下面的签名密钥
 ```
 
 首次 `cargo` 构建需要下载依赖树（Tauri 约 400 个 crate），之后全部走本地缓存。
+
+#### `tauri build` 需要更新签名密钥
+
+`tauri.conf.json` 里配了 `createUpdaterArtifacts: true` 和公钥，此时
+**没有私钥构建会直接失败**（`A public key has been found, but no private key.`）：
+
+```powershell
+$env:TAURI_SIGNING_PRIVATE_KEY = Get-Content "$env:USERPROFILE\.tauri\messagenote.key" -Raw
+# **必须显式设成空串。** 不设的话 tauri 会弹交互式密码提示 —— 在 CI 里
+# 表现成 job 一直卡到超时，而日志最后一行只是 "expect a prompt for password"
+$env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = ""
+pnpm tauri build
+```
+
+`pnpm tauri dev` 不需要它：dev 不打安装包。
+
+新密钥用 `pnpm tauri signer generate -w <路径>` 生成，公钥换成
+`tauri.conf.json` 里那一个（**换了公钥，已经在用户机器上的版本就再也收不到
+你发的更新了** —— 它们会一律校验失败）。
 
 ### 测试
 
@@ -200,6 +219,10 @@ HLC 是 `(wall_ms, counter, device)` 三元组，按这个顺序全序比较。�
 下次重拉同一批会走 HLC 相等那条幂等路径。
 
 ## 部署服务端
+
+**最省事的方式是一条 `docker compose up -d`** —— 完整步骤、TLS、备份、
+以及"反代必须关掉响应缓冲否则实时推送不工作"那个坑，见
+[`deploy/README.md`](deploy/README.md)。下面是裸机方式。
 
 服务端**只说 HTTP 明文、且默认只绑 `127.0.0.1`** —— TLS 交给前面的反向代理。
 默认绑 `0.0.0.0` 会让人一不留神就把装着全部笔记的明文端口暴露到公网。
@@ -520,7 +543,47 @@ cargo test -p messagenote -- --ignored --nocapture
 | `messagenote-server_<版本>_windows-x64.exe` | 同步服务端（Windows） |
 | `messagenote-server_<版本>_linux-x64` | 同步服务端（Linux，glibc） |
 | `messagenote-server_<版本>_linux-x64-static` | 同步服务端（Linux，**静态**，任何发行版都能跑） |
+| `SHA256SUMS.txt` | 上面这些文件的校验值 |
+| `latest.json` | 桌面端自动更新的清单（**不用手动下**） |
 
 安装包**未做代码签名**，Windows SmartScreen 会弹警告 —— 这是预期行为，
 不是安装包损坏。自用可以直接「仍要运行」。
+
+### 校验下载没被篡改
+
+```bash
+sha256sum -c SHA256SUMS.txt
+# Windows:
+certutil -hashfile MessageNote_<版本>_x64-setup.exe SHA256
+```
+
+校验值**替代不了代码签名**：它证明不了"这是作者发的"，但能证明"下载过程中
+没被人改过"。注意它和更新签名是两回事 —— 后者保护的是自动更新链路，
+用的是 Tauri 自己的密钥对。
+
+### 自动更新
+
+桌面端**每次启动会自动查新版本**，有的话在顶栏显示一条提示，点一下就更新并重启。
+**刻意不做静默自动更新**：装新版本要重启，而用户可能正在写东西 ——
+捕获浮层里那段还没发出去的草稿只在内存里（窗口是隐藏而不是销毁，所以它才留得住），
+一重启就没了。拿一段可能正在写的笔记去换一个后台升级，不划算。
+
+更新包会**校验签名**之后才安装。这一条不能省：更新包是从网上拿的，
+不校验就等于让任何人给你换一个 exe。公钥在 `src-tauri/tauri.conf.json` 里。
+
+> **自动更新只能从"第一个带它的版本"开始。** 更新是客户端主动去查的 ——
+> 一个本身不含更新插件的老版本，不会因为你发了新版就突然会升级。
+> 在自动更新上线之前发布的版本需要**手动装一次**新版本，之后才是自动的。
+
+### 用容器自建服务端
+
+```bash
+cp deploy/.env.example deploy/.env   # 填一个至少 32 字符的令牌
+docker compose --env-file deploy/.env up -d
+```
+
+一条命令起一个完整的 MessageNote（服务端 + 网页端，只暴露一个端口）。
+细节、TLS、备份、以及"反代必须关掉响应缓冲"那个坑，见
+[`deploy/README.md`](deploy/README.md)。
+
 

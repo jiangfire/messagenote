@@ -154,6 +154,12 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let outcome = tauri::Builder::default()
+        // 自动更新。检查/下载/校验签名都在 Rust 侧，界面只负责问用户一句。
+        //
+        // `process` 插件只为了一个命令：装完之后重启（Windows 上 NSIS 安装完
+        // 本来就会拉起新版本，但显式重启让三端行为一致，也省得依赖安装器）。
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, _shortcut, event| {

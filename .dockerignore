@@ -1,0 +1,17 @@
+# 构建上下文里不需要的东西。
+#
+# `target/` 尤其重要：它是几个 GB，而且 Docker 会把它整个传进守护进程 ——
+# 不加这个文件的话，一次 `docker build` 要先把几个 GB 复制一遍。
+target/
+node_modules/
+dist/
+.git/
+.scratch/
+.cargo/
+
+# 本地库和密钥
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.key
+.env

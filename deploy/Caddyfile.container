@@ -1,0 +1,45 @@
+# 容器里那份 Caddy 配置。和 deploy/Caddyfile（裸机那份）行为一致，
+# 区别只有两点：地址来自环境变量，TLS 交给外面那层。
+#
+# `{$VAR:default}` 是 Caddy 的环境变量语法。
+
+:80 {
+	encode zstd gzip
+
+	root * /srv
+
+	# API 走服务端容器
+	handle /api/* {
+		# 容器名由 compose 的 service 名解析，也可以用 MESSAGENOTE_API 覆盖
+		reverse_proxy {$MESSAGENOTE_API:server:8787} {
+			# **必须关掉响应缓冲，否则实时推送整个不工作。**
+			# `/api/events` 是永不结束的 SSE 流，而反代默认攒够缓冲才往下发 ——
+			# 永不结束的响应永远攒不满。表现是连接建好了、一条事件都收不到，
+			# 而且两端都不报错。
+			flush_interval -1
+		}
+	}
+
+	handle /assets/* {
+		file_server
+	}
+
+	# 其余一律回网页端入口。它是单页应用，路由在客户端。
+	# **注意是 web.html 不是 index.html** —— 后者是 Tauri 主窗口的壳，
+	# 依赖 window.__TAURI__，在浏览器里打开只会白屏。
+	handle {
+		rewrite * /web.html
+		file_server
+	}
+
+	header {
+		X-Content-Type-Options "nosniff"
+		# 不要对外暴露服务端软件信息
+		-Server
+	}
+
+	log {
+		output stdout
+		format console
+	}
+}

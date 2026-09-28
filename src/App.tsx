@@ -16,6 +16,7 @@ import { Stream } from "./components/Stream";
 import { Composer } from "./components/Composer";
 import { SyncBadge } from "./components/SyncBadge";
 import { SyncSettings } from "./components/SyncSettings";
+import { UpdateNotice } from "./components/UpdateNotice";
 
 const PAGE_SIZE = 200;
 const SEARCH_DEBOUNCE_MS = 160;
@@ -435,6 +436,9 @@ export default function App() {
             </button>
           </div>
         )}
+
+        {/* 有新版本时的一条提示。网页端不显示（`desktop` 是 null）。 */}
+        <UpdateNotice />
 
         {/* 筛选条只在时间线上出现。
             把"未归档"放在这里而不是侧边栏，是为了让它明确是**时间线的一个筛选**，

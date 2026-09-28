@@ -49,11 +49,20 @@
     "category": "Productivity",
     "shortDescription": "聊天框式本地优先笔记",
     "longDescription": "零摩擦捕获、事后整理的个人笔记应用。全局快捷键唤起捕获浮层，内容落到时间线，按频道归档、按标签横切。支持自建服务端的多设备同步。",
+    "createUpdaterArtifacts": true,
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
       "icons/icon.ico"
     ]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEFEREUwMzdDMUU2OUFENzUKUldSMXJXa2VmQVBlcmZ5OHNVZkNTSENpczd6OXh4QUdRMkNFWnZ6eXZCWmZPYWpNZ2c3VWZhelcK",
+      "endpoints": [
+        "https://github.com/jiangfire/messagenote/releases/latest/download/latest.json"
+      ]
+    }
   }
 }

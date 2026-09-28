@@ -23,6 +23,14 @@ messagenote-store = { workspace = true }
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-global-shortcut = "2"
 
+# 自动更新。桌面端已经分发出去了 —— 没有它，用户手上那份就是**死版本**，
+# 每次发新版都得让人重新下载安装包。
+#
+# `updater` 负责检查/下载/校验签名；`process` 只为了一个命令：装完之后重启。
+# 不用 cfg 限定平台：这个项目就只出 Windows 桌面端，写了只是噪音。
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
+
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

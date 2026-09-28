@@ -14,7 +14,7 @@ on:
         required: true
         type: string
 
-# 创建 Release 需要写权限。其余一律只读。
+# 创建 Release 需要写权限；推镜像需要 packages:write（在 job 上单独声明）。
 permissions:
   contents: write
 
@@ -53,9 +53,33 @@ jobs:
       - name: 测试
         run: cargo test --locked --workspace
 
-      # beforeBuildCommand 会自己跑 pnpm build
-      - name: 打包
-        run: pnpm tauri build
+      # **私钥是必须的，不是可选的。** tauri.conf.json 里配了
+      # `createUpdaterArtifacts: true` 和公钥，此时没有私钥构建会**直接失败**：
+      # "A public key has been found, but no private key."
+      #
+      # 本地开发同理 —— 见 README 的「本地构建」一节。
+      - name: 打包（带更新签名）
+        shell: bash
+        env:
+          RAW_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          RAW_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          # 两件事都必须显式做，缺一样构建都会**卡住或失败**：
+          #
+          # 1. **密码必须是"设了但是空"**，不能是"没设"。密钥没设密码时，
+          #    缺这个变量会让 tauri 弹交互式密码提示 —— 在 CI 里表现成
+          #    job 一直卡到超时，而且日志最后一行只是
+          #    "expect a prompt for password"。
+          #
+          # 2. **密钥要先剥掉换行。** 从 Secrets 传进来的值可能带尾随换行
+          #    （粘贴或管道都会），而密钥解码对它是敏感的 —— 报错只说
+          #    "解密失败"，看不出真正原因。
+          export TAURI_SIGNING_PRIVATE_KEY="$(printf '%s' "$RAW_KEY" | tr -d '\r\n')"
+          export TAURI_SIGNING_PRIVATE_KEY_PASSWORD="$RAW_PASSWORD"
+
+          pnpm tauri build
 
       - name: 收集产物
         shell: bash
@@ -64,6 +88,13 @@ jobs:
           mkdir -p out
           cp target/release/messagenote.exe out/
           cp target/release/bundle/nsis/*.exe out/
+          # 更新签名。**Tauri v2 的 NSIS 更新包就是安装包本身** ——
+          # 签名文件紧挨着它，而不是 v1 那种单独的 `.nsis.zip`
+          # （只有 `createUpdaterArtifacts: "v1Compatible"` 才会生成 zip）。
+          #
+          # 这里必须用 glob、不能写死名字：写死的话哪天命名规则变了，
+          # 会静默发出一个没有签名的版本，而桌面端只会安静地永远升不了级。
+          cp target/release/bundle/nsis/*.exe.sig out/
           ls -la out
 
       - uses: actions/upload-artifact@v4
@@ -95,7 +126,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # 手动触发时用输入的 tag；tag push 时就是推上来的那个
           ref: ${{ inputs.tag || github.ref_name }}
 
       - name: 改用官方 crates.io 源
@@ -134,6 +164,54 @@ jobs:
           path: out/*
           if-no-files-found: error
 
+  images:
+    name: 容器镜像 · ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # 推 GHCR 需要它
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: server
+            dockerfile: deploy/server.Dockerfile
+            image: messagenote-server
+          - name: web
+            dockerfile: deploy/web.Dockerfile
+            image: messagenote-web
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
+          tags: |
+            type=semver,pattern={{version}},value=${{ inputs.tag || github.ref_name }}
+            type=raw,value=latest
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
   release:
     name: 发 Release
     needs: [desktop, server]
@@ -141,8 +219,9 @@ jobs:
     steps:
       # 这个 job 本来不需要仓库内容，但 Apache-2.0 第 4 条要求**分发二进制时
       # 附带许可证副本** —— 所以把 LICENSE 也放进 Release 附件。
-      # 不指定 ref：手动触发时是 main，tag push 时就是那个 tag。
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
 
       - uses: actions/download-artifact@v4
         with:
@@ -162,6 +241,7 @@ jobs:
              "out/MessageNote_${V}_x64-portable.exe"
           cp artifacts/desktop-windows/MessageNote_${V}_x64-setup.exe \
              "out/MessageNote_${V}_x64-setup.exe"
+          cp artifacts/desktop-windows/*.exe.sig out/
           cp artifacts/server-x86_64-pc-windows-msvc/messagenote-server.exe \
              "out/messagenote-server_${V}_windows-x64.exe"
           cp artifacts/server-x86_64-unknown-linux-gnu/messagenote-server \
@@ -174,11 +254,60 @@ jobs:
           cp LICENSE out/LICENSE.txt
           ls -la out
 
+      # 桌面端的自动更新靠这个文件，而 endpoints 写的是
+      # `releases/latest/download/latest.json` —— 所以它必须每次都在
+      # latest release 上。
+      - name: 生成更新清单
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          V="${TAG#v}"
+
+          # 用 glob 找，不写死名字：Tauri 的命名规则变了的话，
+          # 这一步会**在发布时就报错**，而不是发出一个永远升不了级的版本。
+          SETUP=$(basename "$(ls out/*-setup.exe)")
+          SIG=$(cat "out/${SETUP}.sig")
+          URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${SETUP}"
+
+          # 用 jq 拼而不是手写 heredoc：签名是含换行的 base64，
+          # 手拼 JSON 只要漏一个转义，桌面端就会**校验失败**，
+          # 而它只会说"签名不对"，看不出是清单写坏了。
+          jq -n \
+            --arg version "$V" \
+            --arg notes "见 https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}" \
+            --arg pub_date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg signature "$SIG" \
+            --arg url "$URL" \
+            '{
+               version: $version,
+               notes: $notes,
+               pub_date: $pub_date,
+               platforms: {
+                 "windows-x86_64": { signature: $signature, url: $url }
+               }
+             }' > out/latest.json
+
+          cat out/latest.json
+
+      # 安装包没有代码签名，SmartScreen 会拦一道。校验值是**免费的替代**：
+      # 用户没法验"这是你发的"，但至少能验"下载没被篡改"。
+      #
+      # 注意它和更新签名是两回事 —— 后者保护的是自动更新链路，用的是
+      # Tauri 自己的密钥对，不是代码签名证书。
+      - name: 生成 SHA256 校验值
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd out
+          # 显式列出要校验的文件，别把 SHA256SUMS.txt 自己也算进去
+          sha256sum MessageNote_*.exe messagenote-server_* LICENSE.txt > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
       - name: 创建或更新 Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # 这个 job 刻意没有 actions/checkout —— 它只整理产物、调 gh。
-          # 但那样就没有 .git 目录，gh 认不出是哪个仓库，所以要显式告诉它。
           GH_REPO: ${{ github.repository }}
           TAG: ${{ inputs.tag || github.ref_name }}
         shell: bash
