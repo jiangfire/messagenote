@@ -1,8 +1,10 @@
-import { useCallback, useMemo, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useMemo, useState, type FormEvent } from "react";
 import App from "../App";
 import { ApiProvider } from "../lib/apiContext";
 import { errorText } from "../lib/errors";
 import { httpApi, login, type Session } from "../lib/httpApi";
+import { uuidV4 } from "../lib/ids";
+import { count, enqueue, replay } from "./outbox";
 import { subscribeChanges as subscribeEvents } from "./sse";
 
 /**
@@ -52,6 +54,9 @@ export default function WebApp() {
 
   const onUnauthorized = useCallback(() => setNeedLogin(true), []);
 
+  /** 离线队列里压着几条。0 表示没有，界面不显示任何东西。 */
+  const [queued, setQueued] = useState(0);
+
   const accept = useCallback((baseUrl: string, s: Session) => {
     const value: Stored = { baseUrl, session: s.session, expiresAt: s.expiresAt };
     localStorage.setItem(STORAGE_KEY, JSON.stringify(value));
@@ -59,17 +64,85 @@ export default function WebApp() {
     setNeedLogin(false);
   }, []);
 
-  const api = useMemo(
-    () =>
-      stored
-        ? httpApi({
-            baseUrl: stored.baseUrl,
-            session: stored.session,
-            onUnauthorized,
-          })
-        : null,
-    [stored, onUnauthorized]
-  );
+  const api = useMemo(() => {
+    if (!stored) return null;
+    const base = httpApi({
+      baseUrl: stored.baseUrl,
+      session: stored.session,
+      onUnauthorized,
+    });
+
+    return {
+      ...base,
+      /**
+       * 断网时不报错，而是**存进离线队列**。
+       *
+       * 这是网页端唯一必须离线可用的操作 —— 桌面端本来就有一份本地库，
+       * 而浏览器里没有。见 `web/outbox.ts`。
+       *
+       * 返回一条**本地回执**（一个长得像 Message 的对象）：调用方拿到它就会
+       * 清空输入框，这正是我们要的效果 —— 用户写的东西已经安全地躺在队列里，
+       * 不该再留在输入框里让他担心。这条回执**不会**出现在时间线上；
+       * 真正那条等联网重放之后才由服务端返回。
+       */
+      appendMessage: async (body: string, channelId: string | null, id?: string) => {
+        const key = id ?? uuidV4();
+        const now = Date.now();
+
+        const stash = async () => {
+          await enqueue({ id: key, body, createdAt: now });
+          setQueued(await count());
+          return {
+            id: key,
+            channelId: channelId ?? "inbox",
+            body,
+            createdAt: now,
+            updatedAt: now,
+            tags: [],
+          };
+        };
+
+        // 先看浏览器自己怎么说，省掉一次注定失败的请求
+        if (!navigator.onLine) return stash();
+
+        try {
+          return await base.appendMessage(body, channelId, key);
+        } catch (e) {
+          // fetch 在网络不可达时抛 TypeError。服务端返回的错误被我们包装成
+          // 普通 Error，**不该**当成离线 —— 那会让一条 400 永远躺在队列里
+          // 反复重放，而且每次都被拒。
+          if (e instanceof TypeError) return stash();
+          throw e;
+        }
+      },
+    };
+  }, [stored, onUnauthorized]);
+
+  /**
+   * 重放离线队列。
+   *
+   * 挂载时也跑一次：用户很可能正是"断网时关掉页面、联网后才重新打开"，
+   * 只监听 `online` 事件的话那一批会一直躺在里面。
+   */
+  useEffect(() => {
+    if (!api) return;
+    let alive = true;
+
+    const run = async () => {
+      const r = await replay(async (item) => {
+        await api.appendMessage(item.body, null, item.id);
+      });
+      if (alive) setQueued(r.remaining);
+    };
+
+    void run();
+    const onOnline = () => void run();
+    window.addEventListener("online", onOnline);
+    return () => {
+      alive = false;
+      window.removeEventListener("online", onOnline);
+    };
+  }, [api]);
 
   /**
    * 服务端推送的订阅。
@@ -110,6 +183,19 @@ export default function WebApp() {
       <ApiProvider api={api} subscribeChanges={subscribeChanges}>
         <App />
       </ApiProvider>
+
+      {/*
+        离线队列的提示。
+        **必须有。** 断网时输入框会正常清空（东西确实存下来了），
+        但时间线上暂时看不到它 —— 没有一个明确的说法，用户只会以为丢了一条。
+      */}
+      {queued > 0 && (
+        <div className="offline-pill" role="status">
+          {navigator.onLine
+            ? `${queued} 条正在补发…`
+            : `${queued} 条已离线保存，联网后自动发送`}
+        </div>
+      )}
 
       {needLogin && (
         <LoginScreen baseUrl={stored.baseUrl} overlay onSuccess={accept} />

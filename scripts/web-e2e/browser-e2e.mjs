@@ -402,6 +402,72 @@ ok(
   s.consoleErrors.join(" | ")
 );
 
+// ---------------------------------------------------------------- 离线捕获
+console.log("== 离线捕获：断网能记，联网自动补发 ==");
+
+await s.send("Network.enable");
+const setOffline = (offline) =>
+  s.send("Network.emulateNetworkConditions", {
+    offline,
+    latency: 0,
+    downloadThroughput: -1,
+    uploadThroughput: -1,
+  });
+
+await setOffline(true);
+
+const offlineMarker = `离线记的${Date.now()}`;
+await fill(s, ".composer-input", offlineMarker);
+await pressEnter(s, ".composer-input");
+
+await waitFor(
+  s,
+  `!!document.querySelector('.offline-pill')`,
+  "离线提示出现",
+  10000
+);
+ok(
+  "断网时记的一条进了离线队列，而且明确告诉了用户",
+  (await evaluate(s, `document.querySelector('.offline-pill').innerText`)).includes(
+    "离线保存"
+  )
+);
+
+// 输入框必须清空：东西确实存下来了，不该还留在那儿让用户担心
+ok(
+  "输入框已清空（本地回执让它走完了正常路径）",
+  (await evaluate(s, `document.querySelector('.composer-input').value`)) === ""
+);
+
+// 断网期间它**不该**出现在时间线上 —— 服务端还没有这条
+ok(
+  "断网时时间线上还没有它（还没发出去）",
+  !(await text()).includes(offlineMarker)
+);
+
+await setOffline(false);
+
+// 重放是自动的，用户不需要做任何事
+await waitFor(
+  s,
+  `document.body.innerText.includes(${JSON.stringify(offlineMarker)})`,
+  "恢复联网后自动补发",
+  15000
+);
+ok("恢复联网后自动补发，记录出现在时间线上", (await text()).includes(offlineMarker));
+
+// **只出现一次** —— 这正是前几轮那个幂等键存在的理由。
+// 少了它，重放（重试、页面重开、手动触发）每跑一次就多一条。
+const times = await evaluate(
+  s,
+  `(document.body.innerText.match(new RegExp(${JSON.stringify(offlineMarker)}, 'g')) || []).length`
+);
+ok("只补发了一条（幂等键挡住了重复重放）", times === 1, `出现了 ${times} 次`);
+
+// 队列空了，提示就该消失
+await waitFor(s, `!document.querySelector('.offline-pill')`, "提示消失", 10000);
+ok("队列清空之后提示消失", !(await evaluate(s, `!!document.querySelector('.offline-pill')`)));
+
 // ---------------------------------------------------------------- 收尾
 console.log("== 页面健康 ==");
 ok(
