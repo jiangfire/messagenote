@@ -2023,6 +2023,7 @@ name = "messagenote-server"
 version = "1.2.0"
 dependencies = [
  "axum",
+ "futures-util",
  "messagenote-core",
  "messagenote-store",
  "rusqlite",

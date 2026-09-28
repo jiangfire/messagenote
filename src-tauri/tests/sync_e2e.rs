@@ -829,7 +829,12 @@ fn logging_out_revokes_the_session_immediately() {
 fn the_long_lived_token_still_works_directly() {
     let addr = start_server();
 
-    for path in ["/api/channels", "/api/timeline/stats", "/api/tags"] {
+    for path in [
+        "/api/channels",
+        "/api/timeline/stats",
+        "/api/tags",
+        "/api/events",
+    ] {
         assert_eq!(
             try_get(addr, path, Some(TOKEN)).0,
             200,
@@ -1448,4 +1453,124 @@ fn a_malformed_client_id_is_a_400_not_a_silent_new_id() {
         0,
         "被拒绝的请求一条也不该落库"
     );
+}
+
+// ---------------------------------------------------------------- 实时推送
+
+/// 连上 `/api/events` 并读到**第一个完整事件块**，然后返回它。
+///
+/// 用带显式 `timeout_recv_body` 的独立 agent：SSE 永远不会结束，
+/// 万一事件没等到，至少会在这个窗口之后报错而不是无限挂住。
+///
+/// ## 一个还没查清的开销（留个记号，别让下一个人重新发现一遍）
+///
+/// 只要这两个 SSE 测试在，**整个测试二进制要多花一个心跳间隔才退出**：
+/// 心跳 15 秒时套件 15.1 秒，改成 2 秒就变成 2.08 秒（实测过，很确定）。
+/// 也就是说有东西在等这条连接的下一个心跳字节。
+///
+/// 已经排除的：
+/// - 不是这两条测试本身慢 —— 只跑它们两个只要 0.31 秒。
+/// - 不是 `ureq` 的全局默认 agent 把连接留在池里 —— 换成独立 agent 没变化。
+///
+/// 影响有限（CI 总共约 6 分钟），但没查到底，所以写在这里而不是假装没看见。
+fn read_one_sse_block(addr: SocketAddr) -> Vec<String> {
+    let agent = ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            // 只要在这个窗口内没等到心跳就当连接坏了。它比服务端的心跳间隔
+            // 长，所以正常情况下永远不会触发。
+            .timeout_recv_body(Some(std::time::Duration::from_secs(20)))
+            .build(),
+    );
+
+    let resp = agent
+        .get(&format!("http://{addr}/api/events"))
+        .header("Authorization", &format!("Bearer {TOKEN}"))
+        .call()
+        .expect("应当能建立 SSE 连接");
+    assert_eq!(resp.status().as_u16(), 200);
+
+    // 用 reader() 而不是 read_to_string()：SSE 是长连接，永远不会结束，
+    // 而 read_to_* 那条路还有 10 MB 上限。
+    let body = resp.into_body();
+    let mut lines = std::io::BufReader::new(body.into_with_config().reader());
+    let mut line = String::new();
+    let mut block: Vec<String> = Vec::new();
+
+    for _ in 0..100 {
+        line.clear();
+        match std::io::BufRead::read_line(&mut lines, &mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        let t = line.trim().to_string();
+        if t.is_empty() {
+            // 空行 = 一个事件块结束
+            if !block.is_empty() {
+                break;
+            }
+            continue;
+        }
+        block.push(t);
+    }
+    block
+}
+
+/// 有变更时，连着的客户端**立刻**收到推送 —— 而不是等下一次轮询。
+#[test]
+fn a_write_pushes_an_event_to_connected_clients() {
+    let addr = start_server();
+
+    // **订阅必须在写入之前建立。** 广播是"当时有谁在听就给谁"，
+    // 反过来的话接收者为空、事件静默丢掉，测试会超时而不是失败得清楚。
+    let reader = std::thread::spawn(move || read_one_sse_block(addr));
+
+    // 给订阅一点时间真的建立起来
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    write_req(
+        addr,
+        "POST",
+        "/api/message",
+        Some(&serde_json::json!({ "body": "触发一次推送" })),
+    );
+
+    let block = reader.join().expect("读线程不该 panic");
+    assert!(
+        block.iter().any(|l| l == "event: changed"),
+        "写入之后应当立刻收到推送，实际读到：{block:?}"
+    );
+}
+
+/// 推送的内容是"有东西变了"，**不是**变更本身。
+///
+/// 这条断言的价值在于拦住将来有人"顺手"把变更内容塞进事件里：
+/// 那样就得在这里重写一遍"哪些变更该发给谁"，而拉取那套游标逻辑
+/// 已经有测试守着了。两份实现对同一件事给出不同答案，是同步 bug 的温床。
+#[test]
+fn the_push_event_carries_no_payload() {
+    let addr = start_server();
+
+    let reader = std::thread::spawn(move || read_one_sse_block(addr));
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    write_req(
+        addr,
+        "POST",
+        "/api/message",
+        Some(&serde_json::json!({ "body": "看看事件里带了什么" })),
+    );
+
+    let block = reader.join().expect("读线程不该 panic");
+    let data_lines: Vec<&String> = block.iter().filter(|l| l.starts_with("data:")).collect();
+    assert_eq!(data_lines.len(), 1, "事件块应当只有一行 data：{block:?}");
+    assert_eq!(
+        data_lines[0].trim(),
+        "data: 1",
+        "data 只该是个信号，不该夹带变更内容：{block:?}"
+    );
+    for l in &block {
+        assert!(
+            !l.contains("看看事件里带了什么"),
+            "推送里不该出现记录正文：{block:?}"
+        );
+    }
 }

@@ -30,6 +30,8 @@
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
+use tokio::sync::broadcast;
+
 use rusqlite::{params, Connection, OptionalExtension};
 
 use messagenote_core::hlc::{now_ms, Hlc};
@@ -49,6 +51,13 @@ use messagenote_store::{blob, clock, normalize, Cursor, Scope};
 use crate::error::{ServerError, ServerResult};
 
 const SCHEMA_VERSION: i64 = 5;
+
+/// 写入广播的队列深度。
+///
+/// 它决定的不是"能推多少条"，而是"一个卡住的订阅者多久之后会收到 Lagged"。
+/// 信号本身没有内容（客户端收到就去拉最新状态），所以丢几次**无害** ——
+/// 收到 Lagged 时补发一个就行。见 `events` 端点。
+const EVENT_BUFFER: usize = 64;
 
 /// 网页端会话的有效期。
 ///
@@ -186,6 +195,18 @@ CREATE INDEX IF NOT EXISTS idx_attachment_present
 
 pub struct Store {
     conn: Mutex<Connection>,
+    /// 写入广播。SSE 客户端靠它知道"有东西变了"。
+    ///
+    /// **只广播一个信号，不带具体内容。** 带上内容就得在这里实现一遍
+    /// "哪些变更该发给谁"，而拉取路径已经有一套带游标、有测试守着的逻辑了 ——
+    /// 两份实现对同一件事给出不同答案，是同步类 bug 最经典的来源。
+    /// 客户端收到信号，自己去拉。
+    ///
+    /// 用 `broadcast` 而不是 `watch`：watch 只保留最后一个值，一个还没被
+    /// 调度的客户端会**漏掉中间的信号**；而这里"漏掉信号"意味着它要等下一次
+    /// 有人写才会醒过来。broadcast 会为每个订阅者排队（队列满了给 `Lagged`，
+    /// 那时补发一次即可，见 `events`）。
+    events: broadcast::Sender<()>,
 }
 
 impl Store {
@@ -216,6 +237,7 @@ impl Store {
 
         Ok(Self {
             conn: Mutex::new(conn),
+            events: broadcast::channel(EVENT_BUFFER).0,
         })
     }
 
@@ -227,6 +249,7 @@ impl Store {
         seed_constants(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            events: broadcast::channel(EVENT_BUFFER).0,
         })
     }
 
@@ -234,6 +257,21 @@ impl Store {
         self.conn
             .lock()
             .map_err(|_| ServerError::Msg("数据库连接锁已损坏".into()))
+    }
+
+    // ---------------------------------------------------------------- 实时推送
+
+    /// 订阅写入信号。SSE 端点用。
+    pub fn subscribe(&self) -> broadcast::Receiver<()> {
+        self.events.subscribe()
+    }
+
+    /// 广播"有东西变了"。
+    ///
+    /// **没有订阅者时是正常的**（比如只有桌面端在同步），所以这里忽略返回的
+    /// 发送失败 —— 它不是错误，只是"没人在听"。
+    fn emit(&self) {
+        let _ = self.events.send(());
     }
 
     /// 当前最大 seq。客户端首次同步时从这里开始，避免把整个历史重放一遍。
@@ -335,6 +373,9 @@ impl Store {
         }
 
         tx.commit()?;
+        // 提交之后才广播：订阅者收到信号就会来拉，那时数据必须已经可见。
+        // 反过来的话，一次"收到信号但拉不到东西"会让客户端认为已经追平了。
+        self.emit();
         Ok(PushResponse { results })
     }
 
@@ -470,6 +511,9 @@ impl Store {
         let seq = next_seq(&tx)?;
         upsert(&tx, &change, seq)?;
         tx.commit()?;
+        // 所有"代笔写入"都走这里（建/改/删消息、频道、标签……），
+        // 所以这是唯一的广播点，不需要在每个 handler 里各写一遍。
+        self.emit();
         Ok(())
     }
 

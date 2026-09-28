@@ -18,13 +18,23 @@ path = "src/main.rs"
 
 [dependencies]
 axum = "0.8.9"
+# 只为 SSE 的流组合（stream::unfold）。axum 自己内部也用它，
+# 所以它本来就在依赖树里 —— 显式声明只是为了让类型能被命名。
+futures-util = "0.3"
 messagenote-core = { workspace = true }
 messagenote-store = { workspace = true }
 rusqlite = { workspace = true, features = ["bundled"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+tokio = { version = "1.53.1", features = [
+  "rt-multi-thread",
+  "macros",
+  "net",
+  "signal",
+  # 实时推送的广播通道。少了它 `tokio::sync::broadcast` 编译不过。
+  "sync",
+] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 uuid = { workspace = true }

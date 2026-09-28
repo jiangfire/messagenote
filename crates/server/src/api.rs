@@ -33,15 +33,20 @@
 //! 刻意用朴素的 REST 而不是 WebSocket：同步是"客户端主动推拉"的模型，
 //! REST 更好调试（curl 就能复现问题），而实时推送（SSE）等 S4 再说。
 
+use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::{Body, Bytes};
 use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::Response;
 use axum::routing::{get, patch, post, put};
 use axum::{Json, Router};
+use futures_util::stream::{self, Stream};
+use tokio::sync::broadcast::error::RecvError;
 
 use messagenote_core::hlc::now_ms;
 use messagenote_core::models::{
@@ -71,6 +76,12 @@ const DEFAULT_SEARCH_LIMIT: i64 = 60;
 
 /// 一次能问多少个 sha 的"你有没有"。
 const MAX_BLOB_QUERY: usize = 2000;
+
+/// SSE 心跳间隔。
+///
+/// 比任何一个中间层的空闲超时都要短。Caddy 默认没有空闲超时，但反代和 NAT
+/// 常常有 30~60 秒的，所以取 15 秒。
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 
 /// 附件上传的体积上限，和 `core::attachment` 里的那个保持一致。
 ///
@@ -115,6 +126,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/api/blob/missing", post(missing_blobs))
         .route("/api/blob/{sha256}", get(download_blob))
+        // 实时推送。挂在鉴权后面，所以客户端必须能带 Authorization 头 ——
+        // 浏览器的 EventSource **不能**自定义请求头，这就是网页端改用
+        // fetch + 手动解析 SSE 的原因（见 web 端的 sse.ts）。
+        .route("/api/events", get(events))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_token));
 
     Router::new()
@@ -296,6 +311,38 @@ async fn search(
         q.limit.unwrap_or(DEFAULT_SEARCH_LIMIT),
         q.offset.unwrap_or(0),
     )?))
+}
+
+// ---------------------------------------------------------------- 实时推送
+//
+// 客户端原先靠 45 秒轮询（桌面端）或用户手动刷新（网页端）。多设备同时开着
+// 的时候这个延迟是能感觉到的：手机上记一笔，电脑上要等半分钟才出现。
+
+/// 有变更就往下推一个信号。
+///
+/// **只推"有东西变了"，不推内容。** 客户端收到之后走既有的拉取路径。
+/// 推内容就得在这里重新实现一遍"哪些变更该发给谁"，而拉取那套游标逻辑
+/// 已经有测试守着了 —— 两份实现对同一件事给出不同答案，
+/// 是同步类 bug 最经典的来源。
+async fn events(
+    State(state): State<Arc<AppState>>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let rx = state.store.subscribe();
+
+    let stream = stream::unfold(rx, |mut rx| async move {
+        match rx.recv().await {
+            // 订阅者落后太多时信号会被丢，但丢的是**次数**、不是**变化本身** ——
+            // 它照样得去拉一次，所以和正常情况发一样的东西。
+            Ok(()) | Err(RecvError::Lagged(_)) => {
+                Some((Ok(Event::default().event("changed").data("1")), rx))
+            }
+            Err(RecvError::Closed) => None,
+        }
+    });
+
+    // 心跳。没有它的话，中间任何一层（Caddy、反代、NAT）都会在空闲时悄悄
+    // 掐掉连接，而客户端看起来只是"再也不更新了" —— 一个不报错的失败。
+    Sse::new(stream).keep_alive(KeepAlive::new().interval(KEEPALIVE_INTERVAL))
 }
 
 // ---------------------------------------------------------------- 附件
