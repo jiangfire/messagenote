@@ -468,6 +468,41 @@ ok("只补发了一条（幂等键挡住了重复重放）", times === 1, `出�
 await waitFor(s, `!document.querySelector('.offline-pill')`, "提示消失", 10000);
 ok("队列清空之后提示消失", !(await evaluate(s, `!!document.querySelector('.offline-pill')`)));
 
+// ---------------------------------------------------------------- 离线打开
+console.log("== 离线打开：断网也能把页面拉起来 ==");
+
+// Service Worker 是在页面加载**之后**才装上的，所以加载它的那一屏不受它控制。
+// 要先等它真的激活，再刷一次页面，它才接管得了一屏。
+await evaluate(s, `navigator.serviceWorker.ready.then(() => true)`);
+await s.send("Page.reload", { ignoreCache: false });
+await sleep(1500);
+await waitFor(
+  s,
+  `!!navigator.serviceWorker.controller`,
+  "Service Worker 接管了这个页面",
+  15000
+);
+ok("Service Worker 已经接管页面", await evaluate(s, `!!navigator.serviceWorker.controller`));
+
+await setOffline(true);
+await s.send("Page.reload", { ignoreCache: true });
+await sleep(2500);
+
+// **这是关键**：没有 Service Worker 的话，离线刷新会得到浏览器的网络错误页，
+// 里面不可能有 .app。所以这一条真真切切在验"壳被缓存下来了"。
+ok(
+  "断网刷新之后界面仍然拉得起来（壳是从缓存里来的）",
+  await evaluate(s, `!!document.querySelector('.app')`),
+  await evaluate(s, `document.body.innerText.slice(0, 120)`)
+);
+
+await setOffline(false);
+await sleep(1500);
+ok(
+  "恢复联网后界面正常",
+  await evaluate(s, `!!document.querySelector('.app')`)
+);
+
 // ---------------------------------------------------------------- 收尾
 console.log("== 页面健康 ==");
 ok(

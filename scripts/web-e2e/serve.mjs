@@ -29,6 +29,14 @@ const TYPES = {
   ".woff2": "font/woff2",
 };
 
+async function isFile(file) {
+  try {
+    return (await stat(file)).isFile();
+  } catch {
+    return false;
+  }
+}
+
 async function serveFile(res, file) {
   try {
     const s = await stat(file);
@@ -90,6 +98,17 @@ createServer(async (req, res) => {
   }
 
   if (url.pathname.startsWith("/assets/")) {
+    await serveFile(res, file);
+    return;
+  }
+
+  // 根目录下**真实存在**的文件也要发（比如 /sw.js）。
+  //
+  // 只认 /assets/* 的话，Service Worker 请求会拿到一份 web.html，
+  // 而浏览器以 MIME 不对为由拒绝注册 —— 报的是
+  // "unsupported MIME type ('text/html')"，看起来和 SW 八竿子打不着。
+  // 真实的 Caddy file_server 不会有这个问题，所以这里也得对。
+  if (await isFile(file)) {
     await serveFile(res, file);
     return;
   }
