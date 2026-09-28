@@ -279,6 +279,86 @@ await screenshot(s, `${SHOTS}/web-08-search-page2.png`);
 await fill(s, ".search-input", "");
 await sleep(600);
 
+// ---------------------------------------------------------------- 图片
+console.log("== 图片：粘贴 → 发送 → 真的渲染出来 ==");
+
+// 在页面里**现画**一张 PNG。不硬编码 base64：那种串抄错一个字符，
+// 表现是"图片显示不出来"，而失败原因看起来会和真正的错误毫无关系。
+const pasted = await evaluate(
+  s,
+  `(async () => {
+     const c = document.createElement('canvas');
+     c.width = 12; c.height = 12;
+     const ctx = c.getContext('2d');
+     ctx.fillStyle = '#e11d48';
+     ctx.fillRect(0, 0, 12, 12);
+     const blob = await new Promise((r) => c.toBlob(r, 'image/png'));
+
+     const dt = new DataTransfer();
+     dt.items.add(new File([blob], 'e2e.png', { type: 'image/png' }));
+
+     const input = document.querySelector('.composer-input');
+     input.focus();
+     input.dispatchEvent(new ClipboardEvent('paste', {
+       clipboardData: dt, bubbles: true, cancelable: true,
+     }));
+
+     // 插入要等一次网络往返（saveAttachment），所以轮询而不是立刻读
+     const started = Date.now();
+     while (Date.now() - started < 15000) {
+       if (/attachment:[0-9a-f]{64}/.test(input.value)) break;
+       await new Promise((r) => setTimeout(r, 100));
+     }
+     return { value: input.value, bytes: blob.size };
+   })()`
+);
+
+const sha = (pasted.value.match(/attachment:([0-9a-f]{64})/) || [])[1];
+ok("粘贴图片后正文里出现 attachment:<sha> 引用", !!sha, pasted.value.slice(0, 160));
+ok(
+  "生成的 PNG 不是空文件（否则下面那条断言是空跑）",
+  pasted.bytes > 50,
+  `${pasted.bytes} 字节`
+);
+
+await pressEnter(s, ".composer-input");
+await waitFor(
+  s,
+  `[...document.querySelectorAll('.md img')].some((i) => i.naturalWidth > 0)`,
+  "图片渲染出来"
+);
+
+const rendered = await evaluate(
+  s,
+  `(() => {
+     const img = [...document.querySelectorAll('.md img')].find((i) => i.naturalWidth > 0);
+     return img ? { w: img.naturalWidth, h: img.naturalHeight, scheme: img.src.split(':')[0] } : null;
+   })()`
+);
+ok(
+  "图片真的解码出来了 —— naturalWidth 有值说明字节是对的，而不只是有个 URL",
+  rendered && rendered.w === 12 && rendered.h === 12,
+  JSON.stringify(rendered)
+);
+ok(
+  "用的是 blob: URL（字节从本地取，不是去访问什么外部地址）",
+  rendered && rendered.scheme === "blob",
+  JSON.stringify(rendered)
+);
+
+// 滚到底再截图 —— 断言是在整棵 DOM 上找的，图可能在视口之外，
+// 那样截出来的图里根本没有它，等于没有证据。
+await evaluate(
+  s,
+  `(() => {
+     const el = document.querySelector('.stream');
+     if (el) el.scrollTop = el.scrollHeight;
+     return true;
+   })()`
+);
+await sleep(500);
+await screenshot(s, `${SHOTS}/web-09-image.png`);
+
 // ---------------------------------------------------------------- 收尾
 console.log("== 页面健康 ==");
 ok(
