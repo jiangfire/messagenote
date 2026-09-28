@@ -481,7 +481,7 @@ $env:MESSAGENOTE_MIGRATE_TEST_DB = "…\副本.sqlite"
 cargo test -p messagenote -- --ignored --nocapture
 ```
 
-## 当前限制（v1.2.0）
+## 当前限制（v1.3.0）
 
 诚实地列出来，避免误判成熟度：
 
@@ -510,6 +510,9 @@ cargo test -p messagenote -- --ignored --nocapture
 **接下来的计划、已知但未修的问题、以及每项的理由，都在 [`ROADMAP.md`](ROADMAP.md)。**
 那份文件是项目的工作记忆，这里只留一个索引：
 
+- **v1.3.0 —— S3 + S4 收尾，交付链路补齐。** 附件（内容寻址的图片收发与展示）、
+  网页端写入幂等、SSE 实时推送（服务端 / 网页端 / 桌面端）、离线捕获队列 +
+  Service Worker；以及自动更新、SHA256 校验值、容器镜像。
 - **v1.2.0 —— 已知问题清空。** 启动警告推到界面、检索支持"加载更多结果"、
   WebView 的 CSP 收紧、服务端校验引用完整性。做法与踩到的坑见 ROADMAP 第一节。
 - **S2 网页端 —— 已完成。** 浏览语义下沉到 `crates/store`（两端同一份查询）、
