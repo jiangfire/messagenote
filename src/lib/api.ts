@@ -82,6 +82,22 @@ export const api = {
   setMessageTags: (messageId: string, tags: string[]) =>
     invoke<void>("set_message_tags", { messageId, tags }),
 
+  // ------------------------------------------------------------ 附件
+
+  saveAttachment: (bytes: Uint8Array) =>
+    // Tauri 的 invoke 走 JSON，Uint8Array 会被当成普通对象序列化成一堆数字键。
+    // 转成 number[] 之后是规整的 JSON 数组，Rust 侧 `Vec<u8>` 正好这么收。
+    invoke<string>("save_attachment", { bytes: Array.from(bytes) }),
+
+  readAttachment: async (sha256: string) => {
+    // 这个命令返回 tauri::ipc::Response，也就是**原始字节**而不是 JSON。
+    // ArrayBuffer 就是 Tauri 为此准备的返回形态。
+    const buf = await invoke<ArrayBuffer>("read_attachment", { sha256 });
+    return new Uint8Array(buf);
+  },
+
+  hasAttachment: (sha256: string) => invoke<boolean>("has_attachment", { sha256 }),
+
   /** 收起捕获浮层。走 Rust 侧命令，保证"如何收起"只有一个实现。 */
   hideCapture: () => invoke<void>("hide_capture"),
 

@@ -28,8 +28,8 @@ use messagenote_core::search as core_search;
 // 浏览与检索的查询住在共享存储层，两端跑的是同一份实现。这里只做转出，
 // 好让 `db::Scope`、`db::list_messages` 这些既有名字继续可用。
 pub use messagenote_store::{
-    attach_tags, list_channels, list_messages, list_tags, row_to_message, search, search_page,
-    timeline_stats, Cursor, Scope, INBOX_ID,
+    attach_tags, blob, list_channels, list_messages, list_tags, row_to_message, search,
+    search_page, timeline_stats, Cursor, Scope, INBOX_ID,
 };
 // 时钟推进同理：它决定"谁更新"，两端必须逐字一致。
 pub use messagenote_store::clock::{clock_next, clock_observe, device_id};
@@ -38,7 +38,7 @@ use messagenote_store::{clock, normalize};
 
 use crate::error::{AppError, AppResult};
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 const SCHEMA_V1: &str = r#"
 CREATE TABLE IF NOT EXISTS meta (
@@ -166,6 +166,40 @@ ALTER TABLE channel DROP COLUMN rev;
 ALTER TABLE message DROP COLUMN rev;
 "#;
 
+/// v3：附件。
+///
+/// **字节就在这张表里，不放文件系统。** 理由是备份：README 推荐的 Litestream
+/// 只跟这一个 .sqlite 文件走，图片放外面会被静默漏掉 —— 恢复时笔记都在、图全没。
+/// 详见 `messagenote_store::blob` 的模块文档。
+///
+/// **附件不进变更日志**：内容寻址意味着它不可变（换图必然换 sha），
+/// 所以没有冲突要解决，HLC / LWW / 墓碑那一整套在这里无事可做。
+/// "对端有这么一个附件"是从**正文**里的 `attachment:<sha>` 读出来的。
+///
+/// 服务端那张同名表少了 `uploaded` 一列 —— 那边不需要知道"谁传没传上来"。
+/// 共享层的每个查询都只碰前五列，两边都能跑。
+const SCHEMA_V3: &str = r#"
+CREATE TABLE IF NOT EXISTS attachment (
+  sha256     TEXT PRIMARY KEY,
+  size       INTEGER NOT NULL,
+  mime       TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  -- NULL = "知道有这么个附件，但字节还没拿到"。它同时表示两件事：
+  -- 本地刚引用、等着上传；以及从对端拉到了引用、等着下载。
+  bytes      BLOB,
+  -- 只属于客户端：字节传上服务端了没有。放这里而不是单独一张表，
+  -- 是因为它和这一行同生共死。
+  uploaded   INTEGER NOT NULL DEFAULT 0,
+  -- 只属于客户端：下载失败过几次。
+  --
+  -- **不是可选的。** 下载 404 是**可以预期**的 —— 上传那台设备可能还没传完。
+  -- 但失败项如果一直排在最前面，队列会被它堵死（每轮都取前 N 个，取到的
+  -- 永远是同几个失败的），后面真正能下的一直轮不到。所以按失败次数升序取，
+  -- 失败的会自己沉下去。
+  attempts   INTEGER NOT NULL DEFAULT 0
+);
+"#;
+
 /// 数据库句柄。用 `Mutex` 包一层足够：单用户、写入极少、每次操作都是毫秒级。
 pub struct Db {
     inner: Mutex<Connection>,
@@ -223,6 +257,9 @@ fn migrate(conn: &Connection) -> AppResult<()> {
     }
     if current < 2 {
         conn.execute_batch(SCHEMA_V2)?;
+    }
+    if current < 3 {
+        conn.execute_batch(SCHEMA_V3)?;
     }
 
     // user_version 不支持参数绑定，只能拼字符串；拼的是编译期常量，无注入风险。
@@ -594,6 +631,123 @@ pub fn set_message_tags(conn: &Connection, message_id: &str, names: &[String]) -
 //
 // 检索和浏览的查询都在 `messagenote_store::browse` 里，见文件头的转出。
 // 留这个标题只是为了让读代码的人知道"东西搬去哪儿了"，而不是以为它消失了。
+
+// ---------------------------------------------------------------- 附件
+//
+// 字节的存取在 `messagenote_store::blob`（两端同一份实现）。这里只加客户端
+// 独有的那一件事：**"传上去了没有"这个标记**。
+//
+// 标记不能省。没有它，每一轮同步都要把本地所有图片盲传一遍 —— 45 秒一次。
+// 代价是这个标记可能和现实脱节（服务端从旧备份恢复），所以另有一个
+// `reset_upload_flags` 作为修复入口。
+
+/// 存一份本地产生的附件，返回它的 sha256。
+///
+/// 调用方拿到 sha 之后要做的两件事：把 `attachment:<sha>` 写进正文，
+/// 以及（在同步时）把字节传上去。
+pub fn save_attachment(conn: &Connection, bytes: &[u8]) -> AppResult<String> {
+    if bytes.is_empty() {
+        return Err(AppError::Msg("附件内容是空的".into()));
+    }
+    if bytes.len() > messagenote_core::attachment::MAX_ATTACHMENT_BYTES {
+        return Err(AppError::Msg(format!(
+            "附件太大（{} MB，上限 {} MB）",
+            bytes.len() / 1024 / 1024,
+            messagenote_core::attachment::MAX_ATTACHMENT_BYTES / 1024 / 1024
+        )));
+    }
+
+    let sha = messagenote_core::attachment::sha256_hex(bytes);
+    blob::put_blob(conn, &sha, bytes, messagenote_core::now_ms())?;
+    Ok(sha)
+}
+
+/// 待上传的附件：本地有字节、但还没确认传上去过。
+pub fn pending_uploads(conn: &Connection, limit: i64) -> AppResult<Vec<(String, Vec<u8>)>> {
+    let mut stmt = conn.prepare(
+        "SELECT sha256, bytes FROM attachment
+          WHERE bytes IS NOT NULL AND uploaded = 0
+          ORDER BY created_at ASC, sha256 ASC
+          LIMIT ?1",
+    )?;
+    let rows = stmt.query_map(params![limit], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// 待下载的附件：知道有这么个东西，但字节还没拿到。
+///
+/// **按失败次数升序**，不是按时间。见 schema 里 `attempts` 那段的说明：
+/// 一个永远拿不到的附件如果按时间排，会一直占着队首，把后面能下的全堵死。
+pub fn pending_downloads(conn: &Connection, limit: i64) -> AppResult<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT sha256 FROM attachment
+          WHERE bytes IS NULL
+          ORDER BY attempts ASC, created_at ASC, sha256 ASC
+          LIMIT ?1",
+    )?;
+    let rows = stmt.query_map(params![limit], |r| r.get::<_, String>(0))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// 记一次下载失败，让它下次排到后面去。
+pub fn note_download_failure(conn: &Connection, sha256: &str) -> AppResult<()> {
+    conn.execute(
+        "UPDATE attachment SET attempts = attempts + 1 WHERE sha256 = ?1",
+        params![sha256],
+    )?;
+    Ok(())
+}
+
+/// 标记为已上传。上传成功之后才调用。
+pub fn mark_uploaded(conn: &Connection, sha256: &str) -> AppResult<()> {
+    conn.execute(
+        "UPDATE attachment SET uploaded = 1 WHERE sha256 = ?1",
+        params![sha256],
+    )?;
+    Ok(())
+}
+
+/// 把**所有**上传标记清掉，让下一轮同步重新核对一遍。
+///
+/// 修复入口，不是常规路径。什么时候用：服务端从一个较早的备份恢复过，
+/// 于是它手上的附件比客户端以为的少 —— 而客户端因为标着"传过了"不会再传，
+/// 表现是**别的设备上那些图永远打不开**。
+///
+/// 为什么不做成自动的：那需要每轮同步都向服务端核对全部 sha，
+/// 对一个只在灾难恢复后才用得上的场景来说，代价不对。
+pub fn reset_upload_flags(conn: &Connection) -> AppResult<usize> {
+    Ok(conn.execute(
+        "UPDATE attachment SET uploaded = 0 WHERE bytes IS NOT NULL",
+        [],
+    )?)
+}
+
+/// 写入下载到的字节，并**同时标成已上传** —— 它本来就是从服务端来的。
+pub fn fill_downloaded_blob(
+    conn: &Connection,
+    sha256: &str,
+    bytes: &[u8],
+    mime: &str,
+) -> AppResult<()> {
+    blob::fill_blob(conn, sha256, bytes, mime, messagenote_core::now_ms())?;
+    conn.execute(
+        "UPDATE attachment SET uploaded = 1 WHERE sha256 = ?1",
+        params![sha256],
+    )?;
+    Ok(())
+}
+
+/// 取一份附件的字节。用于 `<img>` 渲染。
+pub fn read_attachment(conn: &Connection, sha256: &str) -> AppResult<(String, Vec<u8>)> {
+    match blob::get_blob(conn, sha256)? {
+        Some(v) => Ok(v),
+        // 明确的"还没拿到"而不是一个泛泛的错误：界面据此显示占位图，
+        // 而不是弹一个用户看不懂的失败
+        None => Err(AppError::Msg("这份附件还没有下载下来".into())),
+    }
+}
 
 #[cfg(test)]
 mod tests {

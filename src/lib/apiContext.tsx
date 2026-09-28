@@ -54,6 +54,24 @@ export interface NoteApi {
   searchMessages(query: string, limit?: number, offset?: number): Promise<SearchPage>;
   listTags(): Promise<TagCount[]>;
   setMessageTags(messageId: string, tags: string[]): Promise<void>;
+
+  // ------------------------------------------------------------ 附件
+  //
+  // 附件按内容寻址（sha256）。正文里用 `attachment:<sha>` 引用它，
+  // 渲染时再换成字节。见 `messagenote_core::attachment`。
+
+  /**
+   * 存一份附件（粘贴或拖进来的图片），返回它的 sha256。
+   *
+   * 桌面端在本地算哈希，离线也能存；网页端没有本地库，由服务端算完返回
+   * （浏览器里 `crypto.subtle` 在非安全上下文下根本不存在，而自建服务端
+   * 常常就是明文 HTTP 的内网地址）。
+   */
+  saveAttachment(bytes: Uint8Array<ArrayBuffer>): Promise<string>;
+  /** 取附件字节。字节还没到手时 reject。 */
+  readAttachment(sha256: string): Promise<Uint8Array<ArrayBuffer>>;
+  /** 字节在不在本地。界面据此显示占位图。 */
+  hasAttachment(sha256: string): Promise<boolean>;
 }
 
 /**

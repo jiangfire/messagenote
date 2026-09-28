@@ -221,3 +221,37 @@ pub struct SessionResponse {
     /// 过期时刻（毫秒时间戳）。客户端据此决定什么时候重新登录。
     pub expires_at: i64,
 }
+
+// ---------------------------------------------------------------- 附件
+
+/// `POST /api/blob` 的返回：服务端算出来的身份。
+///
+/// 上传时**客户端不报 sha**，由服务端对收到的字节现算。这样做有两个好处：
+///
+/// 1. 上传方不必先本地哈希（浏览器里 `crypto.subtle` 在非安全上下文下
+///    根本不存在 —— 而自建服务端常常是明文 HTTP 的内网地址）。
+/// 2. 本地已经算过哈希的客户端（桌面端）可以拿这个返回值**核对**自己算的
+///    对不对。算错了是灾难性的：错误的字节会被永久钉在一个名字上，
+///    而所有设备都信任那个名字。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlobResponse {
+    pub sha256: String,
+    pub size: i64,
+    pub mime: String,
+}
+
+/// `POST /api/blob/missing`：一次问清楚哪些附件服务端没有。
+///
+/// 没有它的话，客户端只能盲传 —— 每同步一轮就把本地所有图片重发一遍。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlobMissingRequest {
+    pub shas: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlobMissingResponse {
+    pub missing: Vec<String>,
+}

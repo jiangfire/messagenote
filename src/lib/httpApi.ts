@@ -123,5 +123,50 @@ export function httpApi(opts: HttpApiOptions): NoteApi {
     },
     listTags: () => req("GET", "/api/tags"),
     setMessageTags: (messageId, tags) => req("PUT", `${msg(messageId)}/tags`, { tags }),
+
+    // ---------------------------------------------------------- 附件
+
+    saveAttachment: async (bytes) => {
+      // **不报 sha**：服务端对收到的字节现算，再告诉我们叫什么。
+      // 这样网页端不必依赖 crypto.subtle —— 它在非安全上下文（明文 HTTP 的
+      // 内网地址）下根本不存在，而自建服务端常常正是那种地址。
+      const resp = await fetch(`${base}/api/blob`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${opts.session}`,
+          "Content-Type": "application/octet-stream",
+        },
+        body: bytes,
+      });
+      if (resp.status === 401) {
+        opts.onUnauthorized?.();
+        throw new UnauthorizedError();
+      }
+      if (!resp.ok) throw new Error(await errorText(resp));
+      const data = (await resp.json()) as { sha256: string };
+      return data.sha256;
+    },
+
+    readAttachment: async (sha256) => {
+      const resp = await fetch(`${base}/api/blob/${encodeURIComponent(sha256)}`, {
+        headers: { Authorization: `Bearer ${opts.session}` },
+      });
+      if (resp.status === 401) {
+        opts.onUnauthorized?.();
+        throw new UnauthorizedError();
+      }
+      if (!resp.ok) throw new Error(await errorText(resp));
+      return new Uint8Array(await resp.arrayBuffer());
+    },
+
+    hasAttachment: async (sha256) => {
+      // 网页端没有本地库 —— 字节要么在服务端，要么还没有。
+      // 直接用 HEAD 问一下，比取一遍再判断便宜得多。
+      const resp = await fetch(`${base}/api/blob/${encodeURIComponent(sha256)}`, {
+        method: "HEAD",
+        headers: { Authorization: `Bearer ${opts.session}` },
+      });
+      return resp.ok;
+    },
   };
 }

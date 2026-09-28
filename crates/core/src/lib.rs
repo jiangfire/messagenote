@@ -20,6 +20,7 @@
 //! `messagenote-store` 里，而不是这里。这个 crate 保持纯逻辑、不依赖 rusqlite，
 //! 于是它能被任何地方使用（包括将来可能编到 wasm 的场景）。
 
+pub mod attachment;
 pub mod error;
 pub mod hlc;
 pub mod merge;

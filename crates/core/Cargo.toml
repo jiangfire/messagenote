@@ -8,4 +8,5 @@ description = "MessageNote 共享内核：中文检索分词、混合逻辑时�
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 thiserror = { workspace = true }

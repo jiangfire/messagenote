@@ -44,11 +44,11 @@ use messagenote_core::search;
 use messagenote_core::wire::{
     Change, EntityKind, PullResponse, PushOutcome, PushResponse, SessionResponse,
 };
-use messagenote_store::{clock, normalize, Cursor, Scope};
+use messagenote_store::{blob, clock, normalize, Cursor, Scope};
 
 use crate::error::{ServerError, ServerResult};
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 /// 网页端会话的有效期。
 ///
@@ -161,6 +161,27 @@ CREATE TABLE IF NOT EXISTS session (
   expires_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_session_expires ON session(expires_at);
+
+-- 附件字节。
+--
+-- 和客户端那张同名表**同形**，少了客户端的 `uploaded` 一列（服务端不需要
+-- 知道"谁传没传上来"）。共享层的每个查询都只碰前五列，所以两边能跑同一份 SQL。
+--
+-- 字节进数据库而不是放一个附件目录：备份。Litestream 只跟这一个 .sqlite 文件
+-- 走，图片放外面会被静默漏掉。详见 messagenote_store::blob 的模块文档。
+--
+-- 这张表**不参与变更日志**：内容寻址意味着不可变（换图必然换 sha），
+-- 没有冲突要解决。客户端是从正文里的 attachment:<sha> 发现它的。
+CREATE TABLE IF NOT EXISTS attachment (
+  sha256     TEXT PRIMARY KEY,
+  size       INTEGER NOT NULL,
+  mime       TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  bytes      BLOB
+);
+-- 回收孤儿附件时要反查"哪些 sha 有字节"。没有这个索引就得全表扫 BLOB。
+CREATE INDEX IF NOT EXISTS idx_attachment_present
+  ON attachment(sha256) WHERE bytes IS NOT NULL;
 "#;
 
 pub struct Store {
@@ -355,6 +376,41 @@ impl Store {
     pub fn search(&self, query: &str, limit: i64, offset: i64) -> ServerResult<SearchPage> {
         let conn = self.conn()?;
         Ok(messagenote_store::search_page(&conn, query, limit, offset)?)
+    }
+
+    // ---------------------------------------------------------------- 附件
+
+    /// 存一份附件字节。已经存在时返回 `false`（内容寻址 —— 同名字节必然相同）。
+    ///
+    /// **调用方必须先核对 sha256**，这里只信任传进来的名字。
+    pub fn put_blob(&self, sha256: &str, bytes: &[u8]) -> ServerResult<bool> {
+        let conn = self.conn()?;
+        Ok(blob::put_blob(&conn, sha256, bytes, now_ms())?)
+    }
+
+    /// 取附件字节和它**由内容嗅探出来的**类型。
+    pub fn get_blob(&self, sha256: &str) -> ServerResult<Option<(String, Vec<u8>)>> {
+        let conn = self.conn()?;
+        Ok(blob::get_blob(&conn, sha256)?)
+    }
+
+    /// 服务端手上有没有这份字节。上传方用它决定要不要真的发字节。
+    pub fn has_blob(&self, sha256: &str) -> ServerResult<bool> {
+        let conn = self.conn()?;
+        Ok(blob::has_blob(&conn, sha256)?)
+    }
+
+    /// 一批 sha 里服务端**缺**哪些。上传方一次问清楚，而不是盲传。
+    pub fn missing_blobs(&self, shas: &[String]) -> ServerResult<Vec<String>> {
+        let conn = self.conn()?;
+        let mut out = Vec::new();
+        for sha in shas {
+            // 名字明显不合法的直接算"缺"，让上传方走完整校验路径
+            if !messagenote_core::attachment::is_sha256(sha) || !blob::has_blob(&conn, sha)? {
+                out.push(sha.clone());
+            }
+        }
+        Ok(out)
     }
 
     // ---------------------------------------------------------------- 代笔写入

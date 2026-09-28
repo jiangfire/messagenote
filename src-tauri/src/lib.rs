@@ -269,6 +269,10 @@ pub fn run() {
             commands::test_sync_connection,
             commands::hide_capture,
             commands::get_startup_warnings,
+            commands::save_attachment,
+            commands::read_attachment,
+            commands::has_attachment,
+            commands::collect_garbage_attachments,
         ])
         .run(tauri::generate_context!());
 

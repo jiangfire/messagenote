@@ -164,6 +164,47 @@ pub fn get_startup_warnings() -> Vec<String> {
     crate::fatal::startup_warnings()
 }
 
+// ---------------------------------------------------------------- 附件
+
+/// 存一份附件（粘贴或拖进来的图片），返回它的 sha256。
+///
+/// 调用方拿到 sha 之后要把它以 `attachment:<sha>` 的形式写进正文 ——
+/// 正文就是笔记本身，附件靠这个引用被发现。见 `messagenote_core::attachment`。
+#[tauri::command]
+pub fn save_attachment(db: State<'_, Db>, bytes: Vec<u8>) -> AppResult<String> {
+    let conn = db.conn()?;
+    db::save_attachment(&conn, &bytes)
+}
+
+/// 取附件字节，给 `<img>` 用。
+///
+/// 返回 `tauri::ipc::Response` 而不是 `Vec<u8>`：前者走**原始字节**通道，
+/// 后者会被序列化成 JSON 数组 —— 一张 2 MB 的图会变成约 8 MB 的文本
+/// （每个字节最多要 4 个字符），在 IPC 上来回搬。
+#[tauri::command]
+pub fn read_attachment(db: State<'_, Db>, sha256: String) -> AppResult<tauri::ipc::Response> {
+    let conn = db.conn()?;
+    let (_mime, bytes) = db::read_attachment(&conn, &sha256)?;
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
+/// 附件字节在不在本地。界面据此决定是显示占位图还是直接渲染。
+#[tauri::command]
+pub fn has_attachment(db: State<'_, Db>, sha256: String) -> AppResult<bool> {
+    let conn = db.conn()?;
+    Ok(db::blob::has_blob(&conn, &sha256)?)
+}
+
+/// 回收不再被任何记录引用的附件字节，返回清掉的字节数。
+///
+/// 刻意做成**显式动作**而不是自动的：它是 O(附件 × 记录) 的扫描，
+/// 而且判错的代价是永久删掉用户的图。见 `messagenote_store::blob`。
+#[tauri::command]
+pub fn collect_garbage_attachments(db: State<'_, Db>) -> AppResult<i64> {
+    let conn = db.conn()?;
+    Ok(db::blob::gc_unreferenced(&conn)?)
+}
+
 // ---------------------------------------------------------------- 同步
 
 #[tauri::command]

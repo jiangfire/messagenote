@@ -9,7 +9,7 @@
 use std::time::Duration;
 
 use messagenote_core::wire::{
-    Change, HealthResponse, PullResponse, PushRequest, PushResponse, PROTOCOL_VERSION,
+    BlobResponse, Change, HealthResponse, PullResponse, PushRequest, PushResponse, PROTOCOL_VERSION,
 };
 
 use crate::error::{AppError, AppResult};
@@ -23,6 +23,13 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
 /// 整体超时兜底：防止对端"连上了但不说话"把同步线程永久挂住。
 /// 同理，它只占用后台线程，不占用数据库锁。
 const OVERALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 读附件字节时的上限。
+///
+/// **不能省。** ureq 的 `read_to_vec` 默认只读 10 MB（`MAX_BODY_SIZE`），
+/// 而附件上限是 25 MB —— 用默认值的话，大图会在某一天莫名其妙地同步不了，
+/// 而且失败得很安静（没有任何地方会提到"10 MB"这个词）。
+const MAX_BLOB_BYTES: u64 = messagenote_core::attachment::MAX_ATTACHMENT_BYTES as u64 + 4096;
 
 pub struct HttpServerApi {
     base: String,
@@ -119,6 +126,57 @@ impl ServerApi for HttpServerApi {
             .map_err(map_err)?;
 
         read_json(resp)
+    }
+
+    /// 附件上传。**不报 sha** —— 服务端对收到的字节现算，返回给调用方核对。
+    fn put_blob(&self, bytes: &[u8]) -> AppResult<BlobResponse> {
+        let resp = self
+            .agent
+            .post(format!("{}/api/blob", self.base))
+            .header("Authorization", self.auth_value())
+            // 服务端根本不读这个头（类型只由字节嗅探决定），带上只是让抓包好看
+            .header("Content-Type", "application/octet-stream")
+            .send(bytes)
+            .map_err(map_err)?;
+
+        read_json(resp)
+    }
+
+    /// 附件下载。返回 (服务端声明的类型, 字节)。
+    ///
+    /// 类型只是**提示**：本地写入时会用字节嗅探覆盖它（见 `blob::fill_blob`）。
+    fn get_blob(&self, sha256: &str) -> AppResult<(String, Vec<u8>)> {
+        let resp = self
+            .agent
+            .get(format!("{}/api/blob/{sha256}", self.base))
+            .header("Authorization", self.auth_value())
+            .call()
+            .map_err(map_err)?;
+
+        let code = resp.status().as_u16();
+        if !(200..300).contains(&code) {
+            // 这里**不需要**区分 404 和别的失败：调用方对任何一次失败的处理
+            // 都一样 —— 记一笔、下次排队尾、继续同步其它东西。
+            return Err(AppError::Msg(format!(
+                "取附件 {sha256} 时服务端返回 HTTP {code}"
+            )));
+        }
+
+        let mime = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+
+        let bytes = resp
+            .into_body()
+            .into_with_config()
+            .limit(MAX_BLOB_BYTES)
+            .read_to_vec()
+            .map_err(map_err)?;
+
+        Ok((mime, bytes))
     }
 }
 

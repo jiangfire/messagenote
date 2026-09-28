@@ -35,8 +35,9 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path, Query, Request, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::body::{Body, Bytes};
+use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::{get, patch, post, put};
@@ -47,9 +48,10 @@ use messagenote_core::models::{
     Channel, Message, MessagePage, SearchPage, TagCount, TimelineStats,
 };
 use messagenote_core::wire::{
-    CreateChannelRequest, CreateMessageRequest, EditMessageRequest, HealthResponse, LoginRequest,
-    MoveMessageRequest, PullQuery, PullResponse, PushRequest, PushResponse, RenameChannelRequest,
-    SearchQuery, SessionResponse, SetTagsRequest, TimelineQuery, PROTOCOL_VERSION,
+    BlobMissingRequest, BlobMissingResponse, BlobResponse, CreateChannelRequest,
+    CreateMessageRequest, EditMessageRequest, HealthResponse, LoginRequest, MoveMessageRequest,
+    PullQuery, PullResponse, PushRequest, PushResponse, RenameChannelRequest, SearchQuery,
+    SessionResponse, SetTagsRequest, TimelineQuery, PROTOCOL_VERSION,
 };
 use messagenote_store::{Cursor, Scope};
 
@@ -66,6 +68,15 @@ const DEFAULT_TIMELINE_LIMIT: i64 = 120;
 
 /// 检索默认条数。同样和桌面端对齐。
 const DEFAULT_SEARCH_LIMIT: i64 = 60;
+
+/// 一次能问多少个 sha 的"你有没有"。
+const MAX_BLOB_QUERY: usize = 2000;
+
+/// 附件上传的体积上限，和 `core::attachment` 里的那个保持一致。
+///
+/// axum 的默认请求体上限是 **2 MB**，不改的话任何一张真实照片都会被 413 挡掉，
+/// 而且报的是"请求体过大"这种和附件八竿子打不着的错。
+const MAX_BLOB_BODY: usize = messagenote_core::attachment::MAX_ATTACHMENT_BYTES;
 
 pub struct AppState {
     pub store: Store,
@@ -96,6 +107,14 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/channel/{id}",
             patch(rename_channel).delete(remove_channel),
         )
+        // 附件。上传要放宽请求体上限 —— axum 默认只给 2 MB，
+        // 不改的话任何一张真实照片都会被挡掉。
+        .route(
+            "/api/blob",
+            post(upload_blob).layer(DefaultBodyLimit::max(MAX_BLOB_BODY)),
+        )
+        .route("/api/blob/missing", post(missing_blobs))
+        .route("/api/blob/{sha256}", get(download_blob))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_token));
 
     Router::new()
@@ -277,6 +296,102 @@ async fn search(
         q.limit.unwrap_or(DEFAULT_SEARCH_LIMIT),
         q.offset.unwrap_or(0),
     )?))
+}
+
+// ---------------------------------------------------------------- 附件
+//
+// 附件**不走变更日志**：内容寻址意味着它不可变（换图必然换 sha），
+// 没有"两边都改了谁赢"这件事要解决。对端是从正文里的 `attachment:<sha>`
+// 发现它的，然后来这里取字节。详见 messagenote_core::attachment。
+
+/// 上传附件字节。
+///
+/// **客户端不报 sha，服务端对收到的字节现算。** 上传方因此不必先本地哈希 ——
+/// 浏览器里 `crypto.subtle` 在非安全上下文下根本不存在，而自建服务端常常
+/// 就是明文 HTTP 的内网地址。已经在本地算过哈希的客户端（桌面端）可以拿
+/// 返回值核对，那正好能抓出自己的哈希 bug。
+async fn upload_blob(
+    State(state): State<Arc<AppState>>,
+    body: Bytes,
+) -> ServerResult<Json<BlobResponse>> {
+    if body.is_empty() {
+        return Err(ServerError::bad_request("附件内容是空的"));
+    }
+
+    // **类型只由字节决定**，绝不采信调用方声明的 Content-Type。
+    // 同源部署下，一个声明成 text/html 的上传文件就是存储型 XSS ——
+    // 网页端和服务端是同一个 origin，脚本能直接读走会话。
+    let mime = messagenote_core::attachment::resolve_mime(&body);
+    let sha256 = messagenote_core::attachment::sha256_hex(&body);
+
+    let fresh = state.store.put_blob(&sha256, &body)?;
+    if !fresh {
+        tracing::debug!(sha256, "这份附件服务端已经有了，跳过写入");
+    }
+
+    Ok(Json(BlobResponse {
+        sha256,
+        size: body.len() as i64,
+        mime: mime.to_string(),
+    }))
+}
+
+/// 一次问清楚哪些附件服务端没有。没有它，客户端每轮同步只能盲传。
+async fn missing_blobs(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<BlobMissingRequest>,
+) -> ServerResult<Json<BlobMissingResponse>> {
+    if req.shas.len() > MAX_BLOB_QUERY {
+        return Err(ServerError::bad_request(format!(
+            "一次最多问 {MAX_BLOB_QUERY} 个 sha"
+        )));
+    }
+    Ok(Json(BlobMissingResponse {
+        missing: state.store.missing_blobs(&req.shas)?,
+    }))
+}
+
+/// 下载附件字节。
+async fn download_blob(
+    State(state): State<Arc<AppState>>,
+    Path(sha256): Path<String>,
+) -> ServerResult<Response> {
+    if !messagenote_core::attachment::is_sha256(&sha256) {
+        return Err(ServerError::bad_request("sha256 格式不对"));
+    }
+
+    let Some((mime, bytes)) = state.store.get_blob(&sha256)? else {
+        // 404 而不是 500：客户端要靠它区分"服务端也没有，别再重试"
+        // 和"服务端出错了，等会儿再试"。回 500 会让下载队列永远卡在同一条。
+        return Err(ServerError::not_found("服务端没有这份附件"));
+    };
+
+    let displayable = messagenote_core::attachment::is_displayable_image(&mime);
+    let mut resp = Response::new(Body::from(bytes));
+
+    let headers = resp.headers_mut();
+    // 类型来自**存进去时对字节的嗅探**，不是任何请求方说了算的东西
+    if let Ok(value) = HeaderValue::from_str(&mime) {
+        headers.insert(header::CONTENT_TYPE, value);
+    }
+    // 内容寻址 = 这个名字下的字节永远不会变，浏览器可以永久缓存
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=31536000, immutable"),
+    );
+    // 即使 Content-Type 被中间人改掉，也禁止浏览器去猜成可执行/可渲染的类型
+    headers.insert(
+        HeaderName::from_static("x-content-type-options"),
+        HeaderValue::from_static("nosniff"),
+    );
+    if !displayable {
+        // 认不出来的类型只当下载，绝不当成可渲染内容
+        headers.insert(
+            header::CONTENT_DISPOSITION,
+            HeaderValue::from_static("attachment"),
+        );
+    }
+    Ok(resp)
 }
 
 // ---------------------------------------------------------------- 写入

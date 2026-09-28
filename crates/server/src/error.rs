@@ -28,6 +28,14 @@ pub enum ServerError {
     #[error("{0}")]
     Unauthorized(String),
 
+    /// 东西不在这儿。
+    ///
+    /// 单独一类是为了回 **404**：附件是按 sha 取字节的，客户端要靠这个状态码
+    /// 区分"这份附件服务端也没有，我不该再重试"和"服务端出错了，等会儿再试"。
+    /// 一律回 500 会让下载队列**永远重试一个不存在的附件**。
+    #[error("{0}")]
+    NotFound(String),
+
     #[error("{0}")]
     Msg(String),
 }
@@ -42,6 +50,7 @@ impl IntoResponse for ServerError {
             // 客户端自己发错的东西，说清楚比藏起来有用
             ServerError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
             ServerError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, msg).into_response(),
+            ServerError::NotFound(msg) => (StatusCode::NOT_FOUND, msg).into_response(),
             other => {
                 tracing::error!(error = %other, "请求处理失败");
                 (StatusCode::INTERNAL_SERVER_ERROR, "服务端内部错误").into_response()
@@ -65,5 +74,10 @@ impl ServerError {
     /// 请求方自己发错了东西。会原样回给客户端（400）。
     pub fn bad_request(text: impl Into<String>) -> Self {
         ServerError::BadRequest(text.into())
+    }
+
+    /// 找不到。会回 404。
+    pub fn not_found(text: impl Into<String>) -> Self {
+        ServerError::NotFound(text.into())
     }
 }

@@ -38,7 +38,7 @@ use messagenote_core::payload::{
     message_tag_key, ChannelPayload, MessagePayload, MessageTagPayload, TagPayload,
 };
 use messagenote_core::search;
-use messagenote_core::wire::{Change, EntityKind, PullResponse, PushResponse};
+use messagenote_core::wire::{BlobResponse, Change, EntityKind, PullResponse, PushResponse};
 
 use crate::db::{self, Db};
 use crate::error::{AppError, AppResult};
@@ -57,6 +57,21 @@ const CURSOR_KEY: &str = "sync_cursor";
 pub trait ServerApi {
     fn pull(&self, since: i64, limit: i64) -> AppResult<PullResponse>;
     fn push(&self, changes: &[Change]) -> AppResult<PushResponse>;
+
+    /// 附件：上传字节。服务端对收到的字节**现算** sha256 并返回，
+    /// 调用方拿它核对自己算得对不对。
+    ///
+    /// 默认实现直接报错。这是故意的：默认实现要是"什么都不做"，一个忘了
+    /// 覆盖它的实现就会**静默不同步附件** —— 本地一切正常，另一台设备上
+    /// 那些图永远是破的，而没有任何地方会报错。
+    fn put_blob(&self, _bytes: &[u8]) -> AppResult<BlobResponse> {
+        Err(AppError::Msg("这个 ServerApi 实现没有提供附件上传".into()))
+    }
+
+    /// 附件：下载字节，返回 (服务端声明的类型, 字节)。
+    fn get_blob(&self, _sha256: &str) -> AppResult<(String, Vec<u8>)> {
+        Err(AppError::Msg("这个 ServerApi 实现没有提供附件下载".into()))
+    }
 }
 
 /// 一轮同步对本地库提出的全部需求。**每个方法内部各自加锁、返回前释放。**
@@ -88,6 +103,28 @@ pub trait LocalStore {
     /// 落库和推游标放在同一次加锁里。崩在中间的话，下次会重拉同一批，
     /// 靠 HLC 相等那条幂等路径兜住 —— 安全，但没必要留这个窗口。
     fn commit_pull_batch(&self, changes: &[Change], new_cursor: i64) -> AppResult<ApplyCount>;
+
+    // ------------------------------------------------------------ 附件
+    //
+    // 附件不进变更日志（内容寻址 = 不可变 = 没有冲突要解决），所以它不走
+    // `take_pending_batch` 那条路，自带一对"取一批 / 落地"。
+    //
+    // 同样遵守**网络调用发生在两次调用之间**：字节取出来之后锁就放开了。
+
+    /// 阶段一（附件）：取出待上传的附件，连字节一起。
+    fn take_upload_batch(&self, limit: i64) -> AppResult<Vec<(String, Vec<u8>)>>;
+
+    /// 阶段三（附件）：确认某个附件已经传上去了。
+    fn commit_uploaded(&self, sha256: &str) -> AppResult<()>;
+
+    /// 阶段一（附件）：取出缺字节的附件 sha。
+    fn take_download_batch(&self, limit: i64) -> AppResult<Vec<String>>;
+
+    /// 阶段三（附件）：写入下载到的字节。
+    fn commit_downloaded(&self, sha256: &str, mime: &str, bytes: &[u8]) -> AppResult<()>;
+
+    /// 某个附件这次没取到，记一笔，让它下次排到队尾去。
+    fn note_download_failure(&self, sha256: &str) -> AppResult<()>;
 }
 
 /// 一批远端变更落库后的统计。
@@ -105,6 +142,10 @@ pub struct SyncReport {
     pub pulled: usize,
     /// 本轮为了保命而新建的冲突副本数量
     pub conflicts: usize,
+    /// 本轮传上去的附件数
+    pub blobs_up: usize,
+    /// 本轮取回来的附件数
+    pub blobs_down: usize,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -600,6 +641,16 @@ fn write_remote(conn: &Connection, change: &Change) -> AppResult<()> {
                     "INSERT INTO message_fts (search_text, message_id) VALUES (?1, ?2)",
                     params![search::to_index_text(&p.body), change.id],
                 )?;
+
+                // 正文里可能引用了本地还没有的附件，登记成待下载。
+                //
+                // **这就是附件的发现机制。** 附件不进变更日志（内容寻址 =
+                // 不可变 = 没有冲突要解决），所以"对端有这么一个东西"只能
+                // 从正文里读出来。登记之后 `blobs_down` 会去取字节。
+                //
+                // 已经有字节的行不会被清掉（`ON CONFLICT DO NOTHING`），
+                // 所以一条迟到的、不带字节的变更不会把已经下好的图擦掉。
+                db::blob::register_referenced(&tx, &p.body, messagenote_core::now_ms())?;
             }
             tx.commit()?;
         }
@@ -705,6 +756,33 @@ impl LocalStore for Db {
 
         Ok(out)
     }
+
+    // ------------------------------------------------------------ 附件
+
+    fn take_upload_batch(&self, limit: i64) -> AppResult<Vec<(String, Vec<u8>)>> {
+        let conn = self.conn()?;
+        db::pending_uploads(&conn, limit)
+    }
+
+    fn commit_uploaded(&self, sha256: &str) -> AppResult<()> {
+        let conn = self.conn()?;
+        db::mark_uploaded(&conn, sha256)
+    }
+
+    fn take_download_batch(&self, limit: i64) -> AppResult<Vec<String>> {
+        let conn = self.conn()?;
+        db::pending_downloads(&conn, limit)
+    }
+
+    fn commit_downloaded(&self, sha256: &str, mime: &str, bytes: &[u8]) -> AppResult<()> {
+        let conn = self.conn()?;
+        db::fill_downloaded_blob(&conn, sha256, bytes, mime)
+    }
+
+    fn note_download_failure(&self, sha256: &str) -> AppResult<()> {
+        let conn = self.conn()?;
+        db::note_download_failure(&conn, sha256)
+    }
 }
 
 /// 推一次、拉干净。返回本轮统计。
@@ -722,6 +800,13 @@ pub fn sync_once(store: &dyn LocalStore, api: &dyn ServerApi) -> AppResult<SyncR
         report.conflicts += store.commit_push_result(&outgoing, &resp)?; // 锁：写
     }
 
+    // ---- 附件先传上去 ----
+    //
+    // 放在推变更**之后**：引用了这张图的那条消息先到，别的设备才知道该来取。
+    // 反过来也不会错（取不到就等下一轮），但先推消息能让另一台设备
+    // **第一次同步就看到图**，而不是先看到破图、45 秒后才补上。
+    report.blobs_up = blobs_up(store, api, BLOB_BATCH)?;
+
     // ---- 拉 ----
     let mut since = store.current_cursor()?; // 锁：读
     loop {
@@ -737,7 +822,66 @@ pub fn sync_once(store: &dyn LocalStore, api: &dyn ServerApi) -> AppResult<SyncR
         }
     }
 
+    // ---- 附件再取回来 ----
+    //
+    // 放在拉之后：这一轮刚拉到的正文里可能引用了本地没有的图，
+    // `commit_pull_batch` 已经把那些登记成待下载了（见 `register_referenced`）。
+    report.blobs_down = blobs_down(store, api, BLOB_BATCH)?;
+
     Ok(report)
+}
+
+/// 一轮最多传/取几个附件。
+///
+/// 定得小是因为**一张图可能好几 MB**：一轮处理几百个会让同步跑上好几分钟，
+/// 而同步是 45 秒一次的。积压会一轮一点地消化掉，但界面不会因此卡住。
+const BLOB_BATCH: i64 = 5;
+
+fn blobs_up(store: &dyn LocalStore, api: &dyn ServerApi, limit: i64) -> AppResult<usize> {
+    let pending = store.take_upload_batch(limit)?; // 锁：读 ─┐
+    let mut done = 0;
+    for (sha, bytes) in pending {
+        let resp = api.put_blob(&bytes)?; // 无锁 ◄──────────┘
+                                          // **核对服务端算出来的名字。** 对不上说明本地那份哈希是错的，
+                                          // 而错误的字节会被永久钉在一个名字上 —— 之后所有设备都信任那个名字，
+                                          // 表现为"这张图在别的设备上永远是破的"，且没有任何地方报错。
+                                          // 宁可在这里响亮地失败。
+        if resp.sha256 != sha {
+            return Err(AppError::Msg(format!(
+                "附件哈希对不上：本地算的是 {sha}，服务端算的是 {}。\
+                 本地这份数据有问题，请删掉这张图重新添加一次。",
+                resp.sha256
+            )));
+        }
+        store.commit_uploaded(&sha)?; // 锁：写
+        done += 1;
+    }
+    Ok(done)
+}
+
+fn blobs_down(store: &dyn LocalStore, api: &dyn ServerApi, limit: i64) -> AppResult<usize> {
+    let pending = store.take_download_batch(limit)?; // 锁：读 ─┐
+    let mut done = 0;
+    for sha in pending {
+        match api.get_blob(&sha) {
+            Ok((mime, bytes)) => {
+                store.commit_downloaded(&sha, &mime, &bytes)?; // 锁：写
+                done += 1;
+            }
+            // **单个附件取不到，不能让整轮同步失败。**
+            //
+            // 服务端还没有这份字节是**可以预期**的：上传那台设备可能正在传、
+            // 或者还没开机。如果这里直接 `?` 出去，一张暂时缺失的图就会
+            // **阻塞掉整台设备的同步** —— 笔记、标签、频道全都同步不了。
+            // 所以记一笔失败（让它下次排队尾，见 schema 里 attempts 的说明），
+            // 然后继续。
+            Err(e) => {
+                store.note_download_failure(&sha)?;
+                eprintln!("[MessageNote] 附件 {sha} 这次没取到（不影响其它同步）：{e}");
+            }
+        }
+    }
+    Ok(done)
 }
 
 #[cfg(test)]

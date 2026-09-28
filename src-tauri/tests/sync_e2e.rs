@@ -876,3 +876,468 @@ fn a_rejected_push_surfaces_the_servers_explanation() {
         "应当把服务端那句话带出来（含具体的频道 id），实际：{msg}"
     );
 }
+
+// ---------------------------------------------------------------- 附件
+
+/// 一个最小的"看起来像 PNG"的载荷：只要魔数对，嗅探就会认它。
+fn fake_png(payload_len: usize) -> Vec<u8> {
+    let mut v = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    // 内容要可区分，否则"拿回来的字节对不对"这个断言就是空跑
+    for i in 0..payload_len {
+        v.push((i % 251) as u8);
+    }
+    v
+}
+
+fn upload_blob(addr: SocketAddr, bytes: &[u8], bearer_val: &str) -> (u16, serde_json::Value) {
+    match ureq::post(&format!("http://{addr}/api/blob"))
+        .header("Authorization", &format!("Bearer {bearer_val}"))
+        .send(bytes)
+    {
+        Ok(r) => {
+            let code = r.status().as_u16();
+            (
+                code,
+                r.into_body().read_json().unwrap_or(serde_json::Value::Null),
+            )
+        }
+        Err(ureq::Error::StatusCode(c)) => (c, serde_json::Value::Null),
+        Err(e) => panic!("上传附件失败：{e}"),
+    }
+}
+
+/// 下载附件，返回 (状态码, Content-Type, Content-Disposition, X-Content-Type-Options, 字节)。
+fn download_blob(
+    addr: SocketAddr,
+    sha: &str,
+    bearer_val: &str,
+) -> (u16, String, String, String, Vec<u8>) {
+    let call = ureq::get(&format!("http://{addr}/api/blob/{sha}"))
+        .header("Authorization", &format!("Bearer {bearer_val}"))
+        .call();
+
+    let header_of = |r: &ureq::http::Response<ureq::Body>, name: &str| -> String {
+        r.headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string()
+    };
+
+    match call {
+        Ok(r) => {
+            let code = r.status().as_u16();
+            let ct = header_of(&r, "content-type");
+            let cd = header_of(&r, "content-disposition");
+            let nosniff = header_of(&r, "x-content-type-options");
+            // **必须显式放宽上限。** ureq 默认只读 10 MB（MAX_BODY_SIZE），
+            // 而附件上限是 25 MB —— 用默认值的话大图会失败，而且失败得很安静。
+            let body = r
+                .into_body()
+                .into_with_config()
+                .limit(64 * 1024 * 1024)
+                .read_to_vec()
+                .unwrap_or_default();
+            (code, ct, cd, nosniff, body)
+        }
+        Err(ureq::Error::StatusCode(c)) => (c, String::new(), String::new(), String::new(), vec![]),
+        Err(e) => panic!("下载附件失败：{e}"),
+    }
+}
+
+/// 附件走完一个来回：上传拿身份、下载拿字节、内容一致。
+#[test]
+fn a_blob_roundtrips_through_http() {
+    let addr = start_server();
+    let payload = fake_png(4096);
+
+    let (code, up) = upload_blob(addr, &payload, TOKEN);
+    assert_eq!(code, 200, "上传应当成功：{up}");
+    let sha = up["sha256"].as_str().expect("要有 sha256").to_string();
+    assert_eq!(sha.len(), 64);
+    assert_eq!(up["size"].as_i64().unwrap(), payload.len() as i64);
+    assert_eq!(
+        up["mime"].as_str().unwrap(),
+        "image/png",
+        "类型必须由字节嗅探出来"
+    );
+
+    let (code, ct, _, nosniff, got) = download_blob(addr, &sha, TOKEN);
+    assert_eq!(code, 200);
+    assert_eq!(ct, "image/png");
+    assert_eq!(nosniff, "nosniff", "任何响应都要禁止浏览器猜类型");
+    assert_eq!(got, payload, "拿回来的字节必须和传上去的一模一样");
+}
+
+/// **axum 的默认请求体上限是 2 MB。** 不改的话任何一张真实照片都会被 413 挡掉，
+/// 而且报的是"请求体过大"这种和附件八竿子打不着的错 —— 用户只会觉得"传图坏了"。
+#[test]
+fn a_photo_sized_upload_survives_the_default_body_limit() {
+    let addr = start_server();
+    let big = fake_png(3 * 1024 * 1024); // 3 MB，刚好越过 axum 的默认 2 MB
+
+    let (code, up) = upload_blob(addr, &big, TOKEN);
+    assert_eq!(
+        code, 200,
+        "3 MB 的上传必须成功 —— 默认请求体上限只有 2 MB，说明没放宽：{up}"
+    );
+
+    let sha = up["sha256"].as_str().unwrap().to_string();
+    let (code, _, _, _, got) = download_blob(addr, &sha, TOKEN);
+    assert_eq!(code, 200);
+    assert_eq!(got.len(), big.len(), "大附件的字节数不能少");
+    assert_eq!(got, big);
+}
+
+/// 上传一个声明成 `image/png` 的 HTML，服务端也只能把它当未知类型 ——
+/// 并且下载时明确要求浏览器**下载**而不是渲染。
+///
+/// 同源部署下这条尤其要紧：网页端和服务端是同一个 origin，
+/// 渲染一个上传上来的 HTML 就等于让脚本读走会话。
+#[test]
+fn the_stored_type_never_comes_from_the_request() {
+    let addr = start_server();
+    let html = b"<script>fetch('/api/timeline')</script>";
+
+    // 客户端在请求里撒什么谎都没用 —— 服务端根本不读 Content-Type
+    let resp = ureq::post(&format!("http://{addr}/api/blob"))
+        .header("Authorization", &format!("Bearer {TOKEN}"))
+        .header("Content-Type", "image/png")
+        .send(&html[..])
+        .expect("上传应当成功（存下来是可以的）");
+    let up: serde_json::Value = resp.into_body().read_json().unwrap();
+    let sha = up["sha256"].as_str().unwrap().to_string();
+
+    assert_eq!(
+        up["mime"].as_str().unwrap(),
+        "application/octet-stream",
+        "认不出来的字节只能得到兜底类型"
+    );
+
+    let (code, ct, cd, nosniff, got) = download_blob(addr, &sha, TOKEN);
+    assert_eq!(code, 200);
+    assert_eq!(ct, "application/octet-stream", "绝不能回 text/html");
+    assert_eq!(cd, "attachment", "未知类型必须当下载，不能当可渲染内容");
+    assert_eq!(nosniff, "nosniff");
+    assert_eq!(got, html);
+}
+
+/// 同样一份内容传两次是幂等的，而且 sha 相同（内容寻址 = 天然去重）。
+#[test]
+fn uploading_the_same_bytes_twice_is_a_no_op() {
+    let addr = start_server();
+    let payload = fake_png(1024);
+
+    let (_, first) = upload_blob(addr, &payload, TOKEN);
+    let (code, second) = upload_blob(addr, &payload, TOKEN);
+    assert_eq!(code, 200);
+    assert_eq!(
+        first["sha256"], second["sha256"],
+        "同样的字节必须得到同样的名字"
+    );
+
+    // 内容不同则名字必须不同 —— 否则后一份会覆盖前一份
+    let (_, other) = upload_blob(addr, &fake_png(1025), TOKEN);
+    assert_ne!(first["sha256"], other["sha256"]);
+}
+
+/// 取一份服务端没有的附件要回 **404**，不是 500。
+///
+/// 客户端靠这个状态码区分"服务端也没有，别再重试"和"服务端出错了，等会儿再试"。
+/// 回 500 会让下载队列永远卡在同一条上。
+#[test]
+fn an_absent_blob_is_a_404_not_a_500() {
+    let addr = start_server();
+    // 格式合法但不存在
+    let absent = "0".repeat(64);
+    let (code, _, _, _, _) = download_blob(addr, &absent, TOKEN);
+    assert_eq!(code, 404);
+
+    // 格式不合法则是 400 —— 这是请求方自己写错了，不是"没有"
+    let (code, _, _, _, _) = download_blob(addr, "not-a-sha", TOKEN);
+    assert_eq!(code, 400);
+}
+
+/// 附件端点和其他端点一样要鉴权。
+#[test]
+fn blob_endpoints_require_a_token() {
+    let addr = start_server();
+    let payload = fake_png(64);
+    let (_, up) = upload_blob(addr, &payload, TOKEN);
+    let sha = up["sha256"].as_str().unwrap().to_string();
+
+    // 无凭据下载
+    match ureq::get(&format!("http://{addr}/api/blob/{sha}")).call() {
+        Err(ureq::Error::StatusCode(401)) => {}
+        other => panic!("无凭据下载附件应当 401，实际：{other:?}"),
+    }
+    // 无凭据上传
+    match ureq::post(&format!("http://{addr}/api/blob")).send(&payload[..]) {
+        Err(ureq::Error::StatusCode(401)) => {}
+        other => panic!("无凭据上传附件应当 401，实际：{other:?}"),
+    }
+}
+
+/// 一次问清楚服务端缺哪些附件。
+///
+/// 没有这个端点，客户端每轮同步只能把本地所有图片盲传一遍。
+#[test]
+fn missing_blobs_reports_only_what_is_absent() {
+    let addr = start_server();
+    let have = fake_png(128);
+    let (_, up) = upload_blob(addr, &have, TOKEN);
+    let have_sha = up["sha256"].as_str().unwrap().to_string();
+
+    let absent_sha = messagenote_core::attachment::sha256_hex(b"never uploaded");
+    let bogus = "zzzz".to_string();
+
+    let resp = write_req(
+        addr,
+        "POST",
+        "/api/blob/missing",
+        Some(&serde_json::json!({
+            "shas": [have_sha, absent_sha, bogus],
+        })),
+    );
+    let missing: Vec<String> = resp["missing"]
+        .as_array()
+        .expect("要有 missing 数组")
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+
+    assert!(
+        !missing.contains(&have_sha),
+        "服务端已经有了的不该出现在 missing 里"
+    );
+    assert!(missing.contains(&absent_sha), "没传过的必须报缺");
+    assert!(
+        missing.contains(&bogus),
+        "格式不合法的名字也算缺 —— 让上传方走完整校验路径"
+    );
+}
+
+// ---------------------------------------------------------------- 附件同步
+
+/// 图片从一台设备走到另一台 —— 这是整个附件功能的验收标准。
+#[test]
+fn an_image_travels_between_two_devices() {
+    let addr = start_server();
+    let api = api(addr);
+    let a = db::open_memory("device-a").unwrap();
+    let b = db::open_memory("device-b").unwrap();
+
+    // A 粘了一张图，正文里引用它
+    let png = fake_png(5000);
+    let sha = {
+        let conn = a.conn().unwrap();
+        let sha = db::save_attachment(&conn, &png).unwrap();
+        db::append_message(
+            &conn,
+            &format!(
+                "看这张\n\n{}",
+                messagenote_core::attachment::image_markdown(&sha, "图")
+            ),
+            None,
+        )
+        .unwrap();
+        sha
+    };
+
+    // A 同步：这一轮里消息推上去、字节也传上去
+    let ra = sync_once(&a, &api).unwrap();
+    assert!(ra.pushed >= 1, "消息应当推出去了");
+    assert_eq!(ra.blobs_up, 1, "附件字节应当跟着传上去了");
+
+    // B 同步一次就该拿到**字节**，而不只是引用
+    let rb = sync_once(&b, &api).unwrap();
+    assert!(rb.pulled >= 1, "B 应当拉到了那条消息");
+    assert_eq!(
+        rb.blobs_down, 1,
+        "同一轮里就该把图取回来 —— 拉到的正文会登记待下载，然后立刻去取"
+    );
+
+    let conn = b.conn().unwrap();
+    assert!(
+        db::blob::has_blob(&conn, &sha).unwrap(),
+        "B 本地应当有这份字节"
+    );
+    assert_eq!(
+        db::read_attachment(&conn, &sha).unwrap().1,
+        png,
+        "取回来的字节必须一个不差"
+    );
+
+    // 正文里的引用也要原样到达 —— 否则界面上会是一张破图
+    let body: String = conn
+        .query_row(
+            "SELECT body FROM message WHERE deleted_at IS NULL ORDER BY created_at LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        messagenote_core::attachment::referenced_shas(&body).contains(&sha),
+        "正文里的引用不该在同步中丢掉：{body}"
+    );
+}
+
+/// 反过来也要通：B 加的图，A 能拿到。
+#[test]
+fn an_image_travels_back_to_the_other_device() {
+    let addr = start_server();
+    let api = api(addr);
+    let a = db::open_memory("device-a").unwrap();
+    let b = db::open_memory("device-b").unwrap();
+
+    let png = fake_png(7777);
+    let sha = {
+        let conn = b.conn().unwrap();
+        let sha = db::save_attachment(&conn, &png).unwrap();
+        db::append_message(
+            &conn,
+            &messagenote_core::attachment::image_markdown(&sha, "反方向"),
+            None,
+        )
+        .unwrap();
+        sha
+    };
+
+    sync_once(&b, &api).unwrap();
+    sync_once(&a, &api).unwrap();
+
+    let conn = a.conn().unwrap();
+    assert_eq!(
+        db::read_attachment(&conn, &sha).unwrap().1,
+        png,
+        "反方向的字节也要一模一样"
+    );
+}
+
+/// **取不到的附件不能阻塞整轮同步。**
+///
+/// 服务端还没有那份字节是**可以预期**的（上传那台设备可能还没开机）。
+/// 如果下载失败直接把错误抛出去，一台设备会因为"某张图暂时不在"而
+/// **完全同步不了** —— 笔记、标签、频道全都卡住，用户看到的是"同步坏了"，
+/// 而真正的原因只是一张图。
+#[test]
+fn an_unreachable_attachment_does_not_block_sync() {
+    let addr = start_server();
+    let api = api(addr);
+    let a = db::open_memory("device-a").unwrap();
+    let b = db::open_memory("device-b").unwrap();
+
+    // 造一条"引用了一个服务端根本没有的附件"的消息。
+    //
+    // 手工拼正文而不是走 save_attachment —— 要的正是一个**没有字节**的引用，
+    // 模拟"对端提到过这张图，但字节始终没传上来"。
+    let ghost = messagenote_core::attachment::sha256_hex(b"this blob was never uploaded");
+    {
+        let conn = a.conn().unwrap();
+        db::append_message(
+            &conn,
+            &format!(
+                "引用了不存在的东西\n\n{}",
+                messagenote_core::attachment::reference(&ghost)
+            ),
+            None,
+        )
+        .unwrap();
+        // 顺手再写一条正常的，用来验证"别的东西照样同步"
+        db::append_message(&conn, "这条必须能同步过去", None).unwrap();
+    }
+
+    sync_once(&a, &api).unwrap();
+
+    // B 同步：取图会失败，但整轮不能失败
+    let rb = sync_once(&b, &api).expect("一张取不到的图不该让整轮同步失败");
+    assert_eq!(rb.blobs_down, 0, "取不到就是取不到，不该算成功");
+    assert!(rb.pulled >= 2, "两条消息都应当拉到");
+
+    let conn = b.conn().unwrap();
+    assert!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM message WHERE body = '这条必须能同步过去'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap()
+            > 0,
+        "**别的内容必须照常同步** —— 这就是这条设计的目的"
+    );
+
+    // 而且失败会被记账，好让它下次排队尾，不堵住后面能下的东西
+    let attempts: i64 = conn
+        .query_row(
+            "SELECT attempts FROM attachment WHERE sha256 = ?1",
+            rusqlite::params![ghost],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(attempts, 1, "失败次数要记下来，否则它会一直占着队首");
+}
+
+/// 失败的条目会沉到队列后面去，不会饿死后面能下的。
+///
+/// 这是 `attempts` 那一列存在的**唯一理由**。没有它，`ORDER BY created_at`
+/// 会让同一个取不到的附件每轮都排在第一个，后面的一律轮不到。
+#[test]
+fn a_repeatedly_failing_attachment_sinks_in_the_queue() {
+    let db = db::open_memory("device-q").unwrap();
+    let conn = db.conn().unwrap();
+
+    let good = messagenote_core::attachment::sha256_hex(b"good");
+    let bad = messagenote_core::attachment::sha256_hex(b"bad");
+
+    // bad 先登记（时间更早），good 后登记
+    db::blob::register_placeholder(&conn, &bad, 100).unwrap();
+    db::blob::register_placeholder(&conn, &good, 200).unwrap();
+
+    assert_eq!(
+        db::pending_downloads(&conn, 1).unwrap(),
+        vec![bad.clone()],
+        "一开始按时间排，先登记的在前"
+    );
+
+    // bad 失败一次之后就该排到后面
+    db::note_download_failure(&conn, &bad).unwrap();
+    assert_eq!(
+        db::pending_downloads(&conn, 1).unwrap(),
+        vec![good],
+        "失败过的必须沉下去，否则它会永远堵住队首"
+    );
+}
+
+/// 下载到本地之后**不能**又被当成"待上传"传回去。
+///
+/// 漏了这一步的话，每台设备都会把从别人那里收到的图再传一遍 ——
+/// 服务端幂等所以不会出错，但每轮同步都在白传几 MB。
+#[test]
+fn a_downloaded_blob_is_not_re_uploaded() {
+    let addr = start_server();
+    let api = api(addr);
+    let a = db::open_memory("device-a").unwrap();
+    let b = db::open_memory("device-b").unwrap();
+
+    let png = fake_png(2048);
+    let sha = {
+        let conn = a.conn().unwrap();
+        let sha = db::save_attachment(&conn, &png).unwrap();
+        db::append_message(
+            &conn,
+            &messagenote_core::attachment::image_markdown(&sha, "图"),
+            None,
+        )
+        .unwrap();
+        sha
+    };
+
+    sync_once(&a, &api).unwrap();
+    sync_once(&b, &api).unwrap();
+    assert!(db::blob::has_blob(&b.conn().unwrap(), &sha).unwrap());
+
+    // B 再同步一轮：什么都传不上去、也取不下来
+    let again = sync_once(&b, &api).unwrap();
+    assert_eq!(again.blobs_up, 0, "从服务端取回来的字节不该再传回去");
+    assert_eq!(again.blobs_down, 0, "已经有了就不该再取一次");
+}

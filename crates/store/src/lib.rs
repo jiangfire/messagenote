@@ -32,10 +32,13 @@
 //! 每个函数一律返回 [`rusqlite::Result`]，由调用方包成自己的错误类型。
 //! 这一层不定义错误，也不需要知道谁在调用它。
 
+pub mod blob;
 pub mod browse;
 pub mod clock;
 pub mod normalize;
 
+// `blob` 刻意**不**扁平转出：它有十来个函数，`blob::get_blob(..)` 比一长串
+// `pub use` 更好读，也不会在将来和 browse 的短名字撞车。
 pub use browse::{
     attach_tags, list_channels, list_messages, list_tags, row_to_message, search, search_page,
     timeline_stats, Cursor, Scope, ScopeParseError, INBOX_ID,
