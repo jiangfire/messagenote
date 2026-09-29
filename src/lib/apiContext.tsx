@@ -2,6 +2,7 @@ import { createContext, useContext, useMemo, type ReactNode } from "react";
 import type {
   Channel,
   Cursor,
+  ExportSummary,
   HealthResponse,
   Message,
   MessagePage,
@@ -121,6 +122,35 @@ export interface DesktopApi {
    * 之后不该再假设自己还在跑。
    */
   installUpdate(): Promise<void>;
+
+  // ------------------------------------------------------------ 导出
+  //
+  // 只做桌面端：导出要往磁盘上写一棵目录树（按频道分目录 + `attachments/`），
+  // 而浏览器里做不到 —— 那边只能下单个文件。这也是"网页端导出"要单独设计的
+  // 原因，不是忘了接。
+
+  /**
+   * 挑一个导出目标目录。用户取消返回 `null`。
+   *
+   * 放在这里而不是让界面直接用插件的 `open()`，是为了让 Tauri 的东西收在
+   * 一个文件里 —— 界面只认这个接口。
+   */
+  pickDirectory(): Promise<string | null>;
+  /**
+   * 把整个库导出到 `dir`，返回摘要。
+   *
+   * `utcOffsetMinutes` 是本地时区相对 UTC 的偏移（**东为正**，东八区 480）。
+   * 传 `-new Date().getTimezoneOffset()`：文件名要的是本地时间，
+   * 而 Rust 侧没有时区库，也不值得为一个文件名引入一个。
+   */
+  exportMarkdown(dir: string, utcOffsetMinutes: number): Promise<ExportSummary>;
+  /**
+   * 把一条记录渲染成 Markdown，给"复制这一条"用。
+   *
+   * 这条已经不在了（被删掉）返回 `null` —— 界面据此说"这条记录已经不在了"，
+   * 而不是把一句数据库错误摔到用户脸上。
+   */
+  renderMessageMarkdown(id: string, utcOffsetMinutes: number): Promise<string | null>;
 }
 
 export interface ApiBundle {

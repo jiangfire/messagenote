@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "dialog",
+  "description": "文件对话框的权限只给主窗口。捕获浮层是个只有一个输入框的置顶小窗，它没有任何理由需要「挑一个目录」的能力 —— 导出是主窗口的动作。和 updater.json 同一个思路：按窗口给最小权限，而不是给插件开一个全局的 default。",
+  "windows": ["main"],
+  "permissions": ["dialog:allow-open"]
+}

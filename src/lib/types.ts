@@ -121,3 +121,17 @@ export interface SyncStatus {
   pulled: number;
   conflicts: number;
 }
+
+/** 一次全量导出的结果摘要。 */
+export interface ExportSummary {
+  messages: number;
+  attachments: number;
+  /**
+   * 正文引用了、但**本地还没有字节**的附件数。
+   *
+   * 这些引用在导出物里原样保留 `attachment:<sha>`。界面**必须**把它说出来
+   * （"有 N 张图本地还没有，没能带出来"），否则用户只会以为导出漏了东西。
+   */
+  missingAttachments: number;
+  channels: number;
+}

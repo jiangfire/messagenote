@@ -161,6 +161,8 @@ pub fn run() {
         // 本来就会拉起新版本，但显式重启让三端行为一致，也省得依赖安装器）。
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        // 导出时选目标目录。权限只给主窗口，见 capabilities/dialog.json。
+        .plugin(tauri_plugin_dialog::init())
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, _shortcut, event| {

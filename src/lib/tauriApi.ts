@@ -1,9 +1,11 @@
 import { listen } from "@tauri-apps/api/event";
+import { invoke } from "@tauri-apps/api/core";
+import { open } from "@tauri-apps/plugin-dialog";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { api as commands } from "./api";
 import type { DesktopApi, NoteApi } from "./apiContext";
-import type { SyncStatus } from "./types";
+import type { ExportSummary, SyncStatus } from "./types";
 
 /** 后台同步线程推上来的状态事件名，与 `sync_worker.rs` 的 `STATUS_EVENT` 一致。 */
 const SYNC_STATUS_EVENT = "sync://status";
@@ -87,6 +89,29 @@ export const tauriDesktop: DesktopApi = {
     await pendingUpdate.downloadAndInstall();
     // Windows 上 NSIS 装完本来也会拉起新版本，但显式重启让行为不依赖安装器。
     await relaunch();
+  },
+
+  // ------------------------------------------------------------ 导出
+
+  async pickDirectory() {
+    const picked = await open({
+      directory: true,
+      multiple: false,
+      title: "导出到哪个目录",
+    });
+    // 用户取消时插件返回 null。类型上还可能是 `string[]`（multiple 的情况），
+    // 这里收窄掉 —— 界面对"没选"和"选了一个"只该有两种反应。
+    return typeof picked === "string" ? picked : null;
+  },
+
+  exportMarkdown(dir, utcOffsetMinutes) {
+    // 参数名是 **camelCase**：Tauri v2 默认把 Rust 那边的 snake_case 转过来，
+    // 写 `utc_offset_minutes` 会得到一个"缺少参数"的报错。
+    return invoke<ExportSummary>("export_markdown", { dir, utcOffsetMinutes });
+  },
+
+  renderMessageMarkdown(id, utcOffsetMinutes) {
+    return invoke<string | null>("render_message_markdown", { id, utcOffsetMinutes });
   },
 };
 

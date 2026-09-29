@@ -383,6 +383,36 @@ export default function App() {
     return { title: undefined, body: undefined };
   }, [view, desktop]);
 
+  /**
+   * 导出全部记录到用户挑的目录。
+   *
+   * **桌面端专有**：导出要往磁盘上写一棵目录树（按频道分目录 + `attachments/`），
+   * 浏览器里做不到。
+   *
+   * 偏移传 `-getTimezoneOffset()`：它返回的是"本地转 UTC 要加多少分钟"，
+   * 取负才是"东为正"的口径，也正是 Rust 那边要的。
+   */
+  async function exportAll() {
+    if (!desktop) return;
+    const dir = await desktop.pickDirectory();
+    if (!dir) return; // 用户取消 —— 不该弹一句"导出失败"
+    try {
+      const s = await desktop.exportMarkdown(dir, -new Date().getTimezoneOffset());
+      // **取不到的附件必须说出来。** 不说的话用户只会以为导出漏了东西 ——
+      // 而导出物里那条 `attachment:<sha>` 他看不懂是什么意思。
+      const missed = s.missingAttachments
+        ? `\n\n注意：有 ${s.missingAttachments} 个附件本地还没有字节，没有带出来` +
+          `（正文里仍是 attachment: 引用）。等同步把它们拿下来再导一次即可。`
+        : "";
+      window.alert(
+        `导出完成：\n\n${s.messages} 条记录\n${s.attachments} 个附件\n` +
+          `${s.channels} 个频道目录\n\n位置：${dir}${missed}`
+      );
+    } catch (e) {
+      window.alert(`导出失败：${errorText(e)}`);
+    }
+  }
+
   return (
     <div className="app">
       <Sidebar
@@ -396,6 +426,7 @@ export default function App() {
         }}
         onCreateChannel={(name) => void run(() => api.createChannel(name))}
         onDeleteChannel={(id) => void run(() => api.deleteChannel(id))}
+        onExport={desktop ? () => void exportAll() : undefined}
       />
 
       <main className="main">

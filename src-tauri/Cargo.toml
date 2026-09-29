@@ -31,6 +31,11 @@ tauri-plugin-global-shortcut = "2"
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
 
+# 导出时选目标目录。Tauri v2 没有内置的文件对话框，标准做法就是这个插件。
+# 权限只给主窗口（见 capabilities/dialog.json）—— 捕获浮层是个只有一个输入框的
+# 小窗，它没有任何理由需要"挑一个目录"的能力。
+tauri-plugin-dialog = "2"
+
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
