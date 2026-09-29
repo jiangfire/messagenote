@@ -50,6 +50,10 @@ pub fn delete_channel(db: State<'_, Db>, id: String) -> AppResult<()> {
 ///
 /// `since`（epoch 毫秒，含端点）是时间范围筛选：「今天 / 近 7 天」这些档位
 /// 在前端折算成一个绝对时刻，命令层不解释它。
+///
+/// 参数多是**有意的**：这一层是薄转发，签名与 IPC 线协议 1:1 对应，
+/// 收拢成结构体反而多出一层反序列化、还要动两端的调用方式。
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub fn list_timeline(
     db: State<'_, Db>,
