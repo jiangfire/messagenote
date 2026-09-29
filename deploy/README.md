@@ -76,11 +76,15 @@ compose 里那个 Caddy 只说 HTTP。公网部署有两条路：
 
 ### 镜像的可见性
 
-镜像发在 GHCR（`ghcr.io/jiangfire/messagenote-server` / `-web`）。
-GHCR 的包**默认是私有的**，即使仓库是公开的。要让别人能直接 `docker pull`，
-去 GitHub 的包设置里把可见性改成 public：
+镜像发在 GHCR：`ghcr.io/jiangfire/messagenote-server` 和 `ghcr.io/jiangfire/messagenote-web`，
+每个都有 `latest` 和一个版本号 tag。
 
+**公开仓库推上去的包是可以匿名拉取的。** 实测过：不带任何凭据能读到 tag 列表，
+所以 `docker pull` 直接能用，不需要先登录 GHCR。
+
+（GHCR 确实有一类包是默认私有的，但那不是这种情况。真的拉不动时再去
 `https://github.com/users/jiangfire/packages/container/messagenote-server/settings`
+改可见性。）
 
 不想用预构建镜像的话，把 `docker-compose.yml` 里的 `build:` 注释打开即可 ——
 两个 Dockerfile 都支持从源码构建。
