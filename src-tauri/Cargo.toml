@@ -36,6 +36,10 @@ tauri-plugin-process = "2"
 # 小窗，它没有任何理由需要"挑一个目录"的能力。
 tauri-plugin-dialog = "2"
 
+# 单条复制时把图片内联成 data URI。手写 base64 是纯风险（漏了填充、算错 6 位组
+# 都不会报错，只会得到一张画不出来的图），而它本来就在依赖树里（0.22.1）。
+base64 = "0.22"
+
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
