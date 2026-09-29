@@ -730,6 +730,24 @@ fn try_get(addr: SocketAddr, path: &str, bearer_val: Option<&str>) -> (u16, serd
     }
 }
 
+/// 只取状态码，**绝不读 body**。
+///
+/// `/api/events` 的 body 是一条故意永不结束的 SSE 流，而且**空闲时一个字节都不发**
+/// （要等 15 秒的心跳注释）。`try_get` 走的 `read_json()` 是**流式**解析 —— 它得有
+/// 字节才能失败，于是一个本来 1 毫秒的请求会白白花掉整整一个心跳间隔。
+/// 详见 `read_one_sse_block` 上面那段。
+fn status_only(addr: SocketAddr, path: &str, bearer_val: Option<&str>) -> u16 {
+    let mut req = ureq::get(&format!("http://{addr}{path}"));
+    if let Some(b) = bearer_val {
+        req = req.header("Authorization", &format!("Bearer {b}"));
+    }
+    match req.call() {
+        Ok(r) => r.status().as_u16(),
+        Err(ureq::Error::StatusCode(c)) => c,
+        Err(e) => panic!("GET {path} 出错：{e}"),
+    }
+}
+
 /// 用长期令牌登录，返回 (HTTP 状态码, JSON)。
 fn login(addr: SocketAddr, token: &str) -> (u16, serde_json::Value) {
     match ureq::post(&format!("http://{addr}/api/session"))
@@ -829,18 +847,25 @@ fn logging_out_revokes_the_session_immediately() {
 fn the_long_lived_token_still_works_directly() {
     let addr = start_server();
 
-    for path in [
-        "/api/channels",
-        "/api/timeline/stats",
-        "/api/tags",
-        "/api/events",
-    ] {
+    for path in ["/api/channels", "/api/timeline/stats", "/api/tags"] {
         assert_eq!(
             try_get(addr, path, Some(TOKEN)).0,
             200,
             "{path} 应当接受长期令牌"
         );
     }
+
+    // `/api/events` 单独走状态码那条路：它的 body 永不结束，读它的人会卡住。
+    assert_eq!(
+        status_only(addr, "/api/events", Some(TOKEN)),
+        200,
+        "/api/events 应当接受长期令牌"
+    );
+    assert_eq!(
+        status_only(addr, "/api/events", None),
+        401,
+        "/api/events 也必须在鉴权后面 —— 没带凭据时中间件在进 SSE 之前就回绝"
+    );
 
     // 同步端点也一样
     let api = api(addr);
@@ -1462,17 +1487,30 @@ fn a_malformed_client_id_is_a_400_not_a_silent_new_id() {
 /// 用带显式 `timeout_recv_body` 的独立 agent：SSE 永远不会结束，
 /// 万一事件没等到，至少会在这个窗口之后报错而不是无限挂住。
 ///
-/// ## 一个还没查清的开销（留个记号，别让下一个人重新发现一遍）
+/// ## 那个「多花一个心跳间隔」的开销：已查清（2026-09）
 ///
-/// 只要这两个 SSE 测试在，**整个测试二进制要多花一个心跳间隔才退出**：
-/// 心跳 15 秒时套件 15.1 秒，改成 2 秒就变成 2.08 秒（实测过，很确定）。
-/// 也就是说有东西在等这条连接的下一个心跳字节。
+/// 这里原先记着一条猜测 —— "只要这两个 SSE 测试在，整个测试二进制就要多花一个
+/// 心跳间隔（15 秒）才退出"，并排除了"测试本身慢"和"`ureq` 全局 agent 留连接"。
+/// **猜测是错的**：把这两条测试整个 `--skip` 掉，二进制仍然是 15.12 秒。
 ///
-/// 已经排除的：
-/// - 不是这两条测试本身慢 —— 只跑它们两个只要 0.31 秒。
-/// - 不是 `ureq` 的全局默认 agent 把连接留在池里 —— 换成独立 agent 没变化。
+/// 真正的来源是 `the_long_lived_token_still_works_directly`：它把 `/api/events`
+/// 和另外三个 JSON 端点一起放进 `try_get`，而 `try_get` 会 `read_json()`。
+/// `read_json()` 是**流式**解析 —— 它得有字节才能失败，而这条 SSE 流在空闲时
+/// **一个字节都不发**，要等 15 秒的心跳注释才吐出第一个 `:`，于是解析器到那才
+/// 报 `expected value`，又被 `unwrap_or(Null)` 吞掉。实测三段耗时：
 ///
-/// 影响有限（CI 总共约 6 分钟），但没查到底，所以写在这里而不是假装没看见。
+/// ```text
+/// /api/channels        2.1ms
+/// /api/timeline/stats  1.0ms
+/// /api/tags            1.2ms
+/// /api/events          响应头 0.95ms  →  body 15.0102s（Err: expected value:1:1）
+/// ```
+///
+/// 这也解释了当初那个"改心跳就跟着变"的观察：延迟严格等于 `KEEPALIVE_INTERVAL`，
+/// 因为那正是第一个字节到达的时刻。修法是 `status_only()` —— 对这个端点只看状态码。
+///
+/// 教训：**"读整个 body"这个动作不能用在一条故意不结束的流上**，而它失败的方式
+/// 是"慢 15 秒且测试通过"，不是报错。
 fn read_one_sse_block(addr: SocketAddr) -> Vec<String> {
     let agent = ureq::Agent::new_with_config(
         ureq::Agent::config_builder()
