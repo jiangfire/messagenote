@@ -9,6 +9,14 @@ import type { SyncStatus } from "./types";
 const SYNC_STATUS_EVENT = "sync://status";
 
 /**
+ * 同步**往本地带了新数据**的事件名，与 `sync_worker.rs` 的 `CHANGED_EVENT` 一致。
+ *
+ * 注意它和上面那个状态事件是两件事：状态每轮都发，这个只在真的拉到了东西
+ * （或留下了冲突副本）时才发。
+ */
+const SYNC_CHANGED_EVENT = "sync://changed";
+
+/**
  * 已经查到、但还没装的那个更新。
  *
  * 为什么留在这里而不是交给界面拿着：`Update` 是插件的一个**句柄**
@@ -81,3 +89,31 @@ export const tauriDesktop: DesktopApi = {
     await relaunch();
   },
 };
+
+/**
+ * 桌面端的「别的地方改了数据，去重取一次」。
+ *
+ * 网页端靠它自己那条 SSE 实现（`web/sse.ts`），桌面端靠这个：Rust 侧的 SSE 线程
+ * 唤醒同步线程，**等变更真的落库之后**再往界面发一个事件。所以界面重取时数据
+ * 一定已经在库里了 —— 不存在"重取早了、然后就没有下一次通知"的竞态。
+ *
+ * 少了它，界面会**永远不刷新**。这不是理论：2026-09 实机验证时，远端变更
+ * 0.28 秒就进了本地库，而时间线上 70 秒都没出现，手动重载才看见。
+ * 那条路径只有实机才暴露 —— `cargo test` 验的是 Rust 侧的库，
+ * 浏览器 E2E 跑的是网页端（那边这个钩子是有的）。
+ */
+export function tauriSubscribeChanges(handler: () => void): () => void {
+  let unlisten: (() => void) | null = null;
+  let cancelled = false;
+
+  void listen(SYNC_CHANGED_EVENT, () => handler()).then((un) => {
+    // 和 onSyncStatus 同一个坑：组件可能在 listen 完成**之前**就卸载了。
+    if (cancelled) un();
+    else unlisten = un;
+  });
+
+  return () => {
+    cancelled = true;
+    unlisten?.();
+  };
+}

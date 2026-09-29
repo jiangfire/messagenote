@@ -29,6 +29,17 @@ const INTERVAL: Duration = Duration::from_secs(45);
 /// 同步状态事件名，前端监听它来显示状态。
 pub const STATUS_EVENT: &str = "sync://status";
 
+/// 本地数据被这一轮同步改动的事件名，前端监听它来"重取一次"。
+///
+/// **它和 `STATUS_EVENT` 是两件事，不能合并。** 状态每轮都发（界面要一直显示
+/// "上次同步成功/失败"），而这个只在**真的往本地带了新东西**时才发。
+/// 合并的话，每 45 秒的轮询兜底都会让界面白重取一次 —— 而时间线是**维护滚动
+/// 位置**的，无谓重取会打扰正在往回翻的人。
+///
+/// 对应网页端的 `subscribeChanges`（`src/web/sse.ts`），语义完全一致：
+/// 别的地方改了数据，去重取一次。
+pub const CHANGED_EVENT: &str = "sync://changed";
+
 #[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncStatus {
@@ -49,6 +60,18 @@ impl SyncStatus {
             conflicts: 0,
         }
     }
+}
+
+/// 这一轮同步有没有往**本地库**里带进新东西（界面需要重取）。
+///
+/// 只有这两个计数会改变界面看到的内容：
+///
+/// - `pulled`：对端推上来的变更落地了。
+/// - `conflicts`：推送被判负时会在本地**新建一条冲突副本**，那也是一条新记录。
+///
+/// `pushed` 刻意不算：那些改动本来就是本地产生的，界面早就显示过了。
+fn brought_local_changes(s: &SyncStatus) -> bool {
+    s.ok && (s.pulled > 0 || s.conflicts > 0)
 }
 
 pub struct SyncWorker {
@@ -100,7 +123,15 @@ pub fn spawn(app: AppHandle) {
             }
         }
         // 失败不该弹窗打断用户 —— 笔记应用里同步失败通常只是"现在没网"
-        let _ = app.emit(STATUS_EVENT, status);
+        let _ = app.emit(STATUS_EVENT, status.clone());
+
+        // **必须在落库之后发。** 界面收到就会立刻重取，而这一刻数据已经进库了。
+        // 反过来放在 `sse.rs` 的 `wake()` 那一侧会有一个竞态：界面重取时拉取还没
+        // 完成，它拿到的还是旧数据，而**不会再有下一次通知** —— 表现就是
+        // "远端记的一条，电脑上死活不出现"。
+        if brought_local_changes(&status) {
+            let _ = app.emit(CHANGED_EVENT, ());
+        }
 
         match rx.recv_timeout(INTERVAL) {
             Ok(()) | Err(RecvTimeoutError::Timeout) => {}
@@ -165,6 +196,38 @@ mod tests {
     use messagenote_server::{AppState, Store};
 
     const TOKEN: &str = "worker-test-token-0123456789abcdefghijklmn";
+
+    /// 界面只在**本地真的多了东西**时才重取。
+    ///
+    /// 这条守的是那个"看着无所谓、实则打扰用户"的分支：每轮都让界面重取一次，
+    /// 时间线的滚动位置每 45 秒就被重新维护一次，正在往回翻记录的人会被反复打断。
+    ///
+    /// 反向验证过：把 `pushed > 0` 也算进"有变化"，第二条断言立刻红。
+    #[test]
+    fn only_pulled_or_conflicts_ask_the_ui_to_refetch() {
+        let s = |ok: bool, pushed: usize, pulled: usize, conflicts: usize| SyncStatus {
+            ok,
+            message: String::new(),
+            pushed,
+            pulled,
+            conflicts,
+        };
+
+        assert!(!brought_local_changes(&s(true, 0, 0, 0)), "什么都没变");
+        assert!(
+            !brought_local_changes(&s(true, 3, 0, 0)),
+            "只是把本地的东西推上去 —— 界面早就显示过了，不该重取"
+        );
+        assert!(brought_local_changes(&s(true, 0, 1, 0)), "拉到东西了要重取");
+        assert!(
+            brought_local_changes(&s(true, 0, 0, 1)),
+            "推送被判负时会在本地新建冲突副本，那也是一条新记录"
+        );
+        assert!(
+            !brought_local_changes(&s(false, 0, 5, 0)),
+            "失败就别打扰界面"
+        );
+    }
 
     /// 在专用线程 + 专用 tokio runtime 上跑一个真实服务端，绑临时端口。
     ///
