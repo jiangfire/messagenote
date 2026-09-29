@@ -2,6 +2,7 @@ import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "re
 import type { Channel, Message } from "../lib/types";
 import { dayKey, formatDayLabel, formatTime } from "../lib/format";
 import { Markdown } from "./Markdown";
+import { useApi } from "../lib/apiContext";
 
 interface Props {
   messages: Message[];
@@ -199,6 +200,35 @@ interface RowProps {
 }
 
 function MessageRow({ message, channels, label, onEdit, onDelete, onMove, onTags }: RowProps) {
+  const { desktop } = useApi();
+
+  /**
+   * 复制这一条。
+   *
+   * 桌面端复制的是**渲染过的 Markdown**（带 front-matter 的频道/标签/时间），
+   * 和全量导出**走同一个渲染器** —— 各写一份的话，同一段内容会变成两种样子。
+   *
+   * 附件带不走（剪贴板里放不了文件），所以正文里仍是 `attachment:<sha>`。
+   * 失败时退回复制原文：那仍然是这条笔记的文字，丢的只是外挂的元信息，
+   * 比让"复制"这个动作什么都没发生要好。
+   */
+  async function copyMarkdown() {
+    if (!desktop) {
+      await navigator.clipboard.writeText(message.body);
+      return;
+    }
+    try {
+      const md = await desktop.renderMessageMarkdown(
+        message.id,
+        -new Date().getTimezoneOffset()
+      );
+      // null = 这条已经不在了（在别处被删掉）。退回原文比什么都不做强。
+      await navigator.clipboard.writeText(md ?? message.body);
+    } catch {
+      await navigator.clipboard.writeText(message.body);
+    }
+  }
+
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(message.body);
   const [tagging, setTagging] = useState(false);
@@ -350,8 +380,8 @@ function MessageRow({ message, channels, label, onEdit, onDelete, onMove, onTags
         </button>
         <button
           className="icon-btn"
-          title="复制原文"
-          onClick={() => void navigator.clipboard.writeText(message.body)}
+          title={desktop ? "复制成 Markdown（带频道/标签/时间）" : "复制原文"}
+          onClick={() => void copyMarkdown()}
         >
           ⧉
         </button>
