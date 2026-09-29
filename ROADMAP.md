@@ -27,7 +27,7 @@
 （见 `sync_worker::SyncWorker::last` 的注释）。
 
 验证：`MESSAGENOTE_TEST_WARNING` 环境变量可以注入一条假警告（正常使用不会设），
-配合 `.scratch/capture.ps1` 截桌面窗口，确认警告条真的显示出来。
+配合 `scripts/desktop-verify/capture.ps1` 截桌面窗口，确认警告条真的显示出来。
 
 ### 2. 检索结果不分页 ✅
 
@@ -70,8 +70,8 @@ UI 上的选择：检索的"加载更多"是**底部的一个明确按钮**，�
 - `connect-src 'self' ipc: http://ipc.localhost`：Tauri 的 IPC。
 
 验证方式是**看**，不是看配置：截主窗口（数据加载出来了，说明 IPC 通）
-和捕获浮层（`setSize` 的 IPC 也通）。`.scratch/capture.ps1` 和
-`.scratch/shot-overlay-live.ps1` 就是干这个的。
+和捕获浮层（`setSize` 的 IPC 也通）。`scripts/desktop-verify/capture.ps1` 和
+`scripts/desktop-verify/shot-overlay-live.ps1` 就是干这个的。
 
 ### 4. 服务端不校验引用完整性 ✅
 

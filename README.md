@@ -61,6 +61,7 @@ cargo test --workspace                 # Rust：内核 / 存储 / 服务端 / �
 pnpm build                             # 前端：类型检查 + 打包
 node scripts/check-web-bundle.mjs dist # 网页端 bundle 里不能混进 Tauri
 pwsh scripts/web-e2e/run.ps1           # 真实浏览器端到端（需先 pnpm build + 编服务端）
+node scripts/desktop-verify/copy-verify.mjs   # 桌面端实机验证，详见 desktop-verify/README.md
 ```
 
 CI（[`.github/workflows/ci.yml`](.github/workflows/ci.yml)）跑的就是这些。

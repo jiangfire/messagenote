@@ -33,5 +33,9 @@ scripts/web-e2e/shots/
 Thumbs.db
 *.log
 
+# Python 字节码（scripts/desktop-verify/ 里有几个 .py）
+__pycache__/
+*.pyc
+
 # tauri-build 每次构建都会重新生成的 capability schema
 src-tauri/gen/
