@@ -106,11 +106,18 @@ impl Cursor {
     }
 }
 
+/// 时间范围筛选。
+///
+/// `since` 之前的参数管"看哪个范围"（哪个频道、哪个标签），`since` 管"看哪一段
+/// 时间"—— 两者正交，所以是并列的可选参数而不是塞进 [`Scope`] 里。
+/// 界面上的「今天 / 近 7 天 / 近 30 天」在**客户端**折算成一个绝对的 epoch 毫秒，
+/// 服务端因此不必知道任何时区约定。
 pub fn list_messages(
     conn: &Connection,
     scope: Scope<'_>,
     limit: i64,
     before: Option<&Cursor>,
+    since: Option<i64>,
 ) -> rusqlite::Result<MessagePage> {
     let limit = limit.clamp(1, 500);
 
@@ -143,6 +150,12 @@ pub fn list_messages(
             );
             args.push(Box::new(name.to_string()));
         }
+    }
+
+    if let Some(since) = since {
+        // 含端点：今天的记录要包含今天 00:00:00.000 整写下的那条
+        sql.push_str(" AND m.created_at >= ?");
+        args.push(Box::new(since));
     }
 
     if let Some(c) = before {

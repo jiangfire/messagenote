@@ -135,6 +135,11 @@ pub struct TimelineQuery {
     pub before_created_at: Option<i64>,
     #[serde(default)]
     pub before_id: Option<String>,
+    /// 只要这个时刻**及之后**的记录（epoch 毫秒，含端点）。
+    /// 界面上的「今天 / 近 7 天 / 近 30 天」在客户端折算成这个绝对时刻，
+    /// 服务端因此不必知道任何时区约定。
+    #[serde(default)]
+    pub since: Option<i64>,
 }
 
 /// `GET /api/search` 的查询参数。

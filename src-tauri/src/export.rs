@@ -235,7 +235,7 @@ fn all_messages(conn: &Connection) -> AppResult<Vec<Message>> {
     let mut out: Vec<Message> = Vec::new();
     let mut before: Option<db::Cursor> = None;
     loop {
-        let page = db::list_messages(conn, db::Scope::All, PAGE, before.as_ref())?;
+        let page = db::list_messages(conn, db::Scope::All, PAGE, before.as_ref(), None)?;
         if page.items.is_empty() {
             break;
         }

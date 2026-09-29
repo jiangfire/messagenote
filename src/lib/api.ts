@@ -42,13 +42,15 @@ export const api = {
     scope: "all" | "unfiled" | "channel" | "tag",
     target: { channelId?: string; tag?: string },
     limit?: number,
-    before?: Cursor | null
+    before?: Cursor | null,
+    since?: number | null
   ) =>
     invoke<MessagePage>("list_timeline", {
       scope,
       channelId: target.channelId ?? null,
       tag: target.tag ?? null,
       limit: limit ?? null,
+      since: since ?? null,
       beforeCreatedAt: before?.createdAt ?? null,
       beforeId: before?.id ?? null,
     }),

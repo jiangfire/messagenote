@@ -96,11 +96,13 @@ export function httpApi(opts: HttpApiOptions): NoteApi {
       req("PATCH", `/api/channel/${encodeURIComponent(id)}`, { name }),
     deleteChannel: (id) => req("DELETE", `/api/channel/${encodeURIComponent(id)}`),
 
-    listTimeline: (scope, target, limit, before) => {
+    listTimeline: (scope, target, limit, before, since) => {
       const p = new URLSearchParams({ scope });
       if (target.channelId) p.set("channelId", target.channelId);
       if (target.tag) p.set("tag", target.tag);
       if (limit != null) p.set("limit", String(limit));
+      // 时间范围筛选：客户端折算好的绝对时刻（epoch 毫秒），服务端不解释它
+      if (since != null) p.set("since", String(since));
       // 游标两个字段必须一起给。只给时间戳等于退回单键游标，
       // 同一毫秒内的多条会被整批跳过，往前翻就凭空少一段。
       if (before) {

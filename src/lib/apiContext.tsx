@@ -33,12 +33,16 @@ export interface NoteApi {
   /**
    * 时间线查询。`before` 是**往前翻**的游标，两个字段必须一起给：
    * 只给时间戳会在同一毫秒内的多条消息处漏掉整批记录，而且不报错。
+   *
+   * `since`（epoch 毫秒，含端点）是时间范围筛选：筛选条上的「今天 / 近 7 天」
+   * 档位在这里折算成一个绝对时刻，两种实现（Tauri / HTTP）都不解释它。
    */
   listTimeline(
     scope: "all" | "unfiled" | "channel" | "tag",
     target: { channelId?: string; tag?: string },
     limit?: number,
-    before?: Cursor | null
+    before?: Cursor | null,
+    since?: number | null
   ): Promise<MessagePage>;
   timelineStats(): Promise<TimelineStats>;
 

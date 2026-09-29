@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { errorText } from "./lib/errors";
 import { useApi, type NoteApi } from "./lib/apiContext";
 import type {
@@ -24,21 +24,86 @@ const SEARCH_DEBOUNCE_MS = 160;
 const SEARCH_PAGE_SIZE = 60;
 
 /**
+ * 时间范围筛选的档位。
+ *
+ * 界面上只有这几档，不提供自由选日期 —— 档位回答的是"我最近记了什么"，
+ * 这才是时间筛选的主要用途；"查某个具体日子"是检索的活。
+ */
+type TimeFilter = "all" | "today" | "7d" | "30d";
+
+const TIME_FILTERS: TimeFilter[] = ["all", "today", "7d", "30d"];
+
+const TIME_FILTER_LABEL: Record<TimeFilter, string> = {
+  all: "不限",
+  today: "今天",
+  "7d": "近 7 天",
+  "30d": "近 30 天",
+};
+
+/**
+ * 档位折算成 `since`（绝对 epoch 毫秒，含端点）。
+ *
+ * 在**客户端**折算而不是传"7d"让后端算：后端不必知道任何时区约定，
+ * 「今天」这种和本地日历相关的概念本来也只有客户端说得清。
+ */
+function sinceMsOf(f: TimeFilter): number | null {
+  switch (f) {
+    case "all":
+      return null;
+    case "today": {
+      const now = new Date();
+      return new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+    }
+    case "7d":
+      return Date.now() - 7 * 86_400_000;
+    case "30d":
+      return Date.now() - 30 * 86_400_000;
+  }
+}
+
+/**
  * 把视图映射成时间线的 scope 参数。
  *
  * `api` 从外面传进来而不是从模块里 import：这个应用要同时跑在桌面端（Tauri
  * invoke）和网页端（HTTP）上，数据从哪儿来只有注入点知道。
  */
-function fetchPage(api: NoteApi, v: View, limit: number, before: Cursor | null) {
+function fetchPage(
+  api: NoteApi,
+  v: View,
+  limit: number,
+  before: Cursor | null,
+  since: number | null
+) {
   switch (v.type) {
     case "timeline":
       // 时间线是主视图；"未归档"只是它上方的一个筛选，不是另一个导航项
-      return api.listTimeline(v.unfiledOnly ? "unfiled" : "all", {}, limit, before);
+      return api.listTimeline(v.unfiledOnly ? "unfiled" : "all", {}, limit, before, since);
     case "channel":
-      return api.listTimeline("channel", { channelId: v.id }, limit, before);
+      return api.listTimeline("channel", { channelId: v.id }, limit, before, since);
     case "tag":
-      return api.listTimeline("tag", { tag: v.name }, limit, before);
+      return api.listTimeline("tag", { tag: v.name }, limit, before, since);
   }
+}
+
+// ---------------- 字号 ----------------
+
+const FONT_SCALE_KEY = "messagenote.fontScale";
+
+/**
+ * 字号档位。所有 font-size 都用 rem 表达，所以缩放 html 的根字号
+ * （`--font-scale`，见 styles.css）一处生效、全局跟随。
+ */
+const FONT_SCALES = [
+  { value: 0.85, label: "小" },
+  { value: 1, label: "标准" },
+  { value: 1.15, label: "大" },
+  { value: 1.3, label: "特大" },
+];
+
+/** 读不出来的（没存过、存了非法值）一律回标准档。 */
+function loadFontScale(): number {
+  const raw = Number(localStorage.getItem(FONT_SCALE_KEY));
+  return FONT_SCALES.some((s) => s.value === raw) ? raw : 1;
 }
 
 export default function App() {
@@ -50,6 +115,10 @@ export default function App() {
   const [channels, setChannels] = useState<Channel[]>([]);
   const [tags, setTags] = useState<TagCount[]>([]);
   const [view, setView] = useState<View>({ type: "timeline", unfiledOnly: false });
+  /** 时间范围筛选。只在时间线上出现（频道/标签有自己的归属语境，不吃这个筛选）。 */
+  const [timeFilter, setTimeFilter] = useState<TimeFilter>("all");
+  /** 整体字号档位。落 localStorage，两端（桌面/网页）各存各的。 */
+  const [fontScale, setFontScale] = useState(loadFontScale);
   const [messages, setMessages] = useState<Message[]>([]);
   const [hasMore, setHasMore] = useState(false);
   const [loadingOlder, setLoadingOlder] = useState(false);
@@ -108,7 +177,9 @@ export default function App() {
       // 列表会立刻缩回最近 200 条，滚动位置也跟着跳 ——
       // 编辑一条不该让你丢掉正在看的那段历史。
       const limit = Math.max(PAGE_SIZE, loadedCount.current);
-      const page = await fetchPage(api, v, limit, null);
+      // 时间筛选是时间线的属性：频道/标签视图不筛（和筛选条只在时间线出现保持一致）
+      const since = v.type === "timeline" ? sinceMsOf(timeFilterRef.current) : null;
+      const page = await fetchPage(api, v, limit, null, since);
       // 后端按时间倒序返回（便于分页），界面按正序渲染
       setMessages([...page.items].reverse());
       setHasMore(page.hasMore);
@@ -130,7 +201,9 @@ export default function App() {
     setLoadingOlder(true);
     try {
       const cursor = { createdAt: oldest.createdAt, id: oldest.id };
-      const page = await fetchPage(api, view, PAGE_SIZE, cursor);
+      // 同 loadMessages：时间筛选只作用于时间线视图
+      const since = view.type === "timeline" ? sinceMsOf(timeFilterRef.current) : null;
+      const page = await fetchPage(api, view, PAGE_SIZE, cursor, since);
       // 追加到**前面**：时间线是正序渲染的
       setMessages((prev) => [...[...page.items].reverse(), ...prev]);
       setHasMore(page.hasMore);
@@ -163,6 +236,12 @@ export default function App() {
     viewRef.current = view;
   }, [view]);
 
+  /** 同 viewRef 的理由：SSE 推送触发的重取也用得到当前档位，但不该进依赖。 */
+  const timeFilterRef = useRef(timeFilter);
+  useEffect(() => {
+    timeFilterRef.current = timeFilter;
+  }, [timeFilter]);
+
   /**
    * 服务端说"有东西变了"就重取一次。
    *
@@ -185,9 +264,13 @@ export default function App() {
 
   useEffect(() => {
     void refresh(view);
-    // 切换视图时把焦点交还输入框：用户的下一个动作几乎总是"写"
+  }, [view, timeFilter, refresh]);
+
+  // 切换视图时把焦点交还输入框：用户的下一个动作几乎总是"写"。
+  // 换时间档位不算换视图，不打断输入。
+  useEffect(() => {
     setFocusSignal((n) => n + 1);
-  }, [view, refresh]);
+  }, [view]);
 
   // 检索：防抖，且为空时立刻退回普通视图
   useEffect(() => {
@@ -252,10 +335,11 @@ export default function App() {
     try {
       setBusy(true);
       setError(null);
-      // 捕获永远落到默认落点，不做任何去向决策 ——
-      // 这是整个产品"零摩擦"那一半的落点。
-      // 消息落下来时还没有标签，所以它会出现在收件箱里等着整理。
-      await api.appendMessage(body, null);
+      // 去向跟随当前视图：在频道里发就进频道（targetLabel 已经把这件事
+      // 告诉用户了，说一套做一套最伤信任）；其余视图落收件箱等着整理。
+      // 捕获浮层那条零摩擦路径不受影响，依旧永远落收件箱。
+      const channelId = view.type === "channel" ? view.id : null;
+      await api.appendMessage(body, channelId);
       setDraft("");
       setFocusSignal((n) => n + 1);
       await refresh(view);
@@ -265,6 +349,15 @@ export default function App() {
       setBusy(false);
     }
   }
+
+  // 字号档位：写到根元素的 CSS 变量上（styles.css 里 html 的 font-size
+  // 用它计算），所有 rem 表达的字号一起缩放；顺手持久化。
+  // 用 layout effect：在首次绘制**之前**写好变量，存过非默认档位的用户
+  // 不会看到一帧标准字号然后跳一下。
+  useLayoutEffect(() => {
+    document.documentElement.style.setProperty("--font-scale", String(fontScale));
+    localStorage.setItem(FONT_SCALE_KEY, String(fontScale));
+  }, [fontScale]);
 
   // 全局快捷键是 Rust 侧注册的；这里只处理窗口内的 Esc
   useEffect(() => {
@@ -316,28 +409,44 @@ export default function App() {
       });
   }, [desktop]);
 
-  // 捕获永远落收件箱：按快捷键、打字、回车，没有"去哪儿"这一步。
-  const targetLabel = "📥 收件箱";
-
   const channelNameOf = useCallback(
     (id: string) => channels.find((c) => c.id === id)?.name ?? "未知频道",
     [channels]
   );
 
+  // 输入框的去向**跟随当前视图**：在哪个频道里，就写进哪个频道。
+  // 「捕获不做决策」说的是全局快捷键唤起的捕获浮层 —— 那条零摩擦路径
+  // 依旧永远落收件箱（见 capture/CaptureApp.tsx），两条路径互不绑架。
+  // 时间线/标签视图没有归属语境，落收件箱等着整理。
+  const targetLabel = view.type === "channel" ? `#${channelNameOf(view.id)}` : "📥 收件箱";
+
   const title = useMemo(() => {
     if (results !== null) return `检索「${query.trim()}」`;
+    const timeSuffix = timeFilter === "all" ? "" : ` · ${TIME_FILTER_LABEL[timeFilter]}`;
     switch (view.type) {
       case "timeline":
-        return view.unfiledOnly ? "时间线 · 未归档" : "时间线";
+        return (view.unfiledOnly ? "时间线 · 未归档" : "时间线") + timeSuffix;
       case "channel":
         return `#${channelNameOf(view.id)}`;
       case "tag":
         return `#${view.name}`;
     }
-  }, [view, results, query, channelNameOf]);
+  }, [view, results, query, timeFilter, channelNameOf]);
 
   /** 「空」在不同视图里含义完全不同，文案也得跟着变。 */
   const emptyCopy = useMemo(() => {
+    // 时间档位筛出来的空必须先说：不然用户明明有记录，
+    // 界面却告诉他"这里还是空的"，他会以为数据丢了。
+    if (view.type === "timeline" && timeFilter !== "all") {
+      return {
+        title: `${TIME_FILTER_LABEL[timeFilter]}还没有记录`,
+        body: (
+          <>
+            <p className="muted">换个更长的时间档位，或把时间筛选切回「不限」。</p>
+          </>
+        ),
+      };
+    }
     if (view.type === "channel") {
       return {
         title: "这个频道还是空的",
@@ -381,7 +490,7 @@ export default function App() {
       };
     }
     return { title: undefined, body: undefined };
-  }, [view, desktop]);
+  }, [view, timeFilter, desktop]);
 
   /**
    * 导出全部记录到用户挑的目录。
@@ -439,6 +548,20 @@ export default function App() {
               onOpen={() => setSettingsOpen(true)}
             />
           )}
+          {/* 字号档位。放在检索框边上：都是"看"的调节，不和写入路径抢位置。 */}
+          <select
+            className="font-select"
+            value={fontScale}
+            title="界面字号"
+            aria-label="界面字号"
+            onChange={(e) => setFontScale(Number(e.target.value))}
+          >
+            {FONT_SCALES.map((s) => (
+              <option key={s.value} value={s.value}>
+                字号：{s.label}
+              </option>
+            ))}
+          </select>
           <div className="search-wrap">
             <input
               ref={searchRef}
@@ -473,7 +596,8 @@ export default function App() {
 
         {/* 筛选条只在时间线上出现。
             把"未归档"放在这里而不是侧边栏，是为了让它明确是**时间线的一个筛选**，
-            而不是和时间线平级的第二个视图 —— 上一版那两个并列项几乎一模一样。 */}
+            而不是和时间线平级的第二个视图 —— 上一版那两个并列项几乎一模一样。
+            时间档位同理：它筛的是"看哪一段"，和"看哪个范围"（全部/未归档）正交。 */}
         {view.type === "timeline" && results === null && (
           <div className="filter-bar">
             <button
@@ -489,6 +613,17 @@ export default function App() {
             >
               未归档 <span className="tag-count">{stats.unfiled}</span>
             </button>
+            <span className="filter-divider" aria-hidden="true" />
+            <span className="filter-label">时间</span>
+            {TIME_FILTERS.map((f) => (
+              <button
+                key={f}
+                className={`filter-chip ${timeFilter === f ? "active" : ""}`}
+                onClick={() => setTimeFilter(f)}
+              >
+                {TIME_FILTER_LABEL[f]}
+              </button>
+            ))}
           </div>
         )}
 

@@ -31,6 +31,12 @@ export interface PendingCapture {
   body: string;
   /** 入队时刻，用来按顺序重放 —— 顺序反了，时间线上看起来就是乱的。 */
   createdAt: number;
+  /**
+   * 入队时所在的频道。**必须记下来**：重放发生在联网后的将来某刻，
+   * 那时用户多半已经切走了视图 —— 按当时的界面决定去向，等于把消息
+   * 悄悄挪进别的频道。省略（没有上下文的捕获）落收件箱。
+   */
+  channelId?: string | null;
 }
 
 function openDb(): Promise<IDBDatabase> {

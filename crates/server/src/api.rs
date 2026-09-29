@@ -287,6 +287,7 @@ async fn timeline(
         scope,
         q.limit.unwrap_or(DEFAULT_TIMELINE_LIMIT),
         cursor.as_ref(),
+        q.since,
     )?))
 }
 

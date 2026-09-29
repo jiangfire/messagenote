@@ -47,6 +47,9 @@ pub fn delete_channel(db: State<'_, Db>, id: String) -> AppResult<()> {
 /// 往前翻页用 `before_created_at` + `before_id` 两个参数一起传 ——
 /// 二者构成 `(created_at, id)` 复合游标。只传时间戳会在同一毫秒内的
 /// 多条消息处漏掉整批记录。
+///
+/// `since`（epoch 毫秒，含端点）是时间范围筛选：「今天 / 近 7 天」这些档位
+/// 在前端折算成一个绝对时刻，命令层不解释它。
 #[tauri::command]
 pub fn list_timeline(
     db: State<'_, Db>,
@@ -54,6 +57,7 @@ pub fn list_timeline(
     channel_id: Option<String>,
     tag: Option<String>,
     limit: Option<i64>,
+    since: Option<i64>,
     before_created_at: Option<i64>,
     before_id: Option<String>,
 ) -> AppResult<MessagePage> {
@@ -70,6 +74,7 @@ pub fn list_timeline(
         scope,
         limit.unwrap_or(120),
         cursor.as_ref(),
+        since,
     )?)
 }
 

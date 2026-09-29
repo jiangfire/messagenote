@@ -19,9 +19,16 @@ body,
   margin: 0;
 }
 
+/* 整体字号的缩放点。
+   界面上的字号控件把档位写进 `--font-scale`（localStorage 持久化），
+   下面的 font-size 全部用 rem 表达，所以改这一处、全局跟着变。 */
+html {
+  font-size: calc(16px * var(--font-scale, 1));
+}
+
 body {
   font-family: var(--font);
-  font-size: 14px;
+  font-size: 0.875rem;
   line-height: 1.6;
   color: var(--text);
   background: var(--bg);
@@ -38,7 +45,7 @@ button {
 
 kbd {
   font-family: var(--mono);
-  font-size: 11px;
+  font-size: 0.6875rem;
   padding: 1px 5px;
   border: 1px solid var(--border);
   border-bottom-width: 2px;
@@ -50,7 +57,7 @@ kbd {
   color: var(--muted);
 }
 .small {
-  font-size: 12px;
+  font-size: 0.75rem;
 }
 
 /* ---------------- 布局 ---------------- */
@@ -98,24 +105,6 @@ kbd {
   overflow-y: auto;
   /* 同上：grid item 不显式归零 min-height 就不会内部滚动 */
   min-height: 0;
-}
-
-.brand {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-weight: 650;
-  font-size: 14px;
-  letter-spacing: 0.2px;
-  padding: 0 8px;
-}
-
-.brand-dot {
-  width: 18px;
-  height: 18px;
-  border-radius: 6px;
-  background: linear-gradient(135deg, #6d6af7, #4f46e5);
-  flex: none;
 }
 
 .nav {
@@ -175,7 +164,7 @@ kbd {
 
 .nav-count {
   flex: none;
-  font-size: 11px;
+  font-size: 0.6875rem;
   color: var(--muted);
   font-variant-numeric: tabular-nums;
 }
@@ -213,7 +202,7 @@ kbd {
   align-items: center;
   justify-content: space-between;
   padding: 0 9px 4px;
-  font-size: 11px;
+  font-size: 0.6875rem;
   font-weight: 700;
   letter-spacing: 0.7px;
   text-transform: uppercase;
@@ -222,7 +211,7 @@ kbd {
 
 .hint {
   margin: 2px 9px 0;
-  font-size: 12px;
+  font-size: 0.75rem;
   color: var(--muted);
   line-height: 1.5;
 }
@@ -235,7 +224,7 @@ kbd {
   background: var(--panel);
   color: var(--text);
   font-family: inherit;
-  font-size: 13px;
+  font-size: 0.8125rem;
   outline: none;
 }
 
@@ -258,8 +247,12 @@ kbd {
 }
 
 .title {
+  /* 不参与收缩：标题是"我现在在哪"，被挤成省略号比检索框窄一点伤害大得多。
+     极端长的标签名靠 max-width 兜底（仍然省略号，但不把顶栏挤爆）。 */
+  flex: none;
+  max-width: 42vw;
   margin: 0;
-  font-size: 15px;
+  font-size: 0.9375rem;
   font-weight: 650;
   white-space: nowrap;
   overflow: hidden;
@@ -269,7 +262,10 @@ kbd {
 .search-wrap {
   position: relative;
   margin-left: auto;
-  width: min(380px, 46vw);
+  /* 可收缩的弹性项：顶栏挤的时候（窗口窄）先缩检索框，
+     视图标题不被挤成省略号 —— 标题是"我现在在哪"，比检索框宽一点重要。 */
+  flex: 0 1 380px;
+  min-width: 150px;
 }
 
 .search-input {
@@ -280,7 +276,7 @@ kbd {
   background: var(--bg);
   color: var(--text);
   font-family: inherit;
-  font-size: 13px;
+  font-size: 0.8125rem;
   outline: none;
   transition: border-color 0.12s, box-shadow 0.12s;
 }
@@ -314,7 +310,7 @@ kbd {
   padding: 8px 18px;
   background: rgba(220, 38, 38, 0.1);
   color: var(--danger);
-  font-size: 13px;
+  font-size: 0.8125rem;
   border-bottom: 1px solid var(--border);
 }
 
@@ -334,7 +330,7 @@ kbd {
   padding: 8px 18px;
   background: var(--accent-soft);
   color: var(--accent);
-  font-size: 13px;
+  font-size: 0.8125rem;
   border-bottom: 1px solid var(--border);
 }
 
@@ -344,7 +340,7 @@ kbd {
 
 .more-hint {
   padding: 6px 18px;
-  font-size: 12px;
+  font-size: 0.75rem;
   color: var(--muted);
   background: var(--panel-2);
   border-bottom: 1px solid var(--border);
@@ -373,7 +369,7 @@ kbd {
   gap: 10px;
   margin: 18px 0 12px;
   color: var(--muted);
-  font-size: 11px;
+  font-size: 0.6875rem;
   font-weight: 600;
   letter-spacing: 0.4px;
 }
@@ -388,7 +384,7 @@ kbd {
 
 .msg-row {
   display: grid;
-  grid-template-columns: 46px 1fr auto;
+  grid-template-columns: 46px 30px 1fr auto;
   gap: 10px;
   padding: 4px 6px;
   border-radius: var(--radius);
@@ -405,9 +401,26 @@ kbd {
 }
 
 .msg-time {
-  font-size: 11px;
+  font-size: 0.6875rem;
   color: var(--muted);
   font-variant-numeric: tabular-nums;
+}
+
+/* 消息头像。这个应用只有一位作者（自己），所以它不区分"谁"，
+   只是把纯文字流变成"一个人在说话"的对话观感。
+   渐变不跟随主题变量 —— 深浅两套下它都是那个识别色。 */
+.avatar {
+  width: 30px;
+  height: 30px;
+  margin-top: 5px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, #6d6af7, #4f46e5);
+  color: #fff;
+  font-size: 0.8125rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  user-select: none;
 }
 
 .msg-body {
@@ -415,7 +428,7 @@ kbd {
 }
 
 .msg-origin {
-  font-size: 11px;
+  font-size: 0.6875rem;
   color: var(--muted);
   margin-bottom: 3px;
 }
@@ -459,7 +472,7 @@ kbd {
   border-radius: 7px;
   background: transparent;
   color: var(--muted);
-  font-size: 13px;
+  font-size: 0.8125rem;
   line-height: 1;
   display: inline-flex;
   align-items: center;
@@ -487,7 +500,7 @@ kbd {
   border-radius: 999px;
   background: var(--panel);
   color: var(--muted);
-  font-size: 12px;
+  font-size: 0.75rem;
   line-height: 1.5;
 }
 
@@ -504,11 +517,11 @@ kbd {
 
 .tag-chip.small {
   padding: 1px 7px;
-  font-size: 11px;
+  font-size: 0.6875rem;
 }
 
 .tag-count {
-  font-size: 10px;
+  font-size: 0.625rem;
   opacity: 0.7;
   font-variant-numeric: tabular-nums;
 }
@@ -519,7 +532,7 @@ kbd {
   color: inherit;
   opacity: 0.6;
   padding: 0 0 0 2px;
-  font-size: 13px;
+  font-size: 0.8125rem;
   line-height: 1;
 }
 
@@ -536,7 +549,7 @@ kbd {
   background: var(--panel);
   color: var(--text);
   font-family: inherit;
-  font-size: 12px;
+  font-size: 0.75rem;
   outline: none;
 }
 
@@ -548,7 +561,7 @@ kbd {
   border-radius: 8px;
   background: var(--panel);
   color: var(--text);
-  font-size: 12.5px;
+  font-size: 0.78125rem;
 }
 
 .btn:hover:not(:disabled) {
@@ -569,7 +582,7 @@ kbd {
 
 .btn.tiny {
   padding: 2px 8px;
-  font-size: 12px;
+  font-size: 0.75rem;
 }
 
 /* ---------------- 编辑 / 移动 ---------------- */
@@ -593,7 +606,7 @@ kbd {
   background: transparent;
   color: var(--text);
   font-family: inherit;
-  font-size: 14px;
+  font-size: 0.875rem;
   line-height: 1.6;
 }
 
@@ -633,12 +646,12 @@ kbd {
 .empty-card h3 {
   margin: 0 0 8px;
   color: var(--text);
-  font-size: 15px;
+  font-size: 0.9375rem;
 }
 
 .empty-card p {
   margin: 6px 0;
-  font-size: 13px;
+  font-size: 0.8125rem;
 }
 
 /* ---------------- 输入框 ---------------- */
@@ -677,7 +690,7 @@ kbd {
   background: transparent;
   color: var(--text);
   font-family: inherit;
-  font-size: 14px;
+  font-size: 0.875rem;
   line-height: 1.6;
   overflow-y: auto;
 }
@@ -690,7 +703,7 @@ kbd {
 }
 
 .composer-target {
-  font-size: 12px;
+  font-size: 0.75rem;
   color: var(--muted);
 }
 
@@ -706,7 +719,7 @@ kbd {
   background: var(--accent);
   color: #fff;
   font-weight: 600;
-  font-size: 13px;
+  font-size: 0.8125rem;
 }
 
 .send-btn:disabled {
@@ -774,7 +787,7 @@ kbd {
 .md pre code {
   padding: 0;
   background: transparent;
-  font-size: 12.5px;
+  font-size: 0.78125rem;
   line-height: 1.55;
 }
 
@@ -792,7 +805,7 @@ kbd {
 .md table {
   border-collapse: collapse;
   margin: 0.5em 0;
-  font-size: 13px;
+  font-size: 0.8125rem;
 }
 
 .md th,
@@ -830,7 +843,7 @@ kbd {
   border-radius: 8px;
   background: var(--panel-2);
   color: var(--muted);
-  font-size: 12px;
+  font-size: 0.75rem;
   line-height: 1.5;
   /* 同一个占位块可能很长（会把 alt 带上），太长就换行而不是横向撑开 */
   overflow-wrap: anywhere;
@@ -859,7 +872,7 @@ kbd {
   border-radius: 999px;
   background: var(--bg);
   color: var(--muted);
-  font-size: 12px;
+  font-size: 0.75rem;
   white-space: nowrap;
 }
 
@@ -908,7 +921,7 @@ kbd {
 
 .modal h2 {
   margin: 0 0 6px;
-  font-size: 15px;
+  font-size: 0.9375rem;
 }
 
 .modal p {
@@ -924,7 +937,7 @@ kbd {
 .field > span {
   display: block;
   margin-bottom: 4px;
-  font-size: 12px;
+  font-size: 0.75rem;
   color: var(--muted);
 }
 
@@ -936,7 +949,7 @@ kbd {
   background: var(--bg);
   color: var(--text);
   font-family: inherit;
-  font-size: 13px;
+  font-size: 0.8125rem;
   outline: none;
 }
 
@@ -972,7 +985,7 @@ kbd {
   margin: 4px 0 10px;
   padding: 7px 10px;
   border-radius: 8px;
-  font-size: 12.5px;
+  font-size: 0.78125rem;
   overflow-wrap: anywhere;
 }
 
@@ -991,7 +1004,7 @@ kbd {
 .load-older {
   padding: 10px 0 14px;
   text-align: center;
-  font-size: 12px;
+  font-size: 0.75rem;
   color: var(--muted);
 }
 
@@ -1030,7 +1043,7 @@ kbd {
   border-radius: 999px;
   background: var(--bg);
   color: var(--muted);
-  font-size: 12.5px;
+  font-size: 0.78125rem;
 }
 
 .filter-chip:hover {
@@ -1043,6 +1056,45 @@ kbd {
   background: var(--accent-soft);
   color: var(--accent);
   font-weight: 600;
+}
+
+/* 时间档位和范围档位（全部/未归档）之间的一条分隔：
+   两组都是筛选，但回答的是不同的问题，视觉上要能一眼分开。 */
+.filter-divider {
+  flex: none;
+  width: 1px;
+  height: 18px;
+  margin: 0 8px;
+  background: var(--border);
+}
+
+.filter-label {
+  flex: none;
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+
+/* 字号档位选择。样式向检索框看齐 —— 顶栏右侧是一组"看"的调节。 */
+.font-select {
+  flex: none;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--bg);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 0.8125rem;
+  outline: none;
+  transition: border-color 0.12s, box-shadow 0.12s;
+}
+
+.font-select:hover {
+  border-color: var(--accent);
+}
+
+.font-select:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
 }
 
 /* ---------------- 滚动条 ---------------- */

@@ -407,10 +407,11 @@ impl Store {
         scope: Scope<'_>,
         limit: i64,
         before: Option<&Cursor>,
+        since: Option<i64>,
     ) -> ServerResult<MessagePage> {
         let conn = self.conn()?;
         Ok(messagenote_store::list_messages(
-            &conn, scope, limit, before,
+            &conn, scope, limit, before, since,
         )?)
     }
 
@@ -1741,24 +1742,27 @@ mod tests {
         assert_eq!(chans[1].message_count, 1);
 
         // 时间线主视图
-        let all = messagenote_store::list_messages(&conn, Scope::All, 50, None).unwrap();
+        let all = messagenote_store::list_messages(&conn, Scope::All, 50, None, None).unwrap();
         assert_eq!(all.items.len(), 2);
         assert_eq!(all.items[0].id, "m2", "按 created_at 倒序");
         assert!(!all.has_more);
 
         // 未归档 —— 也就是时间线上那个筛选条
-        let unfiled = messagenote_store::list_messages(&conn, Scope::Unfiled, 50, None).unwrap();
+        let unfiled =
+            messagenote_store::list_messages(&conn, Scope::Unfiled, 50, None, None).unwrap();
         assert_eq!(unfiled.items.len(), 1);
         assert_eq!(unfiled.items[0].id, "m1");
 
         // 按频道
         let work =
-            messagenote_store::list_messages(&conn, Scope::Channel("ch-work"), 50, None).unwrap();
+            messagenote_store::list_messages(&conn, Scope::Channel("ch-work"), 50, None, None)
+                .unwrap();
         assert_eq!(work.items.len(), 1);
         assert_eq!(work.items[0].id, "m2");
 
         // 按标签：标签是横切的，未归档的那条照样查得到
-        let tagged = messagenote_store::list_messages(&conn, Scope::Tag("重要"), 50, None).unwrap();
+        let tagged =
+            messagenote_store::list_messages(&conn, Scope::Tag("重要"), 50, None, None).unwrap();
         assert_eq!(tagged.items.len(), 1);
         assert_eq!(tagged.items[0].id, "m1");
         assert_eq!(
@@ -1780,16 +1784,60 @@ mod tests {
         assert_eq!(tags[0].count, 1);
 
         // 键集分页：同一毫秒的兄弟行不漏，翻到底 has_more 要变成 false
-        let page1 = messagenote_store::list_messages(&conn, Scope::All, 1, None).unwrap();
+        let page1 = messagenote_store::list_messages(&conn, Scope::All, 1, None, None).unwrap();
         assert_eq!(page1.items.len(), 1);
         assert_eq!(page1.items[0].id, "m2");
         assert!(page1.has_more, "还有更早的");
 
         let cursor = Cursor::before(&page1.items[0]);
-        let page2 = messagenote_store::list_messages(&conn, Scope::All, 1, Some(&cursor)).unwrap();
+        let page2 =
+            messagenote_store::list_messages(&conn, Scope::All, 1, Some(&cursor), None).unwrap();
         assert_eq!(page2.items.len(), 1);
         assert_eq!(page2.items[0].id, "m1");
         assert!(!page2.has_more, "已经翻到底了，不该再说还有");
+    }
+
+    /// 时间范围筛选（筛选条上的「今天 / 近 7 天」折算成的那个绝对时刻）。
+    ///
+    /// 时间刻意用**真实量级**的 epoch 毫秒：把毫秒写成 100、101 这种玩具数，
+    /// "单位弄错了"（当成秒、当成微秒）的 bug 根本测不出来 —— 错误的单位
+    /// 一样能通过玩具数的断言，到了真实数据上才炸。
+    #[test]
+    fn timeline_since_filters_by_absolute_time() {
+        let s = store();
+        s.push(&[
+            msg("m-old", 1_700_000_000_000, 0, "a", "更早的一条"),
+            msg("m-new", 1_700_086_400_000, 0, "a", "更晚的一条"),
+        ])
+        .unwrap();
+        let conn = s.conn().unwrap();
+
+        let all = messagenote_store::list_messages(&conn, Scope::All, 50, None, None).unwrap();
+        assert_eq!(all.items.len(), 2, "不给 since 就不该筛");
+
+        // 含端点：恰好等于 since 的那条要算数（"今天"= 今天 00:00:00.000 起）
+        let since =
+            messagenote_store::list_messages(&conn, Scope::All, 50, None, Some(1_700_086_400_000))
+                .unwrap();
+        assert_eq!(since.items.len(), 1);
+        assert_eq!(since.items[0].id, "m-new");
+
+        // since 和往前翻的游标要能同时生效：在剩余集合里继续取"更早"
+        let page =
+            messagenote_store::list_messages(&conn, Scope::All, 50, None, Some(1_699_900_000_000))
+                .unwrap();
+        assert_eq!(page.items.len(), 2);
+        let cursor = Cursor::before(&page.items[0]);
+        let older = messagenote_store::list_messages(
+            &conn,
+            Scope::All,
+            50,
+            Some(&cursor),
+            Some(1_699_900_000_000),
+        )
+        .unwrap();
+        assert_eq!(older.items.len(), 1);
+        assert_eq!(older.items[0].id, "m-old");
     }
 
     #[test]
@@ -2265,7 +2313,7 @@ mod tests {
         {
             let conn = s.conn().unwrap();
             assert_eq!(
-                messagenote_store::list_messages(&conn, Scope::Channel(&ch.id), 50, None)
+                messagenote_store::list_messages(&conn, Scope::Channel(&ch.id), 50, None, None)
                     .unwrap()
                     .items
                     .len(),
@@ -2285,7 +2333,8 @@ mod tests {
             "频道本身应当被删掉"
         );
 
-        let unfiled = messagenote_store::list_messages(&conn, Scope::Unfiled, 50, None).unwrap();
+        let unfiled =
+            messagenote_store::list_messages(&conn, Scope::Unfiled, 50, None, None).unwrap();
         assert_eq!(unfiled.items.len(), 1, "记录必须还在，而且回到收件箱");
         assert_eq!(unfiled.items[0].id, m.id);
         assert_eq!(unfiled.items[0].channel_id, "inbox");

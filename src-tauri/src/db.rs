@@ -868,7 +868,7 @@ mod tests {
             "删除后不应还能搜到"
         );
         assert!(
-            list_messages(&conn, Scope::All, 50, None)
+            list_messages(&conn, Scope::All, 50, None, None)
                 .unwrap()
                 .items
                 .is_empty(),
@@ -916,7 +916,7 @@ mod tests {
         )
         .unwrap();
 
-        let page = list_messages(&conn, Scope::All, 50, None).unwrap();
+        let page = list_messages(&conn, Scope::All, 50, None, None).unwrap();
         assert_eq!(
             page.items[0].tags,
             vec!["工作".to_string(), "重要".to_string()],
@@ -924,7 +924,7 @@ mod tests {
         );
 
         assert_eq!(
-            list_messages(&conn, Scope::Tag("工作"), 50, None)
+            list_messages(&conn, Scope::Tag("工作"), 50, None, None)
                 .unwrap()
                 .items
                 .len(),
@@ -968,14 +968,14 @@ mod tests {
         let ch = create_channel(&conn, "项目").unwrap();
         move_message(&conn, &filed.id, &ch.id).unwrap();
 
-        let unfiled = list_messages(&conn, Scope::Unfiled, 50, None).unwrap();
+        let unfiled = list_messages(&conn, Scope::Unfiled, 50, None, None).unwrap();
         assert_eq!(unfiled.items.len(), 1, "只有还留在收件箱的那条算未归档");
         assert_eq!(unfiled.items[0].id, pending.id);
 
         // 把剩下那条也归档，未归档就空了
         move_message(&conn, &pending.id, &ch.id).unwrap();
         assert!(
-            list_messages(&conn, Scope::Unfiled, 50, None)
+            list_messages(&conn, Scope::Unfiled, 50, None, None)
                 .unwrap()
                 .items
                 .is_empty(),
@@ -984,7 +984,7 @@ mod tests {
 
         // 它们并没有消失，只是换了归属
         assert_eq!(
-            list_messages(&conn, Scope::All, 50, None)
+            list_messages(&conn, Scope::All, 50, None, None)
                 .unwrap()
                 .items
                 .len(),
@@ -992,7 +992,7 @@ mod tests {
             "时间线里两条都还在"
         );
         assert_eq!(
-            list_messages(&conn, Scope::Channel(&ch.id), 50, None)
+            list_messages(&conn, Scope::Channel(&ch.id), 50, None, None)
                 .unwrap()
                 .items
                 .len(),
@@ -1013,7 +1013,7 @@ mod tests {
         set_message_tags(&conn, &m.id, &["重要".into()]).unwrap();
 
         assert_eq!(
-            list_messages(&conn, Scope::Unfiled, 50, None)
+            list_messages(&conn, Scope::Unfiled, 50, None, None)
                 .unwrap()
                 .items
                 .len(),
@@ -1021,7 +1021,7 @@ mod tests {
             "打标签不该让消息离开收件箱 —— 那是频道的职责"
         );
         assert_eq!(
-            list_messages(&conn, Scope::Tag("重要"), 50, None)
+            list_messages(&conn, Scope::Tag("重要"), 50, None, None)
                 .unwrap()
                 .items
                 .len(),
@@ -1031,12 +1031,12 @@ mod tests {
         // 归档之后，标签仍然能查到它（横切）
         let ch = create_channel(&conn, "项目").unwrap();
         move_message(&conn, &m.id, &ch.id).unwrap();
-        assert!(list_messages(&conn, Scope::Unfiled, 50, None)
+        assert!(list_messages(&conn, Scope::Unfiled, 50, None, None)
             .unwrap()
             .items
             .is_empty());
         assert_eq!(
-            list_messages(&conn, Scope::Tag("重要"), 50, None)
+            list_messages(&conn, Scope::Tag("重要"), 50, None, None)
                 .unwrap()
                 .items
                 .len(),
@@ -1054,14 +1054,14 @@ mod tests {
         set_message_tags(&conn, &m.id, &["工作".into(), "重要".into()]).unwrap();
 
         assert_eq!(
-            list_messages(&conn, Scope::Tag("工作"), 50, None)
+            list_messages(&conn, Scope::Tag("工作"), 50, None, None)
                 .unwrap()
                 .items
                 .len(),
             1
         );
         assert_eq!(
-            list_messages(&conn, Scope::Tag("重要"), 50, None)
+            list_messages(&conn, Scope::Tag("重要"), 50, None, None)
                 .unwrap()
                 .items
                 .len(),
@@ -1084,14 +1084,14 @@ mod tests {
         assert_eq!(stats.unfiled, 1);
         assert_eq!(
             stats.total,
-            list_messages(&conn, Scope::All, 50, None)
+            list_messages(&conn, Scope::All, 50, None, None)
                 .unwrap()
                 .items
                 .len() as i64
         );
         assert_eq!(
             stats.unfiled,
-            list_messages(&conn, Scope::Unfiled, 50, None)
+            list_messages(&conn, Scope::Unfiled, 50, None, None)
                 .unwrap()
                 .items
                 .len() as i64
@@ -1126,7 +1126,7 @@ mod tests {
         let mut cursor: Option<Cursor> = None;
         // 每页 2 条 → 至少需要 3 页才装得下 5 条
         for _ in 0..10 {
-            let page = list_messages(&conn, Scope::All, 2, cursor.as_ref()).unwrap();
+            let page = list_messages(&conn, Scope::All, 2, cursor.as_ref(), None).unwrap();
             if page.items.is_empty() {
                 break;
             }
@@ -1158,7 +1158,7 @@ mod tests {
             append_message(&conn, &format!("记录 {i}"), None).unwrap();
         }
 
-        let bulk: Vec<String> = list_messages(&conn, Scope::All, 100, None)
+        let bulk: Vec<String> = list_messages(&conn, Scope::All, 100, None, None)
             .unwrap()
             .items
             .into_iter()
@@ -1168,7 +1168,7 @@ mod tests {
         let mut paged: Vec<String> = Vec::new();
         let mut cursor: Option<Cursor> = None;
         loop {
-            let page = list_messages(&conn, Scope::All, 3, cursor.as_ref()).unwrap();
+            let page = list_messages(&conn, Scope::All, 3, cursor.as_ref(), None).unwrap();
             if page.items.is_empty() {
                 break;
             }
@@ -1195,7 +1195,7 @@ mod tests {
         let mut seen = 0;
         let mut cursor: Option<Cursor> = None;
         loop {
-            let page = list_messages(&conn, Scope::Tag("翻页"), 2, cursor.as_ref()).unwrap();
+            let page = list_messages(&conn, Scope::Tag("翻页"), 2, cursor.as_ref(), None).unwrap();
             if page.items.is_empty() {
                 break;
             }
@@ -1466,7 +1466,7 @@ mod tests {
         let m = append_message(&conn, "频道里的一条", Some(&ch.id)).unwrap();
 
         assert_eq!(
-            list_messages(&conn, Scope::Channel(&ch.id), 50, None)
+            list_messages(&conn, Scope::Channel(&ch.id), 50, None, None)
                 .unwrap()
                 .items
                 .len(),
@@ -1481,7 +1481,7 @@ mod tests {
             "频道本身应当被删掉"
         );
 
-        let unfiled = list_messages(&conn, Scope::Unfiled, 50, None).unwrap();
+        let unfiled = list_messages(&conn, Scope::Unfiled, 50, None, None).unwrap();
         assert_eq!(unfiled.items.len(), 1, "记录必须还在，而且回到收件箱");
         assert_eq!(unfiled.items[0].id, m.id);
 

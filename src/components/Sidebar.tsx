@@ -58,11 +58,8 @@ export function Sidebar({
 
   return (
     <aside className="sidebar">
-      <div className="brand">
-        <span className="brand-dot" />
-        MessageNote
-      </div>
-
+      {/* 没有品牌块：窗口标题栏已经写着应用名了，这里再来一遍就是重复 ——
+          省下的垂直空间让给频道和标签列表。 */}
       <nav className="nav">
         <button
           className={`nav-item ${view.type === "timeline" ? "active" : ""}`}

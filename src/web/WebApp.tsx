@@ -90,7 +90,7 @@ export default function WebApp() {
         const now = Date.now();
 
         const stash = async () => {
-          await enqueue({ id: key, body, createdAt: now });
+          await enqueue({ id: key, body, createdAt: now, channelId });
           setQueued(await count());
           return {
             id: key,
@@ -130,7 +130,8 @@ export default function WebApp() {
 
     const run = async () => {
       const r = await replay(async (item) => {
-        await api.appendMessage(item.body, null, item.id);
+        // 频道要还原成**入队时**的那个，不是重放时界面正开着的那个
+        await api.appendMessage(item.body, item.channelId ?? null, item.id);
       });
       if (alive) setQueued(r.remaining);
     };

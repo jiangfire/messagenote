@@ -186,13 +186,47 @@ ok(
 );
 await screenshot(s, `${SHOTS}/web-05-channel.png`);
 
+// ---------------------------------------------------------------- 频道里发消息
+console.log("== 在频道里发消息，去向就该是这个频道 ==");
+// 曾经的 bug：不管在哪个视图，输入框都把消息塞回收件箱。
+await click(s, ".nav-item.group .nav-main");
+await sleep(700);
+ok(
+  "输入框的去向跟着视图走",
+  (await evaluate(s, "document.querySelector('.composer-target').innerText")).includes(
+    "浏览器建的频道"
+  )
+);
+await fill(s, ".composer-input", "在频道里直接发的一条");
+await click(s, ".send-btn");
+await waitFor(s, `document.body.innerText.includes('在频道里直接发的一条')`, "消息出现在频道里");
+await sleep(600);
+const chCountAfterSend = await evaluate(
+  s,
+  `(() => {
+     const item = [...document.querySelectorAll('.nav-item.group')]
+       .find(x => x.innerText.includes('浏览器建的频道'));
+     return item?.querySelector('.nav-count')?.innerText.trim() ?? null;
+   })()`
+);
+ok(
+  "发出去的消息真的进了频道（计数 2）",
+  chCountAfterSend === "2",
+  `频道计数=${chCountAfterSend}`
+);
+await screenshot(s, `${SHOTS}/web-05b-send-in-channel.png`);
+
+// 回时间线 —— 下一段要在时间线视图里删频道
+await click(s, ".nav .nav-item");
+await sleep(500);
+
 // ---------------------------------------------------------------- 删频道
 console.log("== 删频道（里面的记录不该消失）==");
 const timelineCount = () =>
   evaluate(s, `document.querySelector('.nav .nav-count').innerText.trim()`);
 
 const before = await timelineCount();
-ok("删之前时间线里有 2 条", before === "2", `实际 ${before}`);
+ok("删之前时间线里有 3 条", before === "3", `实际 ${before}`);
 
 await click(s, ".nav-item.group .row-action");
 await sleep(1400);
@@ -211,7 +245,7 @@ ok("频道确实删掉了", true);
 const after = await timelineCount();
 ok(
   "**频道里的记录没有跟着消失**",
-  after === "2",
+  after === "3",
   `删频道前 ${before} 条，删完变成 ${after} 条 —— 确认框说了会回到收件箱，就不能删掉它们`
 );
 ok("那条记录仍然看得到", (await text()).includes("地铁上想到的一个点子"));

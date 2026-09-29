@@ -233,7 +233,7 @@ fn a_deletion_propagates_as_a_tombstone() {
     );
     let conn = a.conn().unwrap();
     assert!(
-        db::list_messages(&conn, db::Scope::All, 50, None)
+        db::list_messages(&conn, db::Scope::All, 50, None, None)
             .unwrap()
             .items
             .is_empty(),
@@ -396,19 +396,20 @@ fn desktop_and_server_agree_on_browse_and_search() {
         .id;
 
     assert_eq!(
-        serde_json::to_value(db::list_messages(&conn, db::Scope::All, 50, None).unwrap()).unwrap(),
+        serde_json::to_value(db::list_messages(&conn, db::Scope::All, 50, None, None).unwrap())
+            .unwrap(),
         get_json(addr, "/api/timeline?scope=all&limit=50"),
         "scope=all"
     );
     assert_eq!(
-        serde_json::to_value(db::list_messages(&conn, db::Scope::Unfiled, 50, None).unwrap())
+        serde_json::to_value(db::list_messages(&conn, db::Scope::Unfiled, 50, None, None).unwrap())
             .unwrap(),
         get_json(addr, "/api/timeline?scope=unfiled&limit=50"),
         "scope=unfiled —— 未归档的判定必须和桌面端一致，否则网页端点进去条数不对"
     );
     assert_eq!(
         serde_json::to_value(
-            db::list_messages(&conn, db::Scope::Channel(&work_id), 50, None).unwrap()
+            db::list_messages(&conn, db::Scope::Channel(&work_id), 50, None, None).unwrap()
         )
         .unwrap(),
         get_json(
@@ -418,8 +419,10 @@ fn desktop_and_server_agree_on_browse_and_search() {
         "scope=channel"
     );
     assert_eq!(
-        serde_json::to_value(db::list_messages(&conn, db::Scope::Tag(tag), 50, None).unwrap())
-            .unwrap(),
+        serde_json::to_value(
+            db::list_messages(&conn, db::Scope::Tag(tag), 50, None, None).unwrap()
+        )
+        .unwrap(),
         get_json(
             addr,
             &format!("/api/timeline?scope=tag&tag={}&limit=50", pct(tag))
@@ -428,11 +431,13 @@ fn desktop_and_server_agree_on_browse_and_search() {
     );
 
     // ---- 键集分页 ----
-    let first = db::list_messages(&conn, db::Scope::All, 2, None).unwrap();
+    let first = db::list_messages(&conn, db::Scope::All, 2, None, None).unwrap();
     let cursor = db::Cursor::before(&first.items[1]);
     assert_eq!(
-        serde_json::to_value(db::list_messages(&conn, db::Scope::All, 2, Some(&cursor)).unwrap())
-            .unwrap(),
+        serde_json::to_value(
+            db::list_messages(&conn, db::Scope::All, 2, Some(&cursor), None).unwrap()
+        )
+        .unwrap(),
         get_json(
             addr,
             &format!(
@@ -441,6 +446,25 @@ fn desktop_and_server_agree_on_browse_and_search() {
             )
         ),
         "往前翻一页的结果两端必须一致"
+    );
+
+    // ---- 时间筛选（since）----
+    //
+    // 这一条专门钉 **HTTP 层的反序列化**：store 层的 since 有专门的单元测试
+    // （timeline_since_filters_by_absolute_time），但 wire 结构体的字段名要是和
+    // 前端发的查询串对不上（camelCase 错位之类），只有真的过一遍 HTTP 才验得到。
+    let all = db::list_messages(&conn, db::Scope::All, 50, None, None).unwrap();
+    let since = all.items[1].created_at; // 第二新的那条起 —— 含端点，它自己也要出现
+    assert_eq!(
+        serde_json::to_value(
+            db::list_messages(&conn, db::Scope::All, 50, None, Some(since)).unwrap()
+        )
+        .unwrap(),
+        get_json(
+            addr,
+            &format!("/api/timeline?scope=all&limit=50&since={since}")
+        ),
+        "since 过 HTTP 后两端必须一致（含端点）"
     );
 
     // ---- 检索：双字词走 FTS，单字走 LIKE 回退，两条路径都要一致 ----
