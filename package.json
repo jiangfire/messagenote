@@ -1,6 +1,6 @@
 {
   "name": "messagenote",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "private": true,
   "type": "module",
   "description": "聊天框式本地优先笔记 —— 零摩擦捕获，事后组织",
