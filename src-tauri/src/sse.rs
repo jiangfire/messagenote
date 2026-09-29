@@ -37,6 +37,35 @@ const READ_TIMEOUT: Duration = Duration::from_secs(25);
 const RETRY_BASE: Duration = Duration::from_secs(2);
 const RETRY_MAX: Duration = Duration::from_secs(60);
 
+/// 一次订阅尝试的结果。
+///
+/// **为什么要把"连上了"和"读到事件了"分成两件事**：退避要回答的只有
+/// "地址和令牌对不对"。原先这两件事被混成了同一个返回值（"读到过 `data:` 帧
+/// 没有"），于是**一条健康的连接如果在空闲期被掐掉** —— 没有任何写入，
+/// 15 秒一次的心跳又不算数据 —— 它会被判成"连接失败"，退避一路翻倍到 60 秒，
+/// 那段时间里的推送全丢。
+///
+/// 而"空闲期被掐掉"恰恰是**最常见**的情形：反代/NAT 掐的从来不是活跃连接，
+/// 是闲置的那些。这个 bug 的表现因此是"偶尔要等半分钟才同步"，
+/// 而不是"同步坏了" —— 最难查的那一类。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Connected {
+    /// 连上了（HTTP 2xx）。地址和令牌是对的。
+    Established,
+    /// 压根没连上：网络不通、令牌不对、DNS 挂了……
+    Failed,
+}
+
+/// 这次连接之后，**下一次**重连前要等多长。
+fn next_wait(current: Duration, outcome: Connected) -> Duration {
+    match outcome {
+        // 连上了就说明配置是对的，下次照最短间隔重试。
+        Connected::Established => RETRY_BASE,
+        // 连不上：翻倍退避，免得服务端关着的时候每 2 秒敲一次门。
+        Connected::Failed => (current * 2).min(RETRY_MAX),
+    }
+}
+
 /// 起一条常驻线程维护订阅。应用生命周期内只有一条。
 pub fn spawn(app: AppHandle) {
     std::thread::spawn(move || {
@@ -50,17 +79,19 @@ pub fn spawn(app: AppHandle) {
 
             // 连上过就说明地址和令牌是对的，退避重置；否则一路退到上限，
             // 免得服务端关着的时候每 2 秒敲一次门。
-            if subscribe(&app, &url, &token) {
-                backoff = RETRY_BASE;
-            }
-            std::thread::sleep(backoff);
-            backoff = (backoff * 2).min(RETRY_MAX);
+            let outcome = subscribe(&app, &url, &token);
+            let wait = backoff;
+            backoff = next_wait(backoff, outcome);
+            std::thread::sleep(wait);
         }
     });
 }
 
-/// 连一次，读到断开或配置变化为止。返回**这次有没有读到过数据**。
-fn subscribe(app: &AppHandle, url: &str, token: &str) -> bool {
+/// 连一次，读到断开或配置变化为止。
+///
+/// 返回**有没有连上**（而不是"有没有读到事件"）—— 这个区别决定了退避会不会
+/// 把一条健康的空闲连接当成失败。见 `Connected`。
+fn subscribe(app: &AppHandle, url: &str, token: &str) -> Connected {
     connect(url, token, || wake(app), || config_changed(app, url, token))
 }
 
@@ -75,7 +106,7 @@ fn connect(
     token: &str,
     on_event: impl FnMut(),
     should_stop: impl FnMut() -> bool,
-) -> bool {
+) -> Connected {
     let endpoint = format!("{}/api/events", url.trim_end_matches('/'));
 
     let agent = ureq::Agent::new_with_config(
@@ -95,23 +126,31 @@ fn connect(
         .call()
     {
         Ok(r) => r,
-        Err(_) => return false,
+        Err(_) => return Connected::Failed,
     };
     if !(200..300).contains(&resp.status().as_u16()) {
-        return false;
+        return Connected::Failed;
     }
 
+    // **走到这里就说明地址和令牌都是对的**，从这一刻起退避就该重置 ——
+    // 这条流之后读多久、有没有读到事件，都和"配置对不对"无关。
+    // 读的返回值刻意丢掉：它过去被当成"这次连接成不成功"，正是那个 bug。
     pump(
         &mut BufReader::new(resp.into_body().into_with_config().reader()),
         on_event,
         should_stop,
-    )
+    );
+    Connected::Established
 }
 
-/// 逐行读 SSE 帧。返回"读到过数据没有"。
+/// 逐行读 SSE 帧，读到断开或该停为止。
 ///
 /// 抽出来单独测：这一段是纯字符串处理，而它出错的表现是**静默收不到推送** ——
 /// 没有报错，只是界面一直不动。这种错误值得一个不用起网络就能跑的测试。
+///
+/// **刻意不返回"读到过事件没有"。** 那个值以前被当成"这次连接成不成功"，
+/// 于是空闲期被掐掉的健康连接会被判成失败、退避翻倍（见 `Connected`）。
+/// 谁要是需要"有没有事件"，用 `on_event` 自己数。
 ///
 /// - `on_event`：收到一个带 data 的帧（也就是真事件）
 /// - `should_stop`：在**心跳帧**上问一次"还该继续吗"。只在这里问是因为
@@ -120,14 +159,13 @@ fn pump<R: BufRead>(
     reader: &mut R,
     mut on_event: impl FnMut(),
     mut should_stop: impl FnMut() -> bool,
-) -> bool {
+) {
     let mut line = String::new();
-    let mut got_data = false;
 
     loop {
         line.clear();
         match reader.read_line(&mut line) {
-            Ok(0) | Err(_) => return got_data,
+            Ok(0) | Err(_) => return,
             Ok(_) => {}
         }
 
@@ -141,13 +179,12 @@ fn pump<R: BufRead>(
         // 否则每 15 秒就会白白触发一次同步。
         if t.starts_with(':') {
             if should_stop() {
-                return got_data;
+                return;
             }
             continue;
         }
 
         if t.starts_with("data:") {
-            got_data = true;
             on_event();
         }
         // 其余（`event:`、空行）忽略：我们只有一种事件，内容也不关心。
@@ -290,6 +327,38 @@ mod tests {
         );
 
         (events.load(Ordering::SeqCst), beats.load(Ordering::SeqCst))
+    }
+
+    /// **退避看的是"连上了没有"，不是"读到事件了没有"。**
+    ///
+    /// 守的是一个很难复现、也很难看出来的 bug：空闲期被反代/NAT 掐掉的**健康**
+    /// 连接会被判成失败，退避一路翻倍到 60 秒 —— 表现是"偶尔要等半分钟才同步"，
+    /// 而不是"同步坏了"。反向验证过：把 `Established` 也按失败算
+    /// （返回 `current * 2`），第一条断言立刻红。
+    #[test]
+    fn a_connection_that_came_up_resets_the_backoff_even_with_no_events() {
+        // 连上过 → 下次照最短间隔重试，**和这一轮有没有事件无关**。
+        // 注意它给的是"退到上限"的当前值：健康连接不该被这个值拖累。
+        assert_eq!(next_wait(RETRY_MAX, Connected::Established), RETRY_BASE);
+
+        // 连不上 → 逐次翻倍，封顶在 RETRY_MAX
+        assert_eq!(
+            next_wait(RETRY_BASE, Connected::Failed),
+            Duration::from_secs(4)
+        );
+        assert_eq!(
+            next_wait(Duration::from_secs(4), Connected::Failed),
+            Duration::from_secs(8)
+        );
+        assert_eq!(
+            next_wait(Duration::from_secs(40), Connected::Failed),
+            RETRY_MAX
+        );
+        assert_eq!(
+            next_wait(RETRY_MAX, Connected::Failed),
+            RETRY_MAX,
+            "到顶之后不能再涨"
+        );
     }
 
     /// 正常帧：`event:` + `data:` + 空行，算**一个**事件。
