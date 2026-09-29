@@ -205,6 +205,39 @@ pub fn collect_garbage_attachments(db: State<'_, Db>) -> AppResult<i64> {
     Ok(db::blob::gc_unreferenced(&conn)?)
 }
 
+/// 把整个库导出成一棵 Markdown 目录树。
+///
+/// **附件的字节不经过前端**：这里直接从 SQLite 读出来写盘。一份图多的库有几十
+/// 上百 MB，让它们来回搬一遍 IPC 既慢又没必要 —— 所以前端只给一个目录路径。
+///
+/// `utc_offset_minutes` 是本地时区相对 UTC 的偏移（**东为正**，东八区是 480）。
+/// 前端传 `-new Date().getTimezoneOffset()`。文件名要的是本地时间，而 Rust 侧
+/// 没有时区库、也不值得为一个文件名引入一个 —— 理由见
+/// `messagenote_core::export` 的模块说明。
+#[tauri::command]
+pub fn export_markdown(
+    db: State<'_, Db>,
+    dir: String,
+    utc_offset_minutes: i32,
+) -> AppResult<crate::export::ExportSummary> {
+    let conn = db.conn()?;
+    crate::export::export_to(&conn, std::path::Path::new(&dir), utc_offset_minutes)
+}
+
+/// 把一条记录渲染成 Markdown，给「复制这一条」用。
+///
+/// 返回 `null` 表示这条已经不在了（被删掉，或 id 不对）—— 界面据此说
+/// "这条记录已经不在了"，而不是把一句数据库错误摔到用户脸上。
+#[tauri::command]
+pub fn render_message_markdown(
+    db: State<'_, Db>,
+    id: String,
+    utc_offset_minutes: i32,
+) -> AppResult<Option<String>> {
+    let conn = db.conn()?;
+    crate::export::render_one(&conn, &id, utc_offset_minutes)
+}
+
 // ---------------------------------------------------------------- 同步
 
 #[tauri::command]

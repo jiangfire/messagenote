@@ -172,6 +172,23 @@ pub fn resolve_mime(bytes: &[u8]) -> &'static str {
     sniff_mime(bytes).unwrap_or(FALLBACK_MIME)
 }
 
+/// 导出时给这个类型用的文件扩展名。
+///
+/// 认不出来的一律 `.bin`：扩展名是**给别人看的**（文件管理器、Markdown 阅读器），
+/// 编一个 `.png` 出来只会让打不开的图看起来像本来就坏了。
+///
+/// 白名单必须和 [`is_displayable_image`] 保持一致 —— 差一个的话，能渲染的类型
+/// 会被写成 `.bin`，于是 Markdown 里的图渲染不出来，而且不报错。
+pub fn extension_for(mime: &str) -> &'static str {
+    match mime {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        _ => "bin",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

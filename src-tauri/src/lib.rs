@@ -12,6 +12,7 @@
 // 同步引擎去对接一个真实跑起来的 axum 服务端。
 pub mod db;
 pub mod error;
+pub mod export;
 pub mod http;
 pub mod sync;
 
@@ -287,6 +288,8 @@ pub fn run() {
             commands::read_attachment,
             commands::has_attachment,
             commands::collect_garbage_attachments,
+            commands::export_markdown,
+            commands::render_message_markdown,
         ])
         .run(tauri::generate_context!());
 
