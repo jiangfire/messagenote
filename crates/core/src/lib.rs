@@ -10,6 +10,8 @@
 //! - `merge`：合并决策。冲突时"留谁"的规则必须唯一。
 //! - `wire`：线缆协议类型。字段名和语义漂移会让同步悄悄丢字段。
 //! - `models`：实体 DTO。桌面端命令层和服务端 API 共用同一份定义。
+//! - `export`：导出的 Markdown 长什么样。两端各写一份的话，同一条笔记会
+//!   导出成不同的东西，而且不报错。
 //!
 //! **不**放进来的是各自的存储实现：客户端有 `dirty` 标记和本地索引，
 //! 服务端有单调递增的 `server_seq`，两边的表和 SQL 本来就不同，
@@ -22,6 +24,7 @@
 
 pub mod attachment;
 pub mod error;
+pub mod export;
 pub mod hlc;
 pub mod merge;
 pub mod models;
