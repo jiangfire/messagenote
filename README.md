@@ -506,7 +506,7 @@ $env:MESSAGENOTE_MIGRATE_TEST_DB = "…\副本.sqlite"
 cargo test -p messagenote -- --ignored --nocapture
 ```
 
-## 当前限制（v1.4.0）
+## 当前限制（v1.7.0）
 
 诚实地列出来，避免误判成熟度：
 
@@ -529,6 +529,10 @@ cargo test -p messagenote -- --ignored --nocapture
   不想这样可以在服务端设 `MESSAGENOTE_S3_BUCKET`，把字节交给对象存储
   （桌面端的本地库不受影响，它永远是本地的）。
   不再被引用的字节要手动回收（桌面端的 `collect_garbage_attachments`）。
+- **对象存储那条路只能往一个方向平滑走。** 切到 S3 不用先搬字节（读的时候会
+  穿底查一次库），但**切回 SQLite 要手工把桶里的对象倒回去** —— 撤掉桶名之后，
+  只有在 S3 期间传上去的图会取不到（库里没有它们）。没有做自动迁移，理由和
+  做法见 [`deploy/README.md`](deploy/README.md)。
 - **外链图片会向第三方暴露"你打开了这条笔记"。** WebView 的 CSP 是收紧过的
   （脚本注入那一层挡住了），但 `img-src` 刻意留着 `https:` —— 笔记里
   `![](https://…)` 能正常显示。哪天想换掉这个取舍，删掉 `img-src` 里的 `https:` 即可。
