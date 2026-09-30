@@ -216,6 +216,12 @@ sha256sum -c SHA256SUMS.txt
 # 2. 提交、打 tag、推
 git tag -a v1.3.0 -m "..." && git push origin v1.3.0
 ```
+
+**版本提交的那段话就是发行说明。** Release 的正文由 `git log -1 --format=%B` 取
+版本提交生成，末尾自动补一行和上一个 tag 的对比链接 —— 所以提交信息要写成
+**给人看的样子**（这一版新增了什么、修了什么、为什么是 minor），而不是
+"bump version"。顺带一提：这个仓库直接往 main 提交、没有 PR，所以
+`--generate-notes` 那种按 PR 归纳的做法在这里只能产出一行空链接。
 Release workflow 会构建并发布：Windows 安装包 + 免安装版 + 更新签名 +
 `latest.json` + 三个平台的服务端二进制 + `SHA256SUMS.txt` + 许可证，
 同时把两个容器镜像推到 GHCR。

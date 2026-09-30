@@ -222,6 +222,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.tag || github.ref_name }}
+          # 发行说明要从版本提交里取、对比链接要找到上一个 tag —— 默认的
+          # 浅克隆（depth 1）两样都拿不到。这个仓库很小，整段历史不值几个字节。
+          fetch-depth: 0
 
       # **必须指定 pattern。** 不带 `pattern` 会把**所有** artifact 都拉下来，
       # 包括 `docker/build-push-action` 留下的那些构建缓存
@@ -327,10 +330,39 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
+          # 发行说明 = **版本提交的那段话**，后面补一行对比链接。
+          #
+          # 原来用 `--generate-notes`，而它是按 **PR** 归纳的 —— 这个仓库直接往
+          # main 提交、没有 PR，于是每一版的说明都只有孤零零一行 Full Changelog
+          # （v1.3.0 到 v1.6.0 都是这样，v1.7.0 是事后手工补的）。
+          # 版本提交本来就写得像发行说明，直接用，省掉每次手工补一遍。
+          NOTES=notes.md
+          {
+            git log -1 --format=%B "$TAG"
+            # 上一个 tag 拿来拼对比链接。**拿不到就不写这一行**，不能让发布挂在这里。
+            PREV=$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || true)
+            if [ -n "$PREV" ]; then
+              printf '\n**Full Changelog**: https://github.com/%s/compare/%s...%s\n' \
+                "$GITHUB_REPOSITORY" "$PREV" "$TAG"
+            fi
+          } > "$NOTES"
+          echo "--- 发行说明 ---"
+          cat "$NOTES"
+
           # 允许重跑：tag 已经发过 Release 时改成覆盖附件，而不是报错退出
           if gh release view "$TAG" >/dev/null 2>&1; then
+            # **只补资产，不动说明。** 说明可能已经被人手工润色过
+            # （v1.7.0 就是），重跑一次把它盖回提交信息是倒退。
             gh release upload "$TAG" out/* --clobber
+          elif [ -s "$NOTES" ]; then
+            gh release create "$TAG" out/* \
+              --title "MessageNote $TAG" \
+              --notes-file "$NOTES"
           else
+            # 兜底：拿不到提交信息（比如浅克隆把历史截掉了）时退回自动生成，
+            # 说明难看一点也比发布失败强。
+            echo "拿不到提交信息，退回 --generate-notes"
             gh release create "$TAG" out/* \
               --title "MessageNote $TAG" \
               --generate-notes
