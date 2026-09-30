@@ -55,6 +55,63 @@ docker compose start server
 
 或者用 Litestream 持续复制那个文件（在线、不用停）。
 
+### 附件放对象存储（可选）
+
+默认附件字节和笔记躺在**同一个 `.sqlite` 文件**里 —— 对一台小机器来说这是最
+省心的方案，也是上面那段"备份 = 备份一个文件"成立的原因。
+
+库大到几个 GB 之后（图片多），可以在 `deploy/.env` 里加上桶名切过去：
+
+```bash
+MESSAGENOTE_S3_BUCKET=my-messagenote
+# 自建的 S3 兼容服务（MinIO / R2 / B2）要填地址；AWS 官方端点留空
+MESSAGENOTE_S3_ENDPOINT=https://s3.example.com
+MESSAGENOTE_S3_REGION=us-east-1
+# 不填就退回 AWS 官方的 AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY（IAM 角色也行）
+MESSAGENOTE_S3_ACCESS_KEY_ID=…
+MESSAGENOTE_S3_SECRET_ACCESS_KEY=…
+```
+
+`MESSAGENOTE_S3_PREFIX` 可以改对象键前缀（默认 `attachments/`），
+想和这个桶里别的东西分开时用。
+
+**桶权限**（写最小策略时照这个来）：
+
+| 权限 | 干什么用 | 缺了会怎样 |
+| --- | --- | --- |
+| `s3:PutObject` | 上传附件 | 上传直接失败 |
+| `s3:GetObject` | 下载附件 | 图片全部打不开 |
+| `s3:ListBucket`（**桶级**，不是 `/*`） | 存在性探测（`HEAD`） | S3 对"这个对象不存在"会回 **403** 而不是 404，于是"我缺哪些"整批失败 |
+
+上传路径**不需要** `ListBucket`：它用的是 `If-None-Match: *` 条件写，
+只花 `PutObject` 的权限。
+
+五件值得知道的事：
+
+- **对象键就是附件的 sha256**（`attachments/<sha256>`）。同一张图传多少次、
+  几台设备各传一次，桶里都只有一个对象 —— 去重是内容寻址白送的，不是额外的判重。
+- **切过去不需要先把老字节搬过去。** 读的时候会穿底问一次 SQLite（只读），
+  所以库里那些老附件照样取得到。
+- **反过来要搬。** 把 `MESSAGENOTE_S3_BUCKET` 去掉之后，**只有在 S3 期间传上去
+  的那些字节会看不见** —— SQLite 里没有它们，而 SQLite 模式不会去问桶。
+  要回退就先 `mc cp` / `rclone copy` 把对象倒回库里，或者在切之前把字节同步回去。
+  这一条**没有做自动迁移**：自动迁移要么在服务端塞一份"双写"，要么要求客户端
+  重传（而客户端已经把 `uploaded` 标成 1，不会重传）。
+- **切过去之后 SQLite 里不再新增附件行。** 那张表是字节的一份**会漂移**的副本
+  （有人从桶里删了对象、或者换了桶，表里还写着"有"）。存在性一律问对象存储，
+  少一份会对不上号的真相。
+- **切过去之后上面那条备份就只备份笔记了**，字节的耐久性归对象存储管
+  （版本控制、生命周期、跨区复制都是它的事）。也就是说：**桶本身的备份策略
+  要自己配**，这一步不能省。
+
+MinIO 那种只在内网说明文 HTTP 的端点：`MESSAGENOTE_S3_ENDPOINT`（或官方的
+`AWS_ENDPOINT`）写成 `http://…` 就会自动放行（同一个 S3 客户端默认拒绝明文端点）。
+
+**注意这只覆盖附件字节**：笔记本身、同步、网页端仍然只跟服务端说话，
+上面的 TLS 和反代配置一条都不用改。
+
+---
+
 ### 上 TLS
 
 compose 里那个 Caddy 只说 HTTP。公网部署有两条路：

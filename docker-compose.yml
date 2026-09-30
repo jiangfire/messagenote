@@ -23,9 +23,19 @@ services:
       MESSAGENOTE_TOKEN: ${MESSAGENOTE_TOKEN:?请先设置 MESSAGENOTE_TOKEN（至少 32 字符）}
       MESSAGENOTE_BIND: 0.0.0.0:8787
       MESSAGENOTE_DB: /data/messagenote.sqlite
+      # 附件放对象存储（可选）。`deploy/.env` 里填了 MESSAGENOTE_S3_BUCKET
+      # 才生效 —— 没填时这里是空串，而**空串按"没设"处理**，所以默认行为
+      # 一个字都不变：字节仍然跟着 SQLite 走。
+      MESSAGENOTE_S3_BUCKET: ${MESSAGENOTE_S3_BUCKET:-}
+      MESSAGENOTE_S3_ENDPOINT: ${MESSAGENOTE_S3_ENDPOINT:-}
+      MESSAGENOTE_S3_REGION: ${MESSAGENOTE_S3_REGION:-}
+      MESSAGENOTE_S3_ACCESS_KEY_ID: ${MESSAGENOTE_S3_ACCESS_KEY_ID:-}
+      MESSAGENOTE_S3_SECRET_ACCESS_KEY: ${MESSAGENOTE_S3_SECRET_ACCESS_KEY:-}
+      MESSAGENOTE_S3_PREFIX: ${MESSAGENOTE_S3_PREFIX:-}
     volumes:
-      # 全部状态都在这个卷里的一个 .sqlite 文件里（附件字节也在里面）。
+      # 全部状态都在这个卷里的一个 .sqlite 文件里（**默认**附件字节也在里面）。
       # 备份 = 备份这个卷；用 Litestream 的话直接跟这个文件。
+      # 附件切到对象存储之后，这个文件里就只剩笔记了（见 deploy/README.md）。
       - messagenote-data:/data
     restart: unless-stopped
     # 不对外暴露端口：只有 web 容器需要能连到它。
