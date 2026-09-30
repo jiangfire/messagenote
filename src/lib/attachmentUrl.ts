@@ -243,6 +243,37 @@ export function useAttachmentImages(
       ensureAttachment(api, sha);
     }
 
+    // **非图片附件的链接。** `[名字](attachment:sha)` 渲染出来是 <a>，上面的
+    // 循环只认 <img>，所以这一段不做的话链接点了什么都不会发生 ——
+    // href 是个浏览器解析不了的地址，表现是"附件功能坏了"而不是"这个链接坏了"。
+    for (const a of root.querySelectorAll<HTMLAnchorElement>("a[href]")) {
+      const href = a.getAttribute("href") ?? "";
+      const sha = href.startsWith(ATTACHMENT_SCHEME)
+        ? href.slice(ATTACHMENT_SCHEME.length)
+        : a.getAttribute("data-md-attachment");
+      if (!sha) continue;
+
+      a.setAttribute("data-md-attachment", sha);
+      // 文件名取自链接文字（插入时写进去的），这样下载下来的名字是用户自己认得的。
+      // 空的话退回 sha —— 至少有个能落地的名字。
+      if (!a.getAttribute("download")) a.setAttribute("download", a.textContent?.trim() || sha);
+
+      const url = getAttachmentUrl(sha);
+      if (url) {
+        if (a.getAttribute("href") !== url) a.setAttribute("href", url);
+        continue;
+      }
+
+      if (isAttachmentUnavailable(sha)) {
+        // 取不到字节就明说，而不是留一个点了没反应的链接。
+        a.classList.add("md-attachment-missing");
+        a.removeAttribute("href");
+        continue;
+      }
+
+      ensureAttachment(api, sha);
+    }
+
     return unsubscribe;
   }, [api, container, html, shaList, epoch]);
 }

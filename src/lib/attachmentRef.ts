@@ -27,6 +27,22 @@ export function attachmentMarkdown(sha256: string): string {
   return `![图片](${ATTACHMENT_SCHEME}${sha256})`;
 }
 
+/**
+ * 生成一段非图片附件的 Markdown 链接。
+ *
+ * 为什么是**链接**而不是图片语法：把一个 PDF 写成 `![report.pdf](attachment:…)`
+ * 的话，渲染出来是一个永远显示不出来的破图（浏览器解不了这个 MIME），
+ * 占位文案还写着"图片还没下载下来"。写成链接，用户点得到、能存下来，
+ * 显示的也还是他自己的文件名 —— 一眼就知道哪个文件。
+ *
+ * 文件名要转义 `]` 和换行：正文是 Markdown，一个裸的 `]` 会把链接截断，
+ * 而 Windows 上叫"备注]草稿.txt"的文件是真实存在的。
+ */
+export function attachmentFileMarkdown(sha256: string, name: string): string {
+  const label = name.replace(/[[\]\r\n]/g, " ").trim() || "附件";
+  return `[${label}](${ATTACHMENT_SCHEME}${sha256})`;
+}
+
 /** 从 `src`/`href` 里取出 sha256；不是本应用认得的附件引用就返回 null。 */
 export function parseAttachmentSrc(src: string | null): string | null {
   if (!src || !src.startsWith(ATTACHMENT_SCHEME)) return null;

@@ -558,6 +558,119 @@ ok(
   `${(picked2.before || "").length} → ${(picked2.after || "").length}`
 );
 
+// ---------------------------------------------------------------- 附件
+console.log("== 附件：非图片也能传、能点开 ==");
+
+// 用户说的是"包括你也可以上传附件"。只支持图片的话，选一个 .pdf / .txt
+// 会被 accept 挡掉，或者存进去了却渲染成一坨没法点的东西 —— 那不叫支持附件。
+const attached = await evaluate(
+  s,
+  `(async () => {
+     const input = document.querySelector('.composer-input');
+     const picker = document.querySelector('.attach-input');
+     if (!picker) return { error: '没有 .attach-input' };
+     if (picker.accept) return { error: '上传框仍然限定了类型：' + picker.accept };
+
+     // **必须先清空。** 上一段测试往输入框里插了两张图，值里已经有
+     // \`![图片](attachment:…)\` 了 —— 不清的话下面那个轮询条件立刻满足，
+     // 读到的是上一轮的旧内容，这条断言就成了在验上一个功能。
+     input.value = '';
+     input.dispatchEvent(new Event('input', { bubbles: true }));
+     await new Promise((r) => setTimeout(r, 200));
+
+     const dt = new DataTransfer();
+     dt.items.add(new File(['会议纪要：三月复盘'], 'notes.txt', { type: 'text/plain' }));
+     picker.files = dt.files;
+     picker.dispatchEvent(new Event('change', { bubbles: true }));
+
+     const started = Date.now();
+     while (Date.now() - started < 15000) {
+       if (/notes\\.txt/.test(input.value)) break;
+       await new Promise((r) => setTimeout(r, 100));
+     }
+     return { value: input.value, accept: picker.accept };
+   })()`
+);
+
+const attachSha = ((attached.value || "").match(/attachment:([0-9a-f]{64})/) || [])[1];
+ok(
+  "非图片文件（.txt）也能上传",
+  !!attachSha,
+  attached.error ?? `选完输入框内容：${(attached.value || "").slice(0, 120)}`
+);
+ok(
+  "非图片插进来的是**链接**而不是图片语法（`[名字](attachment:sha)`）",
+  /\[notes\.txt\]\(attachment:[0-9a-f]{64}\)/.test(attached.value || ""),
+  `实际：${(attached.value || "").slice(0, 120)}`
+);
+
+await pressEnter(s, ".composer-input");
+await waitFor(
+  s,
+  `(() => {
+     const a = [...document.querySelectorAll('.md a')].find((x) => x.innerText.includes('notes.txt'));
+     return !!a && a.getAttribute('href')?.startsWith('blob:');
+   })()`,
+  "附件链接变成可点的 blob URL",
+  20000
+);
+ok(
+  "发出去之后附件链接能点开（href 换成了 blob: URL）",
+  await evaluate(
+    s,
+    `(() => {
+       const a = [...document.querySelectorAll('.md a')].find((x) => x.innerText.includes('notes.txt'));
+       return !!a && a.getAttribute('href')?.startsWith('blob:') && !!a.getAttribute('download');
+     })()`
+  )
+);
+ok(
+  "附件带 download 属性（点下去是存文件，不是跳到一个 attachment: 的死链）",
+  await evaluate(
+    s,
+    `(() => {
+       const a = [...document.querySelectorAll('.md a')].find((x) => x.innerText.includes('notes.txt'));
+       return a?.getAttribute('download') === 'notes.txt';
+     })()`
+  )
+);
+
+// 拖进来的文件夹不该被当成文件存进去
+const folderDropped = await evaluate(
+  s,
+  `(async () => {
+     const composer = document.querySelector('.composer');
+     const input = document.querySelector('.composer-input');
+     // 同样先清空：这里比的是"拖之前 == 拖之后"，
+     // 输入框里留着上一段测试的内容的话，两边一样，这断言就是空的。
+     input.value = '';
+     input.dispatchEvent(new Event('input', { bubbles: true }));
+     await new Promise((r) => setTimeout(r, 200));
+     const before = input.value;
+
+     const dt = new DataTransfer();
+     // 拖文件夹时浏览器给出的项：type 为空、size 为 0、name 为空
+     dt.items.add(new File([], '', { type: '' }));
+     const fire = (type) => composer.dispatchEvent(
+       new DragEvent(type, { dataTransfer: dt, bubbles: true, cancelable: true })
+     );
+     fire('dragover');
+     fire('drop');
+     await new Promise((r) => setTimeout(r, 1500));
+     return { before, after: input.value };
+   })()`
+);
+ok(
+  "拖进来的文件夹被挡掉，不会被当成附件存进去",
+  folderDropped.before === "" && folderDropped.after === "",
+  `拖之前 ${JSON.stringify(folderDropped.before.slice(-40))}，拖之后 ${JSON.stringify(folderDropped.after.slice(-40))}`
+);
+ok(
+  "**拖之前输入框确实是空的**（否则上一条是空跑）",
+  folderDropped.before === "",
+  `实际：${JSON.stringify(folderDropped.before)}`
+);
+
 // ---------------------------------------------------------------- 头像
 console.log("== 头像：能换成自己上传的图 ==");
 

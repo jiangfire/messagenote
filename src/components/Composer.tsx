@@ -2,8 +2,8 @@ import { useEffect, useRef, useState, type ClipboardEvent, type KeyboardEvent } 
 import { useApi } from "../lib/apiContext";
 import { errorText } from "../lib/errors";
 import {
-  imageFilesFromClipboard,
-  insertImages,
+  filesFromClipboard,
+  insertAttachments,
   makeImageDropHandlers,
 } from "../lib/imageInsert";
 
@@ -69,17 +69,17 @@ export function Composer({
   }
 
   /**
-   * 粘贴图片。
+   * 粘贴附件。
    *
-   * 只在剪贴板里真的有图片时才 `preventDefault`：如果是普通文字，
+   * 只在剪贴板里真的有**文件**时才 `preventDefault`：如果是普通文字，
    * 让浏览器按默认行为插到光标处就好 —— 自己接管纯文本粘贴会丢掉
    * 富文本转换、撤销栈这些我们没打算重写的东西。
    */
   function handlePaste(e: ClipboardEvent<HTMLTextAreaElement>) {
-    const files = imageFilesFromClipboard(e.clipboardData?.items ?? null);
+    const files = filesFromClipboard(e.clipboardData?.items ?? null);
     if (files.length === 0 || disabled) return;
     e.preventDefault(); // 不挡的话 WebView 会自己插一段它理解的图片 HTML
-    void insertImages(api, e.currentTarget, files, setDraft).catch((err) =>
+    void insertAttachments(api, e.currentTarget, files, setDraft).catch((err) =>
       onError?.(errorText(err))
     );
   }
@@ -95,12 +95,16 @@ export function Composer({
   /**
    * 通过按钮选文件。
    *
-   * 拖拽和粘贴都有各自的盲区：图在手机上、在一段聊天记录里、在剪贴板里
-   * （截图工具没开）时，这两条路都够不着。留一个"去选一张"的入口，
-   * 用户至少永远有一条路能把图送进来。
+   * 拖拽和粘贴都有各自的盲区：文件在手机上、在另一段聊天记录里、在剪贴板里
+   * （截图工具没开）时，这两条路都够不着。留一个"去选一个"的入口，
+   * 用户至少永远有一条路能把文件送进来。
+   *
+   * **不设 `accept`**：图片只是附件里最常见的一类。写死 `image/*` 的话，
+   * 用户想存一张发票、一份 PDF、一段录音，文件对话框里根本选不到。
+   * 后端存得下任意字节，类型由 `sniff_mime` 兜底，所以这里放开是安全的。
    *
    * 选完立刻清空 `value`：同一个文件连选两次时浏览器不会再派发 change，
-   * 而"重新选一次同一张图"恰恰是换回来最自然的操作。
+   * 而"重新选一次同一个文件"恰恰是换回来最自然的操作。
    */
   function onPickFiles(e: React.ChangeEvent<HTMLInputElement>) {
     const files = Array.from(e.target.files ?? []);
@@ -108,7 +112,7 @@ export function Composer({
     const el = ref.current;
     if (files.length === 0 || !el || disabled) return;
     el.focus();
-    void insertImages(api, el, files, setDraft).catch((err) => onError?.(errorText(err)));
+    void insertAttachments(api, el, files, setDraft).catch((err) => onError?.(errorText(err)));
   }
 
   return (
@@ -133,7 +137,7 @@ export function Composer({
       <div className="composer-bar">
         <span className="composer-target">
           {dropActive ? (
-            "松手就把图片存进来"
+            "松手就存进来"
           ) : (
             <>
               发送到 <strong>{targetLabel}</strong>
@@ -148,8 +152,8 @@ export function Composer({
             className="attach-btn"
             onClick={() => filePicker.current?.click()}
             disabled={disabled}
-            title="选一张图片（也可以直接粘贴或拖进来）"
-            aria-label="选择图片"
+            title="选一个文件（也可以直接粘贴或拖进来）"
+            aria-label="选择文件"
           >
             📎
           </button>
@@ -157,7 +161,6 @@ export function Composer({
             ref={filePicker}
             className="attach-input"
             type="file"
-            accept="image/*"
             multiple
             onChange={onPickFiles}
             aria-hidden="true"

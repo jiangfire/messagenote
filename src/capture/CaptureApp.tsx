@@ -12,8 +12,8 @@ import { LogicalSize } from "@tauri-apps/api/dpi";
 import { useApi } from "../lib/apiContext";
 import { errorText } from "../lib/errors";
 import {
-  imageFilesFromClipboard,
-  insertImages,
+  filesFromClipboard,
+  insertAttachments,
   makeImageDropHandlers,
 } from "../lib/imageInsert";
 
@@ -127,17 +127,17 @@ export default function CaptureApp() {
   }
 
   /**
-   * 粘贴图片。浮层里这一步尤其值钱：截图之后按快捷键唤起、直接 Ctrl+V，
+   * 粘贴附件。浮层里这一步尤其值钱：截图之后按快捷键唤起、直接 Ctrl+V，
    * 中间不需要"先保存成文件"。
    *
-   * 只在剪贴板里确实有图片时才接管，纯文本粘贴近乎是同一个输入框的主用途，
-   * 不能因为我们想支持图片就把它也拦下来。
+   * 只在剪贴板里确实有**文件**时才接管，纯文本粘贴近乎是同一个输入框的主用途，
+   * 不能因为我们想支持附件就把它也拦下来。
    */
   function onPaste(e: ClipboardEvent<HTMLTextAreaElement>) {
-    const files = imageFilesFromClipboard(e.clipboardData?.items ?? null);
+    const files = filesFromClipboard(e.clipboardData?.items ?? null);
     if (files.length === 0) return;
     e.preventDefault();
-    void insertImages(api, e.currentTarget, files, setDraft).catch((err) =>
+    void insertAttachments(api, e.currentTarget, files, setDraft).catch((err) =>
       setError(errorText(err))
     );
   }
@@ -175,7 +175,7 @@ export default function CaptureApp() {
               {error}
             </span>
           ) : dropActive ? (
-            <span className="cap-target">松手就把图片存进来</span>
+            <span className="cap-target">松手就存进来</span>
           ) : (
             <span className="cap-target">📥 收件箱</span>
           )}

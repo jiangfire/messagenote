@@ -1,14 +1,19 @@
 import type { DragEvent, RefObject } from "react";
 import type { NoteApi } from "./apiContext";
-import { attachmentMarkdown } from "./attachmentRef";
+import { attachmentFileMarkdown, attachmentMarkdown } from "./attachmentRef";
 
 /**
- * 输入框里的图片粘贴与拖拽。
+ * 输入框里的附件粘贴与拖拽。
+ *
+ * **附件不限于图片**：图片内联成 `![图片](attachment:sha)`，其它文件
+ * 成 `[名字](attachment:sha)` 链接。后端本来就存得下任意字节
+ * （`messagenote_core::attachment::sniff_mime` 会给未知类型兜底成
+ * `application/octet-stream`），前端原先按 `image/` 过滤只是没走到那一步。
  *
  * ## 为什么单独一个文件
  *
  * 产品里有两个输入框要支持它：主时间线的 `Composer`，和桌面端的捕获浮层。
- * 两者的区别只是"发送之后去哪儿"，粘贴图片这件事一模一样。复制一份的话，
+ * 两者的区别只是"发送之后去哪儿"，插入附件这件事一模一样。复制一份的话，
  * 光标处理这种细节（下面全是坑）就会在两次改动里慢慢分叉。
  *
  * ## 为什么不是"追加到末尾"
@@ -60,41 +65,66 @@ async function fileBytes(file: File): Promise<Uint8Array<ArrayBuffer>> {
   return new Uint8Array(await file.arrayBuffer());
 }
 
+/**
+ * 判断是不是图片。
+ *
+ * 不看扩展名：粘贴板和拖拽给的 File 没有可信的扩展名，
+ * 而剪贴板里的截图 `type` 一定是 `image/png` 这类 MIME。
+ */
 function isImage(file: File): boolean {
-  // 不看扩展名：粘贴板和拖拽给的 File 没有可信的扩展名，
-  // 而剪贴板里的截图 `type` 一定是 `image/png` 这类 MIME。
   return file.type.startsWith("image/");
 }
 
 /**
- * 存下这些图片，并把 Markdown 引用插到光标处。
+ * 这份 File 到底能不能当附件存进去。
  *
- * 多张按顺序插入（一次拖进来三张，顺序就该和用户选的一样），
- * 单张失败不影响其余的 —— 失败的那些攒起来在最后一起报，由调用方显示。
+ * **空文件要挡掉**，而判据不是 `size === 0` 一刀切 —— 拖进来的**文件夹**
+ * 在 DataTransfer 里就是一个 size 为 0、type 为空的项，它显然不是附件。
+ * 零字节的 txt 却是合法附件（用户就是想记一个空行）。
+ *
+ * 所以按"有没有文件名"来分：拖文件夹时浏览器给的 `name` 是空的，
+ * 真实文件一定有名字。这个判据和类型无关，因此对图片和非图片一样成立。
+ */
+function isUsableFile(file: File): boolean {
+  return file.name !== "" && file.size > 0;
+}
+
+/**
+ * 存下这些附件，并把 Markdown 引用插到光标处。
+ *
+ * 图片插成 `![图片](attachment:sha)`，非图片插成 `[名字](attachment:sha)`
+ * —— 后者能点开存下来，前者渲染成破图。
+ *
+ * 多份按顺序插入（一次拖进来三个，顺序就该和用户选的一样），
+ * 单份失败不影响其余的 —— 失败的那些攒起来在最后一起报，由调用方显示。
  *
  * 素材（正文、光标位置）在**进入函数时取一次快照**：这里面的 await 会让出
- * 事件循环，用户完全可能在"图正在存"的时候继续打字，而边打字边往
+ * 事件循环，用户完全可能在"文件正在存"的时候继续打字，而边打字边往
  * `textarea.value` 上追加会把刚敲的字吃掉。
  */
-export async function insertImages(
+export async function insertAttachments(
   api: NoteApi,
   textarea: HTMLTextAreaElement,
   files: File[],
   setValue: (v: string) => void
 ): Promise<void> {
-  const images = files.filter(isImage);
-  if (images.length === 0) return;
+  const usable = files.filter(isUsableFile);
+  if (usable.length === 0) return;
 
   let value = textarea.value;
   let caret = textarea.selectionStart ?? value.length;
   let caretEnd = textarea.selectionEnd ?? caret;
   const failures: string[] = [];
 
-  for (const file of images) {
+  for (const file of usable) {
     try {
       const sha = await api.saveAttachment(await fileBytes(file));
-      // 每插一张都重新算光标：上一张插进正文之后，光标已经不在原位了。
-      const edit = insertAtCursor(value, caret, caretEnd, attachmentMarkdown(sha));
+      // 图片内联、非图片成链接：同一个 sha，语法按能不能渲染来选。
+      const snippet = isImage(file)
+        ? attachmentMarkdown(sha)
+        : attachmentFileMarkdown(sha, file.name);
+      // 每插一份都重新算光标：上一份插进正文之后，光标已经不在原位了。
+      const edit = insertAtCursor(value, caret, caretEnd, snippet);
       value = edit.value;
       caret = edit.caret;
       caretEnd = edit.caret;
@@ -106,7 +136,7 @@ export async function insertImages(
       // 快速连粘时和用户的手动点击抢光标。
       textarea.setSelectionRange(caret, caret);
     } catch (e) {
-      failures.push(`${file.name || "剪贴板图片"}：${e instanceof Error ? e.message : String(e)}`);
+      failures.push(`${file.name || "附件"}：${e instanceof Error ? e.message : String(e)}`);
     }
   }
 
@@ -116,22 +146,30 @@ export async function insertImages(
   if (failures.length > 0) throw new Error(failures.join("；"));
 }
 
-/** 从剪贴板里挑出图片文件。非图片的项原样留给浏览器处理。 */
-export function imageFilesFromClipboard(items: DataTransferItemList | null): File[] {
+/**
+ * 从剪贴板里挑出**文件**（图片和其它附件都要）。
+ *
+ * 非文件的项原样留给浏览器处理 —— 纯文本粘贴是这个输入框的主用途，
+ * 不能因为我们想支持附件就把它也拦下来。
+ */
+export function filesFromClipboard(items: DataTransferItemList | null): File[] {
   if (!items) return [];
   const out: File[] = [];
   for (const item of items) {
-    if (item.kind !== "file" || !item.type.startsWith("image/")) continue;
+    if (item.kind !== "file") continue;
     const file = item.getAsFile();
-    if (file) out.push(file);
+    if (file && isUsableFile(file)) out.push(file);
   }
   return out;
 }
 
-/** 从拖拽里挑出图片文件。拖进来一个文件夹或一堆 .zip 时什么也不做。 */
-export function imageFilesFromDrop(dt: DataTransfer | null): File[] {
+/**
+ * 从拖拽里挑出文件。图片和其它附件都要，但文件夹要挡掉 ——
+ * 见 [`isUsableFile`]，那里说明了为什么不能只看 size。
+ */
+export function filesFromDrop(dt: DataTransfer | null): File[] {
   if (!dt) return [];
-  return Array.from(dt.files).filter(isImage);
+  return Array.from(dt.files).filter(isUsableFile);
 }
 
 export interface ImageDropHandlers {
@@ -182,12 +220,12 @@ export function makeImageDropHandlers(
       setActive(false);
       const el = textarea.current;
       if (!el) return;
-      const files = imageFilesFromDrop(e.dataTransfer);
+      const files = filesFromDrop(e.dataTransfer);
       if (files.length === 0) return;
       // 落点当作光标位置：拖拽本身没有"光标在文字中间"的概念，
       // 直接把焦点交回输入框，插入位置就是它当前的选区。
       el.focus();
-      void insertImages(api, el, files, setValue).catch(onError);
+      void insertAttachments(api, el, files, setValue).catch(onError);
     },
   };
 }

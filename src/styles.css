@@ -933,6 +933,19 @@ kbd {
   color: var(--accent);
 }
 
+/* 附件链接：加个 📎 前缀（用 ::before 而不是改 innerText，
+   这样"取不到字节"时把 href 摘掉，文字本身还在，
+   用户至少知道这里原本是个附件而不是一个坏掉的链接）。 */
+.md a[data-md-attachment]::before {
+  content: "📎 ";
+}
+
+.md a.md-attachment-missing {
+  color: var(--muted);
+  text-decoration: line-through;
+  cursor: default;
+}
+
 .md table {
   border-collapse: collapse;
   margin: 0.5em 0;
