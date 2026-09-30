@@ -1584,4 +1584,98 @@ mod tests {
         assert_eq!(exact.items.len(), 1);
         assert!(!exact.has_more, "只有一条时不该说还有更多");
     }
+
+    // ------------------------------------------------ 附件的去重
+
+    /// 同一份字节存两次**只占一份空间**。
+    ///
+    /// 去重不是这里额外的逻辑，而是内容寻址白送的性质（主键就是内容的 sha256，
+    /// 写入是 `ON CONFLICT DO NOTHING`）。正因为它"白送"，才更需要一条守卫：
+    /// 主键一旦被改掉（比如将来为了别的理由换成自增 id + 唯一索引），同一张图会被
+    /// 存成 N 份，而且**不报错** —— 只是库文件在没人注意的地方悄悄变大，
+    /// 同步时也白传几遍。
+    ///
+    /// **它挡不住的是"把 `DO NOTHING` 改成 `DO UPDATE`"**：同样的字节覆盖同样的
+    /// 字节，行数和字节总量都不变，这条测试照样绿。那种改动是无害的，
+    /// 所以这里也不假装能测出来。
+    #[test]
+    fn storing_the_same_bytes_twice_keeps_a_single_copy() {
+        let db = mem();
+        let conn = db.conn().unwrap();
+
+        // 三张图：两张一样，一张不同
+        let png = b"\x89PNG\r\n\x1a\n".to_vec();
+        let mut other = png.clone();
+        other.push(0x2a);
+
+        let first = save_attachment(&conn, &png).unwrap();
+        let again = save_attachment(&conn, &png).unwrap();
+        assert_eq!(first, again, "同样的字节必须得到同样的名字");
+
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM attachment", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 1, "同一份字节只该有一行");
+
+        let stored: i64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(LENGTH(bytes)), 0) FROM attachment",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, png.len() as i64, "字节本身也只该留一份");
+
+        // 内容不同就是另一份 —— 去重不能去成"后一份覆盖前一份"
+        let different = save_attachment(&conn, &other).unwrap();
+        assert_ne!(first, different);
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM attachment", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 2);
+    }
+
+    /// 两条记录引用同一张图，也只存一份。
+    ///
+    /// 这是去重真正要解决的场景：同一张截图被粘进两条笔记（或两台设备各粘一次），
+    /// 引用出现两次而字节只有一份。所以这里**存两次**（模拟两台设备各自粘一次）
+    /// 再断言只有一行 —— 只存一次的话 `assert_eq!(rows, 1)` 是恒真的，
+    /// 那样的守卫测试永远不会红。
+    #[test]
+    fn two_messages_referencing_the_same_image_share_one_copy() {
+        let db = mem();
+        let conn = db.conn().unwrap();
+
+        let png = b"\x89PNG\r\n\x1a\n".to_vec();
+        let first = save_attachment(&conn, &png).unwrap();
+        let second = save_attachment(&conn, &png).unwrap();
+        assert_eq!(first, second, "两台设备各存一次，名字必须是同一个");
+
+        let sha = first;
+        append_message(&conn, &format!("第一次 ![图](attachment:{sha})"), None).unwrap();
+        append_message(&conn, &format!("第二次 ![图](attachment:{sha})"), None).unwrap();
+
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM attachment", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 1, "两条记录引用同一张图，库里只该有一份");
+
+        let stored: i64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(LENGTH(bytes)), 0) FROM attachment",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, png.len() as i64, "字节也只该留一份");
+
+        // 两份正文都还引用得到同一份字节
+        for m in list_messages(&conn, Scope::All, 50, None, None)
+            .unwrap()
+            .items
+        {
+            let (_mime, bytes) = read_attachment(&conn, &sha).unwrap();
+            assert_eq!(bytes, png, "正文：{}", m.body);
+        }
+    }
 }
