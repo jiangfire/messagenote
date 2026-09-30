@@ -2,6 +2,7 @@ import { createContext, useContext, useMemo, type ReactNode } from "react";
 import type {
   Channel,
   Cursor,
+  ExportFilter,
   ExportSummary,
   HealthResponse,
   Message,
@@ -146,8 +147,15 @@ export interface DesktopApi {
    * `utcOffsetMinutes` 是本地时区相对 UTC 的偏移（**东为正**，东八区 480）。
    * 传 `-new Date().getTimezoneOffset()`：文件名要的是本地时间，
    * 而 Rust 侧没有时区库，也不值得为一个文件名引入一个。
+   *
+   * `filter` 省略（或 null）= 全量导出；给了就只导命中的那部分。
+   * 区间、频道的折算都在界面上做完，Rust 侧不解释任何时区约定。
    */
-  exportMarkdown(dir: string, utcOffsetMinutes: number): Promise<ExportSummary>;
+  exportMarkdown(
+    dir: string,
+    utcOffsetMinutes: number,
+    filter?: ExportFilter | null
+  ): Promise<ExportSummary>;
   /**
    * 把一条记录渲染成 Markdown，给"复制这一条"用。
    *

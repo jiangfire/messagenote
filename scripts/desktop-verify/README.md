@@ -44,7 +44,7 @@
 | --- | --- |
 | `cdp-eval.mjs` | 极简 CDP 求值器：`node cdp-eval.mjs '<url正则>' '<JS表达式>'`。**其它脚本都靠它**。窗口靠 URL 区分：主窗口是 `tauri\.localhost/$`，浮层是 `capture\.html`。 |
 | `paste-verify.ps1` + `paste-db.py` | 合成真实全局快捷键 + `Ctrl+V` 粘一张 12×12 的 PNG，再查库断言"字节的 sha256 == 正文里写的 sha"且"解出来真的是 12×12"。**跑之前保存剪贴板、跑完还原。** |
-| `export-verify.mjs` + `export-db.py` | 用应用自己的写命令造数据 → 调 `export_markdown` → 断言文件树、front-matter、以及**附件相对路径真能取到那份字节**（不是"字符串长这样"）。 |
+| `export-verify.mjs` + `export-db.py` | 用应用自己的写命令造数据 → 调 `export_markdown`（全量 + 四种筛选）→ 断言文件树、front-matter、**附件相对路径真能取到那份字节**（不是"字符串长这样"）、筛选的区间端点含不含在内、以及导出面板本身（菜单 → 面板 → 控件 → 日期写反被拦住）。 |
 | `copy-verify.mjs` | 单条复制：断言图被内联成 data URI，并在 Node 这边**独立解码**再和原字节逐字节比。 |
 | `sse-latency.mjs` + `sse-latency-db.py` | 量"服务端写一条 → 桌面端**界面**（或本地库）多久看到"，用来分辨 SSE 和 45 秒轮询兜底哪条在起作用。 |
 | `capture.ps1` / `shot-overlay-live.ps1` | 截主窗口 / 截捕获浮层，用来**看**界面到底显示了什么。 |
@@ -63,7 +63,7 @@ Start-Process .\target\release\messagenote.exe
 # 单条复制（不用起服务端）
 node scripts\desktop-verify\copy-verify.mjs
 
-# 全量导出
+# 导出（全量 + 筛选）与导出面板
 node scripts\desktop-verify\export-verify.mjs
 python scripts\desktop-verify\export-db.py
 
@@ -85,4 +85,7 @@ pwsh -NoProfile -File scripts\desktop-verify\paste-verify.ps1
 - **别用点按钮的方式验带原生对话框的路径。** 选目录会弹 Windows 原生对话框，
   CDP 驱动不了；那一段只能人点。用 `__TAURI_INTERNALS__.invoke` 直接调命令，
   验的是**命令接缝**（也就是最容易错的那一层），并把这个边界说清楚，
-  而不是假装验过了。
+  而不是假装验过了。**面板本身**（不含那个对话框）是可以点着验的：
+  `export-verify.mjs` 里第二段就是点 ⋯ → 点「导出记录…」→ 改控件 → 读 DOM。
+  给 React 的受控输入赋值要走原生 setter（`HTMLInputElement.prototype` 上的
+  那个 `value` setter），直接 `el.value = x` 它收不到，React 记着自己写进去的值。

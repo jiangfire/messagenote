@@ -1160,6 +1160,13 @@ kbd {
   border-radius: var(--radius);
   background: var(--panel);
   box-shadow: var(--shadow-pop);
+  /* 面板比窗口高时要能滚。
+     窗口最小高度是 480（tauri.conf.json），减去 backdrop 的上下 padding 只剩
+     432 —— 导出面板在最大字号 + 一段多行的结果提示下能到 700 以上，不滚的话
+     「选择目录并导出 / 关闭」整行被切在视口外面，**用户关不掉面板**。
+     （原来只有同步设置那个小面板，装得下，所以一直没暴露。） */
+  max-height: calc(100vh - 48px);
+  overflow-y: auto;
 }
 
 .modal h2 {
@@ -1184,7 +1191,9 @@ kbd {
   color: var(--muted);
 }
 
-.field input {
+/* 输入框和下拉框共用一套外观：同一个表单里两种控件长得不一样最扎眼。 */
+.field input,
+.field select {
   width: 100%;
   padding: 8px 10px;
   border: 1px solid var(--border);
@@ -1196,12 +1205,14 @@ kbd {
   outline: none;
 }
 
-.field input:focus {
+.field input:focus,
+.field select:focus {
   border-color: var(--accent);
   box-shadow: 0 0 0 3px var(--accent-soft);
 }
 
-.field input:disabled {
+.field input:disabled,
+.field select:disabled {
   opacity: 0.6;
 }
 
@@ -1230,11 +1241,20 @@ kbd {
   border-radius: 8px;
   font-size: 0.78125rem;
   overflow-wrap: anywhere;
+  /* 导出结果和"没带出来几个附件"是多行的，按换行符断行 */
+  white-space: pre-line;
 }
 
 .note.ok {
   background: rgba(22, 163, 74, 0.12);
   color: #16a34a;
+}
+
+/* 「做完了，但结果为空」这类**正常**的结果。
+   用红的那一档会读成"出错了"，而"这个筛选下没有记录"不是错误。 */
+.note.info {
+  background: rgba(120, 120, 140, 0.14);
+  color: var(--muted);
 }
 
 .note.err {

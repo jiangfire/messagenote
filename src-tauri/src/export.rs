@@ -13,6 +13,18 @@
 //!
 //! 先 `blob_meta`（轻，不含字节）决定每个引用的相对路径，之后再逐个读字节写盘。
 //! 合成一步就得把所有附件同时捏在内存里 —— 一份图多的库能到几百 MB。
+//!
+//! ## 筛选发生在这一层，不下推到 `list_messages`
+//!
+//! 频道和标签能表达成共享层的 [`db::Scope`]（那套「频道管归属、标签管横切」的
+//! 定义只有一份），**时间范围不能**：导出要的是一个**区间**，而 `list_messages`
+//! 只认下界 `since`。两处各管一半的后果是"这个区间到底含不含端点"会有两个答案，
+//! 而用户看到的只是"少了一条"。所以时间在这里一次筛完，端点都算数。
+//!
+//! 代价是**窄区间导出仍然会把整表翻一遍**（筛完才丢）。这是有意的取舍：
+//! 正确性只有一份实现，而导出是一次性的用户动作，翻表的成本全量导出本来也要付。
+//! 真要优化，把 `since` 下推是**安全**的（`list_messages` 的下界同样是闭的），
+//! 但那会让"下界"重新变成两处各写一遍 —— 等它真的成为瓶颈再说。
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -33,6 +45,50 @@ const ATTACHMENTS_DIR: &str = "attachments";
 
 /// 枚举时一页取多少条。`list_messages` 自己会把上限收到 500。
 const PAGE: i64 = 500;
+
+/// 导出筛选。四个字段全空 = 全量导出。
+///
+/// `Deserialize` 是给 IPC 用的：前端直接传一个对象（或 `null`），而不是四个
+/// 各自可为空的参数 —— 这四个字段是一件事（"导哪一部分"），不是一个签名。
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportFilter {
+    /// 只导这个频道。收件箱也是一个频道（id 固定为 `inbox`），不用特判。
+    pub channel_id: Option<String>,
+    /// 只导打了这个标签的记录。标签是横切的，与频道正交 —— 两个都给时取交集。
+    pub tag: Option<String>,
+    /// 时间范围下界（epoch 毫秒，**含端点**）。
+    pub from_ms: Option<i64>,
+    /// 时间范围上界（epoch 毫秒，**含端点**）。
+    pub to_ms: Option<i64>,
+}
+
+impl ExportFilter {
+    /// 时间范围在界面上可能就是同一个日期（起 = 止），这里不特判：
+    /// `from == to` 自然就是"那一毫秒"，而调用方给的是当天的 0 点和 23:59:59.999。
+    ///
+    /// 频道**只在"标签也给了"的时候**才在这里补一刀：那时 SQL 走的是标签
+    /// （见 `selected_messages`），频道条件就落到了这一层。
+    fn matches(&self, m: &Message) -> bool {
+        if let Some(from) = self.from_ms {
+            if m.created_at < from {
+                return false;
+            }
+        }
+        if let Some(to) = self.to_ms {
+            if m.created_at > to {
+                return false;
+            }
+        }
+        if self.tag.is_some() {
+            if let Some(id) = self.channel_id.as_deref() {
+                // `channel_id` 是非空列，所以这就是 SQL 里那句 `m.channel_id = ?`
+                return m.channel_id == id;
+            }
+        }
+        true
+    }
+}
 
 /// 频道名查不到时的落点。
 ///
@@ -114,14 +170,15 @@ pub fn render_one(
     )))
 }
 
-/// 把整库导出到 `dir`（不存在就建）。
+/// 把整库（或筛选出的那一部分）导出到 `dir`（不存在就建）。
 pub fn export_to(
     conn: &Connection,
     dir: &Path,
     utc_offset_minutes: i32,
+    filter: &ExportFilter,
 ) -> AppResult<ExportSummary> {
     let channels = channel_names(conn)?;
-    let messages = all_messages(conn)?;
+    let messages = selected_messages(conn, filter)?;
 
     // 第一遍：只碰元数据，决定每个被引用附件的相对路径。
     let mut paths: HashMap<String, String> = HashMap::new();
@@ -227,15 +284,32 @@ fn channel_names(conn: &Connection) -> AppResult<HashMap<String, String>> {
         .collect())
 }
 
-/// 按 `(created_at, id)` 顺序把**全部**未删除记录翻完。
+/// 按 `(created_at, id)` 顺序把筛选命中的记录翻完。
 ///
 /// 用游标翻页而不是一次性 `SELECT *`：`list_messages` 的上限是 500，
 /// 而且它维护的是和界面同一个查询 —— 这里就不该再写一份取数的 SQL。
-fn all_messages(conn: &Connection) -> AppResult<Vec<Message>> {
+///
+/// 翻页拿到的每一页都可能是"被筛掉一部分"的，所以游标取的是**原始页的最后一条**，
+/// 而不是筛完之后的 —— 否则筛空的那些页会让翻页提前停住，后面还有记录也不翻了。
+fn selected_messages(conn: &Connection, filter: &ExportFilter) -> AppResult<Vec<Message>> {
+    // **标签优先。** 两个筛选都给的时候 SQL 走标签、频道在 `matches` 里补 ——
+    // 这样"什么算有这个标签"只有 `Scope::Tag` 一份定义。反过来（SQL 走频道、
+    // 标签在 Rust 里比 `m.tags`）就成了两个谓词：`Scope::Tag` 只看
+    // `message_tag.deleted_at`，而 `m.tags` 还要求 `tag.deleted_at IS NULL`，
+    // 于是一条"标签行被软删、消息上的关联还在"的记录会在两种筛法下得到
+    // **两个答案** —— 而用户看到的只是"少了一条"。
+    let scope = if let Some(tag) = filter.tag.as_deref() {
+        db::Scope::Tag(tag)
+    } else if let Some(id) = filter.channel_id.as_deref() {
+        db::Scope::Channel(id)
+    } else {
+        db::Scope::All
+    };
+
     let mut out: Vec<Message> = Vec::new();
     let mut before: Option<db::Cursor> = None;
     loop {
-        let page = db::list_messages(conn, db::Scope::All, PAGE, before.as_ref(), None)?;
+        let page = db::list_messages(conn, scope, PAGE, before.as_ref(), None)?;
         if page.items.is_empty() {
             break;
         }
@@ -247,6 +321,7 @@ fn all_messages(conn: &Connection) -> AppResult<Vec<Message>> {
         }
     }
     db::attach_tags(conn, &mut out)?;
+    out.retain(|m| filter.matches(m));
     Ok(out)
 }
 
@@ -300,7 +375,7 @@ mod tests {
         db::set_message_tags(&conn, &m.id, &["重要".to_string()]).unwrap();
 
         let dir = tmpdir("full");
-        let sum = export_to(&conn, &dir, 480).unwrap();
+        let sum = export_to(&conn, &dir, 480, &ExportFilter::default()).unwrap();
         assert_eq!(sum.messages, 1);
         assert_eq!(sum.attachments, 1);
         assert_eq!(sum.missing_attachments, 0);
@@ -338,7 +413,7 @@ mod tests {
         db::append_message(&conn, &format!("看图 attachment:{sha}"), None).unwrap();
 
         let dir = tmpdir("missing");
-        let sum = export_to(&conn, &dir, 0).unwrap();
+        let sum = export_to(&conn, &dir, 0, &ExportFilter::default()).unwrap();
         assert_eq!(sum.messages, 1);
         assert_eq!(sum.attachments, 0);
         assert_eq!(sum.missing_attachments, 1, "取不到的附件要被数出来告诉用户");
@@ -371,6 +446,194 @@ mod tests {
         );
         // 判重按目录来：另一个频道下的同名文件本来就该各自保留
         assert_eq!(unique_name(&mut used, "项目B", base), base);
+    }
+
+    /// 直接改一条记录的 `created_at`。
+    ///
+    /// 时间范围筛选要验的是**端点算不算数**，那就必须能把一条记录钉在一个确切的
+    /// 时刻上；靠 `append_message` 拿到的"现在"只能验个大概。
+    fn pin_created_at(conn: &Connection, id: &str, ms: i64) {
+        conn.execute(
+            "UPDATE message SET created_at = ?2 WHERE id = ?1",
+            rusqlite::params![id, ms],
+        )
+        .unwrap();
+    }
+
+    /// 三个真实量级的时刻：相隔一天，而且都是 2023 年之后的毫秒值。
+    /// 玩具数（1、2、3）测不出"把毫秒当成秒"这类单位错误。
+    const T1: i64 = 1_700_000_000_000;
+    const T2: i64 = 1_700_086_400_000;
+    const T3: i64 = 1_700_172_800_000;
+
+    fn md_files_in(dir: &Path) -> Vec<String> {
+        if !dir.exists() {
+            return Vec::new();
+        }
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn an_export_filtered_by_channel_leaves_the_other_channels_out() {
+        let db = db::open_memory("test-device").unwrap();
+        let conn = db.conn().unwrap();
+        let a = db::create_channel(&conn, "项目A").unwrap();
+        let b = db::create_channel(&conn, "项目B").unwrap();
+        db::append_message(&conn, "A 里的", Some(&a.id)).unwrap();
+        db::append_message(&conn, "B 里的", Some(&b.id)).unwrap();
+        db::append_message(&conn, "收件箱里的", None).unwrap();
+
+        let dir = tmpdir("by-channel");
+        let filter = ExportFilter {
+            channel_id: Some(a.id.clone()),
+            ..Default::default()
+        };
+        let sum = export_to(&conn, &dir, 0, &filter).unwrap();
+
+        assert_eq!(sum.messages, 1);
+        assert_eq!(sum.channels, 1);
+        let md = fs::read_to_string(only_md(&dir.join("项目A"))).unwrap();
+        assert!(md.contains("A 里的"), "实际：{md}");
+        // "没导出"和"导出了但目录是空的"要分得清：别的频道目录根本不该被建出来
+        assert!(!dir.join("项目B").exists(), "别的频道不该有目录");
+        assert!(
+            !dir.join("收件箱").exists(),
+            "没收件箱的记录就不该建收件箱目录"
+        );
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 收件箱也是一个频道，`channel_id = "inbox"` 能直接筛。
+    ///
+    /// 这一条看着像废话，但导出面板里"收件箱"就是下拉里的一个选项，
+    /// 而它的 id 是**固定字符串**而不是随机 UUID —— 哪天有人给它加个特判、
+    /// 或者把固定 id 换掉，"只导未归档的"会**静默**变成导出一棵空目录树。
+    #[test]
+    fn the_inbox_is_selectable_as_a_channel() {
+        let db = db::open_memory("test-device").unwrap();
+        let conn = db.conn().unwrap();
+        let a = db::create_channel(&conn, "项目A").unwrap();
+        db::append_message(&conn, "已归档的", Some(&a.id)).unwrap();
+        db::append_message(&conn, "还在收件箱的", None).unwrap();
+
+        let dir = tmpdir("inbox");
+        let filter = ExportFilter {
+            channel_id: Some("inbox".into()),
+            ..Default::default()
+        };
+        let sum = export_to(&conn, &dir, 0, &filter).unwrap();
+
+        assert_eq!(sum.messages, 1);
+        let md = fs::read_to_string(only_md(&dir.join("收件箱"))).unwrap();
+        assert!(md.contains("还在收件箱的"), "实际：{md}");
+        assert!(!dir.join("项目A").exists(), "别的频道不该被导出来");
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn channel_and_tag_together_are_an_intersection() {
+        let db = db::open_memory("test-device").unwrap();
+        let conn = db.conn().unwrap();
+        let a = db::create_channel(&conn, "项目A").unwrap();
+        let b = db::create_channel(&conn, "项目B").unwrap();
+
+        let in_a_tagged = db::append_message(&conn, "A 且重要", Some(&a.id)).unwrap();
+        db::set_message_tags(&conn, &in_a_tagged.id, &["重要".into()]).unwrap();
+        let in_a_plain = db::append_message(&conn, "A 但没标签", Some(&a.id)).unwrap();
+        db::set_message_tags(&conn, &in_a_plain.id, &["次要".into()]).unwrap();
+        let in_b_tagged = db::append_message(&conn, "B 且重要", Some(&b.id)).unwrap();
+        db::set_message_tags(&conn, &in_b_tagged.id, &["重要".into()]).unwrap();
+
+        let dir = tmpdir("channel-and-tag");
+        let filter = ExportFilter {
+            channel_id: Some(a.id.clone()),
+            tag: Some("重要".into()),
+            ..Default::default()
+        };
+        let sum = export_to(&conn, &dir, 0, &filter).unwrap();
+
+        // `Scope` 表达不了"这个频道里带这个标签的"，所以这一条真的会被验到：
+        // 少筛一半就会把"B 且重要"或"A 但没标签"也导出来
+        assert_eq!(
+            sum.messages,
+            1,
+            "实际：{:?}",
+            md_files_in(&dir.join("项目A"))
+        );
+        let md = fs::read_to_string(only_md(&dir.join("项目A"))).unwrap();
+        assert!(md.contains("A 且重要"), "实际：{md}");
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_time_range_includes_both_endpoints() {
+        let db = db::open_memory("test-device").unwrap();
+        let conn = db.conn().unwrap();
+        let a = db::create_channel(&conn, "项目A").unwrap();
+
+        let first = db::append_message(&conn, "第一天", Some(&a.id)).unwrap();
+        let middle = db::append_message(&conn, "第二天", Some(&a.id)).unwrap();
+        let last = db::append_message(&conn, "第三天", Some(&a.id)).unwrap();
+        pin_created_at(&conn, &first.id, T1);
+        pin_created_at(&conn, &middle.id, T2);
+        pin_created_at(&conn, &last.id, T3);
+
+        // 起止都取在**已有记录的整点上**：区间是闭区间，两端那两条都要在
+        let dir = tmpdir("range-inclusive");
+        let filter = ExportFilter {
+            from_ms: Some(T1),
+            to_ms: Some(T2),
+            ..Default::default()
+        };
+        let sum = export_to(&conn, &dir, 0, &filter).unwrap();
+
+        assert_eq!(
+            sum.messages,
+            2,
+            "实际：{:?}",
+            md_files_in(&dir.join("项目A"))
+        );
+        let bodies: String = md_files_in(&dir.join("项目A"))
+            .iter()
+            .map(|n| fs::read_to_string(dir.join("项目A").join(n)).unwrap())
+            .collect();
+        assert!(bodies.contains("第一天"), "下界那一条要算数：{bodies}");
+        assert!(bodies.contains("第二天"), "上界那一条要算数：{bodies}");
+        assert!(!bodies.contains("第三天"), "上界之外的不该进来：{bodies}");
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_filter_that_matches_nothing_writes_nothing_and_says_zero() {
+        let db = db::open_memory("test-device").unwrap();
+        let conn = db.conn().unwrap();
+        db::append_message(&conn, "一条普通的记录", None).unwrap();
+
+        // 谁都没有这个标签。空结果是一个**正常的答案**，不是错误 ——
+        // 界面据此说"这个筛选下没有记录"，而不是摔一句失败。
+        let dir = tmpdir("no-match");
+        let filter = ExportFilter {
+            tag: Some("不存在的标签".into()),
+            ..Default::default()
+        };
+        let sum = export_to(&conn, &dir, 0, &filter).unwrap();
+
+        assert_eq!(sum.messages, 0);
+        assert_eq!(sum.channels, 0);
+        assert_eq!(sum.attachments, 0);
+        assert!(md_files_in(&dir.join("收件箱")).is_empty());
+
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

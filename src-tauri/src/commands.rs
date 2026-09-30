@@ -223,14 +223,23 @@ pub fn collect_garbage_attachments(db: State<'_, Db>) -> AppResult<i64> {
 /// 前端传 `-new Date().getTimezoneOffset()`。文件名要的是本地时间，而 Rust 侧
 /// 没有时区库、也不值得为一个文件名引入一个 —— 理由见
 /// `messagenote_core::export` 的模块说明。
+///
+/// `filter` 省略（或 `null`）= 全量导出。给了就只导命中的那部分：频道 / 标签 /
+/// 时间区间，三者可任意组合。**区间是闭区间**，理由见 `crate::export`。
 #[tauri::command]
 pub fn export_markdown(
     db: State<'_, Db>,
     dir: String,
     utc_offset_minutes: i32,
+    filter: Option<crate::export::ExportFilter>,
 ) -> AppResult<crate::export::ExportSummary> {
     let conn = db.conn()?;
-    crate::export::export_to(&conn, std::path::Path::new(&dir), utc_offset_minutes)
+    crate::export::export_to(
+        &conn,
+        std::path::Path::new(&dir),
+        utc_offset_minutes,
+        &filter.unwrap_or_default(),
+    )
 }
 
 /// 把一条记录渲染成 Markdown，给「复制这一条」用。

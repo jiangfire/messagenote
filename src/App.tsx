@@ -16,6 +16,7 @@ import { Stream } from "./components/Stream";
 import { Composer } from "./components/Composer";
 import { SyncBadge } from "./components/SyncBadge";
 import { SyncSettings } from "./components/SyncSettings";
+import { ExportDialog } from "./components/ExportDialog";
 import { OverflowMenu } from "./components/OverflowMenu";
 import { UpdateNotice } from "./components/UpdateNotice";
 
@@ -178,6 +179,8 @@ export default function App() {
   const [syncConfigured, setSyncConfigured] = useState(false);
   const [syncStatus, setSyncStatus] = useState<SyncStatus | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  /** 导出面板。筛选条件就定在里面，见 ExportDialog。 */
+  const [exportOpen, setExportOpen] = useState(false);
   /** 本次启动的非致命警告（快捷键被占用之类）。见下面的 effect。 */
   const [notices, setNotices] = useState<string[]>([]);
 
@@ -516,33 +519,18 @@ export default function App() {
   }, [view, timeFilter, desktop]);
 
   /**
-   * 导出全部记录到用户挑的目录。
+   * 打开导出面板。
    *
-   * **桌面端专有**：导出要往磁盘上写一棵目录树（按频道分目录 + `attachments/`），
-   * 浏览器里做不到。
+   * 导出筛选（频道 / 标签 / 起止日期）住在 `ExportDialog` 里，而不是像原来那样
+   * 一个菜单项直接弹目录选择器：筛选是"导什么"的一部分，得能在同一个地方定下来，
+   * 否则用户只能在导出之后自己去目录里挑。
    *
-   * 偏移传 `-getTimezoneOffset()`：它返回的是"本地转 UTC 要加多少分钟"，
-   * 取负才是"东为正"的口径，也正是 Rust 那边要的。
+   * 仍然**只有桌面端有**：导出要往磁盘上写一棵目录树（按频道分目录 +
+   * `attachments/`），浏览器里做不到。
    */
-  async function exportAll() {
+  function openExport() {
     if (!desktop) return;
-    const dir = await desktop.pickDirectory();
-    if (!dir) return; // 用户取消 —— 不该弹一句"导出失败"
-    try {
-      const s = await desktop.exportMarkdown(dir, -new Date().getTimezoneOffset());
-      // **取不到的附件必须说出来。** 不说的话用户只会以为导出漏了东西 ——
-      // 而导出物里那条 `attachment:<sha>` 他看不懂是什么意思。
-      const missed = s.missingAttachments
-        ? `\n\n注意：有 ${s.missingAttachments} 个附件本地还没有字节，没有带出来` +
-          `（正文里仍是 attachment: 引用）。等同步把它们拿下来再导一次即可。`
-        : "";
-      window.alert(
-        `导出完成：\n\n${s.messages} 条记录\n${s.attachments} 个附件\n` +
-          `${s.channels} 个频道目录\n\n位置：${dir}${missed}`
-      );
-    } catch (e) {
-      window.alert(`导出失败：${errorText(e)}`);
-    }
+    setExportOpen(true);
   }
 
   return (
@@ -636,10 +624,10 @@ export default function App() {
                     className="overflow-item"
                     onClick={() => {
                       close();
-                      void exportAll();
+                      openExport();
                     }}
                   >
-                    导出全部记录…
+                    导出记录…
                   </button>
                 )}
               </>
@@ -768,6 +756,14 @@ export default function App() {
             // 刚配好就立刻同步一次，用户不必等下一个自动周期
             void desktop.syncNow();
           }}
+        />
+      )}
+
+      {desktop && exportOpen && (
+        <ExportDialog
+          channels={channels}
+          tags={tags}
+          onClose={() => setExportOpen(false)}
         />
       )}
     </div>

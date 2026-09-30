@@ -122,7 +122,7 @@ export interface SyncStatus {
   conflicts: number;
 }
 
-/** 一次全量导出的结果摘要。 */
+/** 一次导出的结果摘要（全量或筛选后的）。 */
 export interface ExportSummary {
   messages: number;
   attachments: number;
@@ -134,4 +134,22 @@ export interface ExportSummary {
    */
   missingAttachments: number;
   channels: number;
+}
+
+/**
+ * 导出筛选。四个字段都是可选的，全不给 = 全量导出（这一条功能之前的行为）。
+ *
+ * 和**时间线**上那个时间档位不是一回事：档位回答"我最近记了什么"，只给下界；
+ * 导出要的是一个**区间**（写周报、交存档常常要"3 月 1 日到 3 月 31 日"），
+ * 所以这里上下界都有，而且**两端都算在内**。
+ */
+export interface ExportFilter {
+  /** 只导这个频道。收件箱也是一个频道（id 固定为 `inbox`）。 */
+  channelId?: string | null;
+  /** 只导打了这个标签的记录。和频道同时给时取交集。 */
+  tag?: string | null;
+  /** 时间范围下界（epoch 毫秒，**含端点**）。 */
+  fromMs?: number | null;
+  /** 时间范围上界（epoch 毫秒，**含端点**）。 */
+  toMs?: number | null;
 }

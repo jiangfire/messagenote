@@ -106,10 +106,18 @@ export const tauriDesktop: DesktopApi = {
     return typeof picked === "string" ? picked : null;
   },
 
-  exportMarkdown(dir, utcOffsetMinutes) {
+  exportMarkdown(dir, utcOffsetMinutes, filter) {
     // 参数名是 **camelCase**：Tauri v2 默认把 Rust 那边的 snake_case 转过来，
     // 写 `utc_offset_minutes` 会得到一个"缺少参数"的报错。
-    return invoke<ExportSummary>("export_markdown", { dir, utcOffsetMinutes });
+    //
+    // `filter` 显式传 `null` 而不是省略：全量导出时 Rust 侧收到的是空筛选，
+    // 和"这个参数根本没传"在那边是同一个意思，但显式一点，
+    // 出错时的现象是明确的。
+    return invoke<ExportSummary>("export_markdown", {
+      dir,
+      utcOffsetMinutes,
+      filter: filter ?? null,
+    });
   },
 
   renderMessageMarkdown(id, utcOffsetMinutes) {
