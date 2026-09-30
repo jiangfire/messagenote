@@ -6,6 +6,7 @@
 //! axum 服务端跑起来（绑 0 端口），不必去 spawn 二进制、也不必占固定端口。
 
 pub mod api;
+pub mod blobs;
 pub mod error;
 pub mod store;
 
@@ -14,6 +15,7 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 
 pub use api::AppState;
+pub use blobs::Blobs;
 pub use error::{ServerError, ServerResult};
 pub use store::Store;
 

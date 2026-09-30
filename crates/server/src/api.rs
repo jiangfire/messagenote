@@ -372,7 +372,7 @@ async fn upload_blob(
     let mime = messagenote_core::attachment::resolve_mime(&body);
     let sha256 = messagenote_core::attachment::sha256_hex(&body);
 
-    let fresh = state.store.put_blob(&sha256, &body)?;
+    let fresh = state.store.put_blob(&sha256, &body).await?;
     if !fresh {
         tracing::debug!(sha256, "这份附件服务端已经有了，跳过写入");
     }
@@ -395,7 +395,7 @@ async fn missing_blobs(
         )));
     }
     Ok(Json(BlobMissingResponse {
-        missing: state.store.missing_blobs(&req.shas)?,
+        missing: state.store.missing_blobs(&req.shas).await?,
     }))
 }
 
@@ -408,7 +408,7 @@ async fn download_blob(
         return Err(ServerError::bad_request("sha256 格式不对"));
     }
 
-    let Some((mime, bytes)) = state.store.get_blob(&sha256)? else {
+    let Some((mime, bytes)) = state.store.get_blob(&sha256).await? else {
         // 404 而不是 500：客户端要靠它区分"服务端也没有，别再重试"
         // 和"服务端出错了，等会儿再试"。回 500 会让下载队列永远卡在同一条。
         return Err(ServerError::not_found("服务端没有这份附件"));

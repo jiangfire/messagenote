@@ -36,13 +36,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 装着全部笔记的明文端口暴露到公网。
     let bind = std::env::var("MESSAGENOTE_BIND").unwrap_or_else(|_| "127.0.0.1:8787".into());
 
-    let store = Store::open(Path::new(&db_path))?;
+    // 附件字节放哪儿：默认跟着 SQLite 走，设了 MESSAGENOTE_S3_BUCKET 就是对象存储。
+    // 见 `messagenote_server::Blobs`（那里列了全部变量）。
+    let blobs = messagenote_server::Blobs::from_env()?;
+    let blobs_where = if blobs.is_s3() {
+        "S3（对象存储）"
+    } else {
+        "SQLite"
+    };
+
+    let store = Store::open_with_blobs(Path::new(&db_path), blobs)?;
     let state = Arc::new(AppState { store, token });
 
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     tracing::info!(
         db = %db_path,
         addr = %listener.local_addr()?,
+        blobs = blobs_where,
         "MessageNote 同步服务端已启动（请确保前面有 TLS 反向代理）"
     );
 

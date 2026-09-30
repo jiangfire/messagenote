@@ -48,6 +48,7 @@ use messagenote_core::wire::{
 };
 use messagenote_store::{blob, clock, normalize, Cursor, Scope};
 
+use crate::blobs::{self, Blobs};
 use crate::error::{ServerError, ServerResult};
 
 const SCHEMA_VERSION: i64 = 5;
@@ -207,10 +208,17 @@ pub struct Store {
     /// 有人写才会醒过来。broadcast 会为每个订阅者排队（队列满了给 `Lagged`，
     /// 那时补发一次即可，见 `events`）。
     events: broadcast::Sender<()>,
+    /// 附件字节放在哪儿。默认 SQLite，设了 `MESSAGENOTE_S3_BUCKET` 就是对象存储。
+    /// 见 [`crate::blobs`]。
+    blobs: Blobs,
 }
 
 impl Store {
-    pub fn open(path: &Path) -> ServerResult<Self> {
+    /// 打开库，并指定附件字节的落点。
+    ///
+    /// 只有一个构造入口（另一个是测试用的 [`Self::in_memory`]）：附件放哪儿
+    /// 是**部署决定**，不给它一个"默认值"就等于让调用方有可能忘了想这件事。
+    pub fn open_with_blobs(path: &Path, blobs: Blobs) -> ServerResult<Self> {
         if let Some(dir) = path.parent() {
             if !dir.as_os_str().is_empty() {
                 std::fs::create_dir_all(dir)?;
@@ -238,18 +246,27 @@ impl Store {
         Ok(Self {
             conn: Mutex::new(conn),
             events: broadcast::channel(EVENT_BUFFER).0,
+            blobs,
         })
     }
 
     /// 内存库。端到端测试要在一个进程里把**真实**服务端跑起来，
     /// 用临时文件不仅慢，还得处理清理和残留。
     pub fn in_memory() -> ServerResult<Self> {
+        Self::in_memory_with_blobs(Blobs::Sqlite)
+    }
+
+    /// 内存库 + 指定附件落点。测 S3 那条路径时用它 ——
+    /// `Blobs::S3` 里塞一个 `InMemory` 对象存储，跑的就是真实代码路径，
+    /// 只是字节落在内存里而不是网上。
+    pub fn in_memory_with_blobs(blobs: Blobs) -> ServerResult<Self> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
         seed_constants(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
             events: broadcast::channel(EVENT_BUFFER).0,
+            blobs,
         })
     }
 
@@ -421,38 +438,107 @@ impl Store {
     }
 
     // ---------------------------------------------------------------- 附件
+    //
+    // 这四个是 Store 里**唯一**的 async 方法：S3 那边的调用是网络往返，
+    // 而其余每一个方法都只是加锁 + 跑一条 SQL。它们只在 SQLite 模式下碰数据库，
+    // 所以不存在"握着 guard 等网络"——那会把整个服务端堵在一把锁上。
 
     /// 存一份附件字节。已经存在时返回 `false`（内容寻址 —— 同名字节必然相同）。
     ///
     /// **调用方必须先核对 sha256**，这里只信任传进来的名字。
-    pub fn put_blob(&self, sha256: &str, bytes: &[u8]) -> ServerResult<bool> {
-        let conn = self.conn()?;
-        Ok(blob::put_blob(&conn, sha256, bytes, now_ms())?)
+    pub async fn put_blob(&self, sha256: &str, bytes: &[u8]) -> ServerResult<bool> {
+        match &self.blobs {
+            Blobs::Sqlite => {
+                let conn = self.conn()?;
+                Ok(blob::put_blob(&conn, sha256, bytes, now_ms())?)
+            }
+            // 对象键就是 sha256，所以"已经有了"和"字节相同"是同一件事。
+            // 服务端**不往 SQLite 里写附件行**：那是字节的一份会漂移的副本，
+            // 理由见 crate::blobs 的模块文档。
+            Blobs::S3 { store, prefix } => {
+                blobs::s3_put(store.as_ref(), prefix, sha256, bytes).await
+            }
+        }
     }
 
-    /// 取附件字节和它**由内容嗅探出来的**类型。
-    pub fn get_blob(&self, sha256: &str) -> ServerResult<Option<(String, Vec<u8>)>> {
-        let conn = self.conn()?;
-        Ok(blob::get_blob(&conn, sha256)?)
+    /// 取附件字节和它的类型。
+    ///
+    /// 类型在两个分支里来源不同但**结果等价**：SQLite 那边读的是存进那一行时的
+    /// `mime` 列（写入时由字节嗅探得出），S3 这边当场嗅探拿到的字节。
+    /// 任何情况下都不采信请求方声明的东西。
+    pub async fn get_blob(&self, sha256: &str) -> ServerResult<Option<(String, Vec<u8>)>> {
+        match &self.blobs {
+            Blobs::Sqlite => {
+                let conn = self.conn()?;
+                Ok(blob::get_blob(&conn, sha256)?)
+            }
+            Blobs::S3 { store, prefix } => {
+                if let Some(bytes) = blobs::s3_get(store.as_ref(), prefix, sha256).await? {
+                    let mime = messagenote_core::attachment::resolve_mime(&bytes);
+                    return Ok(Some((mime.to_string(), bytes)));
+                }
+                // 穿底：切到 S3 之前存进 SQLite 的字节仍然取得到。少了这一步，
+                // 老附件会在客户端眼里变成 404，而客户端把 404 当"对端也没有"、
+                // 不再重试 —— 表现是"换了 S3 之后以前的图全裂了"，且不会自愈。
+                let conn = self.conn()?;
+                Ok(blob::get_blob(&conn, sha256)?)
+            }
+        }
     }
 
-    /// 服务端手上有没有这份字节。上传方用它决定要不要真的发字节。
-    pub fn has_blob(&self, sha256: &str) -> ServerResult<bool> {
-        let conn = self.conn()?;
-        Ok(blob::has_blob(&conn, sha256)?)
+    /// 这份字节在不在服务端手上。上传方用它决定要不要真的发字节。
+    pub async fn has_blob(&self, sha256: &str) -> ServerResult<bool> {
+        Ok(self
+            .missing_blobs(std::slice::from_ref(&sha256.to_string()))
+            .await?
+            .is_empty())
     }
 
     /// 一批 sha 里服务端**缺**哪些。上传方一次问清楚，而不是盲传。
-    pub fn missing_blobs(&self, shas: &[String]) -> ServerResult<Vec<String>> {
-        let conn = self.conn()?;
-        let mut out = Vec::new();
-        for sha in shas {
-            // 名字明显不合法的直接算"缺"，让上传方走完整校验路径
-            if !messagenote_core::attachment::is_sha256(sha) || !blob::has_blob(&conn, sha)? {
-                out.push(sha.clone());
+    pub async fn missing_blobs(&self, shas: &[String]) -> ServerResult<Vec<String>> {
+        match &self.blobs {
+            Blobs::Sqlite => {
+                let conn = self.conn()?;
+                let mut out = Vec::new();
+                for sha in shas {
+                    // 名字明显不合法的直接算"缺"，让上传方走完整校验路径
+                    if !messagenote_core::attachment::is_sha256(sha) || !blob::has_blob(&conn, sha)?
+                    {
+                        out.push(sha.clone());
+                    }
+                }
+                Ok(out)
+            }
+            Blobs::S3 { store, prefix } => {
+                // 先问对象存储（不碰数据库），剩下的再去 SQLite 里确认一遍。
+                // 顺序不能反：握着一把同步锁去等网络，等于让整个服务端排队。
+                let mut candidates = Vec::new();
+                for sha in shas {
+                    // 名字不合法的绝不拼进对象键里：那是一条越界写的入口。
+                    if !messagenote_core::attachment::is_sha256(sha) {
+                        candidates.push(sha.clone());
+                        continue;
+                    }
+                    if !blobs::s3_has(store.as_ref(), prefix, sha).await? {
+                        candidates.push(sha.clone());
+                    }
+                }
+                if candidates.is_empty() {
+                    return Ok(candidates);
+                }
+
+                // 穿底，和 get_blob 同一条规矩：对象存储上没有、但 SQLite 里有的
+                // 那些**不算缺**，否则客户端会为一份自己已经能取到的附件反复重传。
+                let conn = self.conn()?;
+                let mut out = Vec::new();
+                for sha in candidates {
+                    if !blob::has_blob(&conn, &sha)? {
+                        out.push(sha);
+                    }
+                }
+                Ok(out)
             }
         }
-        Ok(out)
     }
 
     // ---------------------------------------------------------------- 代笔写入
@@ -1632,6 +1718,145 @@ mod tests {
 
     fn store() -> Store {
         Store::in_memory().unwrap()
+    }
+
+    /// 一个内存版的对象存储。跑的是**真实**代码路径（同一份 `Blobs::S3` 分支），
+    /// 只是字节落在内存里而不是网上 —— 不需要一个真桶就能测这段逻辑。
+    fn s3_store() -> Store {
+        Store::in_memory_with_blobs(Blobs::S3 {
+            store: std::sync::Arc::new(object_store::memory::InMemory::new()),
+            prefix: "attachments/".into(),
+        })
+        .unwrap()
+    }
+
+    fn png_bytes() -> Vec<u8> {
+        let mut v = b"\x89PNG\r\n\x1a\n".to_vec();
+        v.extend_from_slice(&[0u8; 16]);
+        v
+    }
+
+    /// S3 模式下字节**不再往 SQLite 里放一份**。
+    ///
+    /// 这一条看着像洁癖，其实是"两份真相"的边界：SQLite 里的那行是字节的一份
+    /// 副本，而副本会漂移（有人从桶里删了对象、或者换了个桶，表里还写着"有"）。
+    #[test]
+    fn in_s3_mode_the_bytes_are_not_also_kept_in_sqlite() {
+        let s = s3_store();
+        let png = png_bytes();
+        let sha = messagenote_core::attachment::sha256_hex(&png);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        rt.block_on(async {
+            assert!(s.put_blob(&sha, &png).await.unwrap(), "第一次该是新写入");
+            // 同样的字节再来一次：对象键就是 sha，所以是同一个对象
+            assert!(
+                !s.put_blob(&sha, &png).await.unwrap(),
+                "第二次该说'已经有了'"
+            );
+
+            let got = s.get_blob(&sha).await.unwrap();
+            assert_eq!(
+                got.as_ref().map(|(_, b)| b.as_slice()),
+                Some(png.as_slice())
+            );
+            assert_eq!(got.as_ref().map(|(m, _)| m.as_str()), Some("image/png"));
+
+            assert!(s.has_blob(&sha).await.unwrap());
+            assert!(s
+                .missing_blobs(std::slice::from_ref(&sha))
+                .await
+                .unwrap()
+                .is_empty());
+        });
+
+        // 取完再查库：S3 模式下一行都不该有
+        let conn = s.conn().unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM attachment", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0, "字节已经在对象存储里了，SQLite 不该再留一份副本");
+    }
+
+    /// 切到 S3 **之前**存进 SQLite 的字节，切完之后仍然取得回来。
+    ///
+    /// 这是升级路径，不是边角情况：库里有老附件是常态。少了这条穿底读，
+    /// 那些图在客户端眼里会变成 404 —— 而客户端的下载队列不会因为 404 就丢掉
+    /// 这一项（它只是把失败次数 +1），于是那条笔记上的图**永远裂着**，
+    /// 每一轮同步还占掉一个下载名额。
+    #[test]
+    fn old_sqlite_bytes_are_still_reachable_after_switching_to_s3() {
+        let s = s3_store();
+        let png = png_bytes();
+        let sha = messagenote_core::attachment::sha256_hex(&png);
+
+        // 直接往 SQLite 里写一份，模拟"切后端之前就有这个附件"
+        {
+            let conn = s.conn().unwrap();
+            blob::put_blob(&conn, &sha, &png, now_ms()).unwrap();
+        }
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let got = s.get_blob(&sha).await.unwrap();
+            assert_eq!(
+                got.as_ref().map(|(_, b)| b.as_slice()),
+                Some(png.as_slice()),
+                "对象存储上没有时，要穿底去 SQLite 找"
+            );
+            // 而且它不算"缺"：否则客户端会为一份自己已经取得到的附件反复重传
+            assert!(s
+                .missing_blobs(std::slice::from_ref(&sha))
+                .await
+                .unwrap()
+                .is_empty());
+            assert!(s.has_blob(&sha).await.unwrap());
+        });
+    }
+
+    /// S3 模式下"我缺哪些"要同时照顾三种情况：在桶里的、只在 SQLite 里的、
+    /// 谁都没有的（外加名字不合法的）。
+    ///
+    /// 只喂单个 sha 的批次是看不见错位的 —— 一个"只处理第一个元素"的实现照样绿。
+    #[test]
+    fn missing_blobs_in_s3_mode_handles_a_mixed_batch() {
+        let s = s3_store();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        let in_bucket = png_bytes();
+        let mut only_sqlite = b"\x89PNG\r\n\x1a\n".to_vec();
+        only_sqlite.push(7);
+        let absent = "f".repeat(64);
+        let malformed = "../../etc/passwd".to_string();
+
+        let sha_bucket = messagenote_core::attachment::sha256_hex(&in_bucket);
+        let sha_sqlite = messagenote_core::attachment::sha256_hex(&only_sqlite);
+
+        rt.block_on(async {
+            assert!(s.put_blob(&sha_bucket, &in_bucket).await.unwrap());
+        });
+        {
+            let conn = s.conn().unwrap();
+            blob::put_blob(&conn, &sha_sqlite, &only_sqlite, now_ms()).unwrap();
+        }
+
+        let missing = rt
+            .block_on(async {
+                s.missing_blobs(&[
+                    sha_bucket.clone(),
+                    sha_sqlite.clone(),
+                    absent.clone(),
+                    malformed.clone(),
+                ])
+                .await
+            })
+            .unwrap();
+
+        assert_eq!(
+            missing,
+            vec![absent, malformed],
+            "只有真的取不到的才算缺；顺序按输入来"
+        );
     }
 
     fn msg(id: &str, wall: i64, counter: u32, device: &str, body: &str) -> Change {
