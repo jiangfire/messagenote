@@ -39,6 +39,7 @@ export function Composer({
 }: Props) {
   const { api } = useApi();
   const ref = useRef<HTMLTextAreaElement>(null);
+  const filePicker = useRef<HTMLInputElement>(null);
   /** 拖拽悬停中。只用来加高亮类名 —— 拖拽的判定全在 dataTransfer 上。 */
   const [dropActive, setDropActive] = useState(false);
 
@@ -91,6 +92,25 @@ export function Composer({
     (err) => onError?.(errorText(err))
   );
 
+  /**
+   * 通过按钮选文件。
+   *
+   * 拖拽和粘贴都有各自的盲区：图在手机上、在一段聊天记录里、在剪贴板里
+   * （截图工具没开）时，这两条路都够不着。留一个"去选一张"的入口，
+   * 用户至少永远有一条路能把图送进来。
+   *
+   * 选完立刻清空 `value`：同一个文件连选两次时浏览器不会再派发 change，
+   * 而"重新选一次同一张图"恰恰是换回来最自然的操作。
+   */
+  function onPickFiles(e: React.ChangeEvent<HTMLInputElement>) {
+    const files = Array.from(e.target.files ?? []);
+    e.target.value = "";
+    const el = ref.current;
+    if (files.length === 0 || !el || disabled) return;
+    el.focus();
+    void insertImages(api, el, files, setDraft).catch((err) => onError?.(errorText(err)));
+  }
+
   return (
     // 拖拽事件挂在整个 composer 上而不是 textarea 上：用户瞄的是"这个输入框"，
     // 落在它周边一圈的边距里也该算数。
@@ -105,7 +125,7 @@ export function Composer({
         className="composer-input"
         rows={1}
         value={draft}
-        placeholder={`记点什么…（Enter 发送，Shift+Enter 换行，也可以直接粘贴或拖进图片）`}
+        placeholder="记点什么…"
         onChange={(e) => setDraft(e.target.value)}
         onKeyDown={handleKeyDown}
         onPaste={handlePaste}
@@ -117,18 +137,41 @@ export function Composer({
           ) : (
             <>
               发送到 <strong>{targetLabel}</strong>
-              <span className="composer-hint"> · 可以粘贴或拖进图片</span>
             </>
           )}
         </span>
-        <button
-          className="send-btn"
-          disabled={disabled || !draft.trim()}
-          onClick={onSend}
-          title="发送 (Enter)"
-        >
-          发送
-        </button>
+        <div className="composer-actions">
+          {/* 上传附件。放在发送键旁边而不是里面：发送是这个输入框的主要动作，
+              附件是一次性的补充，两者混在一起会让"回车就发出去"这件事变模糊。 */}
+          <button
+            type="button"
+            className="attach-btn"
+            onClick={() => filePicker.current?.click()}
+            disabled={disabled}
+            title="选一张图片（也可以直接粘贴或拖进来）"
+            aria-label="选择图片"
+          >
+            📎
+          </button>
+          <input
+            ref={filePicker}
+            className="attach-input"
+            type="file"
+            accept="image/*"
+            multiple
+            onChange={onPickFiles}
+            aria-hidden="true"
+            tabIndex={-1}
+          />
+          <button
+            className="send-btn"
+            disabled={disabled || !draft.trim()}
+            onClick={onSend}
+            title="发送 (Enter)"
+          >
+            发送
+          </button>
+        </div>
       </div>
     </div>
   );

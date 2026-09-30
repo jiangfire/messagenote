@@ -102,11 +102,21 @@ ok(
   !(await text()).includes("Ctrl+Shift+Space"),
   "浏览器里没有那个快捷键，提它会让用户去找一个不存在的东西"
 );
-ok(
-  "空状态改成了网页端的说法",
-  (await text()).includes("下面那个输入框就是入口")
-);
 await screenshot(s, `${SHOTS}/web-02-empty.png`);
+
+// 用户提的：侧边栏那两段"还没有频道……先落到收件箱，以后再移"和
+// "标签是横切的补充标记，和频道正交"是把功能讲给用户听，不解决问题。
+// 界面该做的是让控件自己说明自己，不是替用户写使用说明。
+ok(
+  "侧边栏不再解释「频道是干什么的」",
+  !(await text()).includes("还没有频道"),
+  "把使用说明写在界面上，用户要的是能用的控件"
+);
+ok(
+  "侧边栏不再解释「标签是横切的」",
+  !(await text()).includes("标签是横切的"),
+  "同上"
+);
 
 // ---------------------------------------------------------------- 写
 console.log("== 记一条 ==");
@@ -392,6 +402,292 @@ await evaluate(
 );
 await sleep(500);
 await screenshot(s, `${SHOTS}/web-09-image.png`);
+
+// ---------------------------------------------------------------- 拖拽
+console.log("== 拖拽：拖进来就存下、就在光标处出现 ==");
+
+// 用户报"拖拽图片无法发送"。上一轮只测了**粘贴**（网页端里粘贴一直是好的），
+// 于是拖拽这条路径从来没被验过 —— 而它恰好是坏的那条。
+//
+// 这里派发真实的 DragEvent + DataTransfer，和用户在资源管理器里拖进来
+// 落到页面上时浏览器给出的事件是同构的。
+const dropped = await evaluate(
+  s,
+  `(async () => {
+     const c = document.createElement('canvas');
+     c.width = 10; c.height = 10;
+     const ctx = c.getContext('2d');
+     ctx.fillStyle = '#0ea5e9';
+     ctx.fillRect(0, 0, 10, 10);
+     const blob = await new Promise((r) => c.toBlob(r, 'image/png'));
+
+     const dt = new DataTransfer();
+     dt.items.add(new File([blob], 'dropped.png', { type: 'image/png' }));
+
+     const composer = document.querySelector('.composer');
+     const input = document.querySelector('.composer-input');
+     input.focus();
+
+     const fire = (type) => composer.dispatchEvent(
+       new DragEvent(type, { dataTransfer: dt, bubbles: true, cancelable: true })
+     );
+     fire('dragover');
+     fire('drop');
+
+     const started = Date.now();
+     while (Date.now() - started < 15000) {
+       if (/attachment:[0-9a-f]{64}/.test(input.value)) break;
+       await new Promise((r) => setTimeout(r, 100));
+     }
+     return input.value;
+   })()`
+);
+
+const dropSha = (dropped.match(/attachment:([0-9a-f]{64})/) || [])[1];
+ok(
+  "拖进来的图片进了正文（不是只有粘贴能用）",
+  !!dropSha,
+  `拖拽后输入框内容：${dropped.slice(0, 120)}`
+);
+
+// 拖拽进来的这张要真的能发出去、能渲染出来 —— 只验证"插入成功"的话，
+// 用户遇到的"拖进去看着像存了、其实发不出去"照样溜过去。
+await pressEnter(s, ".composer-input");
+await waitFor(
+  s,
+  `[...document.querySelectorAll('.md img')].some((i) => i.naturalWidth === 10)`,
+  "拖进来的那张图渲染出来了"
+);
+ok("拖进来的图片发送后真的渲染出来", true);
+await evaluate(
+  s,
+  `(() => {
+     const el = document.querySelector('.stream');
+     if (el) el.scrollTop = el.scrollHeight;
+     return true;
+   })()`
+);
+await sleep(400);
+await screenshot(s, `${SHOTS}/web-09b-dropped.png`);
+
+// ---------------------------------------------------------------- 上传按钮
+console.log("== 上传按钮：不拖不粘也能选文件 ==");
+
+ok(
+  "输入框旁边有上传按钮",
+  await evaluate(s, `!!document.querySelector('.attach-btn')`),
+  "只有拖拽和粘贴的话，用户手上唯一一张图在手机上、在另一个程序里时就无路可走"
+);
+
+const picked = await evaluate(
+  s,
+  `(async () => {
+     const c = document.createElement('canvas');
+     c.width = 9; c.height = 9;
+     const ctx = c.getContext('2d');
+     ctx.fillStyle = '#16a34a';
+     ctx.fillRect(0, 0, 9, 9);
+     const blob = await new Promise((r) => c.toBlob(r, 'image/png'));
+
+     const input = document.querySelector('.composer-input');
+     input.focus();
+
+     // 给那个隐藏的 file input 塞一个真的 FileList，然后派发 change ——
+     // 等价于用户在系统文件对话框里选了一张图。
+     const picker = document.querySelector('.attach-input');
+     if (!picker) return { error: '没有 .attach-input' };
+     const dt = new DataTransfer();
+     dt.items.add(new File([blob], 'picked.png', { type: 'image/png' }));
+     picker.files = dt.files;
+     picker.dispatchEvent(new Event('change', { bubbles: true }));
+
+     const started = Date.now();
+     while (Date.now() - started < 15000) {
+       if (/attachment:[0-9a-f]{64}/.test(input.value)) break;
+       await new Promise((r) => setTimeout(r, 100));
+     }
+     return { value: input.value };
+   })()`
+);
+const pickSha = ((picked.value || "").match(/attachment:([0-9a-f]{64})/) || [])[1];
+ok(
+  "通过按钮选的文件也进了正文",
+  !!pickSha,
+  picked.error ?? `按钮选完输入框内容：${(picked.value || "").slice(0, 120)}`
+);
+// 选**和拖进来那张完全相同的字节**（同一个画布尺寸 + 同一个颜色），
+// sha 必须一样：内容寻址意味着同一份内容永远是同一个名字，
+// 存两次既浪费存储，也会让正文里出现两条指向同一张图的引用。
+const picked2 = await evaluate(
+  s,
+  `(async () => {
+     const c = document.createElement('canvas');
+     c.width = 9; c.height = 9;
+     const ctx = c.getContext('2d');
+     ctx.fillStyle = '#16a34a';
+     ctx.fillRect(0, 0, 9, 9);
+     const blob = await new Promise((r) => c.toBlob(r, 'image/png'));
+
+     const input = document.querySelector('.composer-input');
+     const picker = document.querySelector('.attach-input');
+     const before = input.value;
+     const dt = new DataTransfer();
+     dt.items.add(new File([blob], 'picked-again.png', { type: 'image/png' }));
+     picker.files = dt.files;
+     picker.dispatchEvent(new Event('change', { bubbles: true }));
+
+     const started = Date.now();
+     while (Date.now() - started < 15000) {
+       // 等到正文里出现**第二个**引用
+       if ((input.value.match(/attachment:[0-9a-f]{64}/g) || []).length > 1) break;
+       await new Promise((r) => setTimeout(r, 100));
+     }
+     return { before, after: input.value };
+   })()`
+);
+const firstSha = ((picked.value || "").match(/attachment:([0-9a-f]{64})/) || [])[1];
+const secondSha = ((picked2.after || "").match(/attachment:([0-9a-f]{64})/g) || []).slice(-1)[0]?.slice(11);
+ok(
+  "同一份内容再选一次，sha 不变（内容寻址去重，不是每次新存一份）",
+  !!firstSha && !!secondSha && firstSha === secondSha,
+  `第一次 ${firstSha}，第二次 ${secondSha}`
+);
+ok(
+  "选同一个文件两次之后输入框里确实多了一条引用（否则上一条是空跑）",
+  (picked2.after || "").length > (picked2.before || "").length,
+  `${(picked2.before || "").length} → ${(picked2.after || "").length}`
+);
+
+// ---------------------------------------------------------------- 头像
+console.log("== 头像：能换成自己上传的图 ==");
+
+ok(
+  "默认头像有入口可以更换（不是写死的「我」）",
+  await evaluate(s, `!!document.querySelector('.avatar-btn, .avatar-upload')`),
+  "写死的「我」字符让用户没法用自己的图"
+);
+
+await evaluate(
+  s,
+  `(async () => {
+     const c = document.createElement('canvas');
+     c.width = 32; c.height = 32;
+     const ctx = c.getContext('2d');
+     ctx.fillStyle = '#9333ea';
+     ctx.fillRect(0, 0, 32, 32);
+     const blob = await new Promise((r) => c.toBlob(r, 'image/png'));
+
+     const picker = document.querySelector('.avatar-input');
+     if (!picker) return;
+     const dt = new DataTransfer();
+     dt.items.add(new File([blob], 'me.png', { type: 'image/png' }));
+     picker.files = dt.files;
+     picker.dispatchEvent(new Event('change', { bubbles: true }));
+     return true;
+   })()`
+);
+
+await waitFor(
+  s,
+  `!!document.querySelector('.avatar img') && document.querySelector('.avatar img').naturalWidth > 0`,
+  "头像换成用户自己上传的图",
+  20000
+);
+ok(
+  "消息流里的头像变成了用户上传的图",
+  await evaluate(
+    s,
+    `(() => {
+       const img = document.querySelector('.msg-row .avatar img');
+       return !!img && img.naturalWidth === 32;
+     })()`
+  )
+);
+
+// 刷新之后还在 —— 只在内存里换了一下等于没换
+await s.send("Page.reload", { ignoreCache: true });
+await sleep(1500);
+await waitFor(s, `!!document.querySelector('.app')`, "刷新后主界面");
+ok(
+  "刷新之后自定义头像还在（存下来了，不是只在内存里）",
+  await evaluate(
+    s,
+    `(() => {
+       const img = document.querySelector('.msg-row .avatar img');
+       return !!img && img.naturalWidth === 32;
+     })()`
+  )
+);
+await screenshot(s, `${SHOTS}/web-09c-avatar.png`);
+
+// 换回默认。没设过头像时不该有这个出口（一个永远点不动的装饰），
+// 设过之后点它要真的退回「我」，否则用户设错了就没有回头路。
+//
+// 先把 localStorage 里存的 sha 抹掉再刷新，验的是"从没设过"的初始态。
+await evaluate(s, `localStorage.removeItem('messagenote.avatarSha'); true`);
+await s.send("Page.reload", { ignoreCache: true });
+await sleep(1600);
+await waitFor(s, `!!document.querySelector('.app')`, "清掉头像后主界面");
+ok(
+  "清掉 localStorage 里的头像后退回「我」",
+  await evaluate(
+    s,
+    `(() => {
+       const a = document.querySelector('.msg-row .avatar');
+       return !!a && !a.querySelector('img') && a.innerText.trim() === '我';
+     })()`
+  )
+);
+ok(
+  "没设过头像时不显示清除按钮",
+  await evaluate(s, `!document.querySelector('.avatar-clear')`)
+);
+
+// 再设一次，然后走「清除」按钮这条路
+await evaluate(
+  s,
+  `(async () => {
+     const c = document.createElement('canvas');
+     c.width = 32; c.height = 32;
+     const ctx = c.getContext('2d');
+     ctx.fillStyle = '#ea580c';
+     ctx.fillRect(0, 0, 32, 32);
+     const blob = await new Promise((r) => c.toBlob(r, 'image/png'));
+     const picker = document.querySelector('.avatar-input');
+     const dt = new DataTransfer();
+     dt.items.add(new File([blob], 'me2.png', { type: 'image/png' }));
+     picker.files = dt.files;
+     picker.dispatchEvent(new Event('change', { bubbles: true }));
+     return true;
+   })()`
+);
+await waitFor(
+  s,
+  `(() => { const i = document.querySelector('.msg-row .avatar img'); return !!i && i.naturalWidth === 32; })()`,
+  "第二次设的头像"
+);
+ok("可以反复更换头像", true);
+ok(
+  "设过之后出现「清除」按钮",
+  await evaluate(s, `!!document.querySelector('.avatar-clear')`)
+);
+
+await click(s, ".avatar-clear");
+await waitFor(
+  s,
+  `(() => { const a = document.querySelector('.msg-row .avatar'); return !!a && !a.querySelector('img'); })()`,
+  "点清除后退回默认头像",
+  10000
+);
+ok(
+  "点「清除」真的退回「我」了（不是只有 localStorage 被清、界面还留着旧图）",
+  await evaluate(
+    s,
+    `document.querySelector('.msg-row .avatar').innerText.trim() === '我'`
+  )
+);
+await sleep(300);
+await screenshot(s, `${SHOTS}/web-09d-avatar-cleared.png`);
 
 // ---------------------------------------------------------------- 实时推送
 console.log("== 实时推送：别处写入，这里自己出现 ==");

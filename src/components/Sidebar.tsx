@@ -125,21 +125,17 @@ export function Sidebar({
           </div>
         ))}
 
-        {named.length === 0 && !adding && (
-          <p className="hint">
-            还没有频道。想按主题归档就建一个 —— 记录时不用管它们，
-            先落到收件箱，以后再移。
-          </p>
-        )}
+        {/* 没有频道时这里就是空的。原先写了一段"还没有频道，想按主题归档就建一个
+            —— 记录时不用管它们，先落到收件箱，以后再移"，那是把功能讲给用户听：
+            控件本身（＋号、空的列表）已经把"可以建频道"说清楚了，多这一段只会
+            让侧边栏变成说明书。 */}
       </div>
 
       <div className="section">
         <div className="section-head">
           <span>标签</span>
         </div>
-        {tags.length === 0 ? (
-          <p className="hint">标签是横切的补充标记，和频道正交。可以不打。</p>
-        ) : (
+        {tags.length > 0 && (
           <div className="tag-cloud">
             {tags.map((t) => (
               <button

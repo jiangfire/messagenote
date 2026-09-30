@@ -19,7 +19,8 @@
         "minWidth": 720,
         "minHeight": 480,
         "resizable": true,
-        "center": true
+        "center": true,
+        "dragDropEnabled": false
       },
       {
         "label": "capture",
@@ -34,7 +35,8 @@
         "visible": false,
         "focus": false,
         "center": false,
-        "shadow": false
+        "shadow": false,
+        "dragDropEnabled": false
       }
     ],
     "security": {

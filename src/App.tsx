@@ -433,60 +433,35 @@ export default function App() {
     }
   }, [view, results, query, timeFilter, channelNameOf]);
 
-  /** 「空」在不同视图里含义完全不同，文案也得跟着变。 */
+  /** 「空」在不同视图里含义完全不同，文案也跟着变。 */
   const emptyCopy = useMemo(() => {
     // 时间档位筛出来的空必须先说：不然用户明明有记录，
     // 界面却告诉他"这里还是空的"，他会以为数据丢了。
     if (view.type === "timeline" && timeFilter !== "all") {
       return {
         title: `${TIME_FILTER_LABEL[timeFilter]}还没有记录`,
-        body: (
-          <>
-            <p className="muted">换个更长的时间档位，或把时间筛选切回「不限」。</p>
-          </>
-        ),
+        body: <p className="muted">换个更长的时间档位。</p>,
       };
     }
     if (view.type === "channel") {
       return {
         title: "这个频道还是空的",
-        body: (
-          <>
-            <p>从时间线里找到要归档的记录，点它右侧的 ⇄ 移过来。</p>
-            <p className="muted">频道管归属，一条记录只属于一个频道。</p>
-          </>
-        ),
+        body: <p>在时间线里找到要归档的记录，点它右侧的 ⇄ 移过来。</p>,
       };
     }
     if (view.type === "timeline" && view.unfiledOnly) {
       return {
         title: "没有未归档的了",
-        body: (
-          <>
-            <p>所有记录都已经归到某个频道。</p>
-            <p className="muted">
-              新记下来的东西会先落到收件箱 —— 它在时间线的「全部」里。
-            </p>
-          </>
-        ),
+        body: <p>所有记录都已经归到某个频道。</p>,
       };
     }
     // 网页端没有全局快捷键、也没有捕获浮层，不能说"按 Ctrl+Shift+Space 唤起窗口"
     // —— 用户会去找一个不存在的快捷键。`Stream` 里那段默认文案是给桌面端写的，
     // 这里是网页端的替身。
-    //
-    // （这一条是**打开浏览器看到的**：代码、类型检查、构建产物全都不会提示它。）
     if (!desktop) {
       return {
         title: undefined,
-        body: (
-          <>
-            <p>
-              下面那个输入框就是入口 —— 写点什么，按 <kbd>Enter</kbd> 记下。
-            </p>
-            <p className="muted">不用先想放哪里，先记下来，以后再整理。</p>
-          </>
-        ),
+        body: <p>在下面写点什么，按 Enter 就记下了。</p>,
       };
     }
     return { title: undefined, body: undefined };

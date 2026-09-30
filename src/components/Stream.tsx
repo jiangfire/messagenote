@@ -2,6 +2,7 @@ import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "re
 import type { Channel, Message } from "../lib/types";
 import { dayKey, formatDayLabel, formatTime } from "../lib/format";
 import { Markdown } from "./Markdown";
+import { Avatar } from "./Avatar";
 import { useApi } from "../lib/apiContext";
 
 interface Props {
@@ -106,15 +107,7 @@ export function Stream({
       <div className="stream-empty">
         <div className="empty-card">
           <h3>{emptyTitle ?? "这里还是空的"}</h3>
-          {emptyBody ?? (
-            <>
-              <p>
-                按 <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Space</kbd>{" "}
-                可以在任何地方唤起窗口，写点什么再按 <kbd>Enter</kbd> 就记下了。
-              </p>
-              <p className="muted">不用先想放哪里 —— 先记下来，以后再整理。</p>
-            </>
-          )}
+          {emptyBody ?? <p className="muted">在下面写点什么，按 Enter 就记下了。</p>}
         </div>
       </div>
     );
@@ -271,14 +264,7 @@ function MessageRow({ message, channels, label, onEdit, onDelete, onMove, onTags
         <span className="msg-time">{formatTime(message.createdAt)}</span>
       </div>
 
-      {/*
-        头像。这个应用只有一位作者（自己），所以头像是一个固定的「我」：
-        它不表达"是谁发的"，只表达"这是一个人在说话" —— 纯文字流看起来
-        像日志，带上头像才像对话。
-      */}
-      <span className="avatar" aria-hidden="true">
-        我
-      </span>
+      <Avatar />
 
       <div className="msg-body">
         {label && <div className="msg-origin">来自 #{label}</div>}
