@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
-import { useApi, type NoteApi } from "./apiContext";
+import type { NoteApi } from "./apiContext";
+import { useAttachmentUrl } from "./attachmentUrl";
 
 /**
  * 自定义头像。
@@ -30,57 +31,54 @@ export function loadAvatarSha(): string | null {
   return raw && /^[0-9a-f]{64}$/.test(raw) ? raw : null;
 }
 
-export function saveAvatarSha(sha: string) {
+/** 存一张新头像，存好后返回它的 sha。 */
+export async function uploadAvatar(api: NoteApi, file: File): Promise<string> {
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  const sha = await api.saveAttachment(bytes);
   localStorage.setItem(AVATAR_KEY, sha);
+  announceAvatarChange();
+  return sha;
 }
 
-export function clearAvatarSha() {
+/** 换回默认。 */
+export function clearAvatar() {
   localStorage.removeItem(AVATAR_KEY);
+  announceAvatarChange();
 }
 
 /**
- * 当前头像的字节 URL（object URL），没设过就是 null。
+ * 设过之后立刻刷新。
  *
- * **跨窗口同步**用 `storage` 事件而不是轮询：头像是在设置窗口里改的，
- * 主窗口和它不是同一个组件树，靠 React 状态传不过去。而 localStorage 变更本来
- * 就会在**其他**同源标签页里派发 `storage` 事件 —— 这是平台白送的通知，
- * 不用自己起一个订阅系统。
+ * `storage` 事件在**别的**窗口里派发，规范明确说不在改动的那个窗口里发 ——
+ * 所以本窗口得手动补一次，否则换完头像界面要等下次刷新才变。
+ */
+export function announceAvatarChange() {
+  window.dispatchEvent(new StorageEvent("storage", { key: AVATAR_KEY }));
+}
+
+/**
+ * 当前头像的字节 URL，没设过（或取不到字节）就是 null。
  *
- * 注意 `storage` 事件**不会在改动的那个窗口里触发**（规范如此），
- * 所以本窗口是靠 setState 立即生效的。
+ * ## 为什么复用附件缓存，而不是自己读一次
+ *
+ * 头像是**全应用唯一的一张图**，但界面上有 N 个 `Avatar`（每条消息一个）。
+ * 每个实例各自 `readAttachment` 的话，77 条记录就是 77 次读盘、77 个
+ * object URL —— 而它们要显示的其实是同一份字节。
+ *
+ * `attachmentUrl.ts` 的模块级缓存本来就写了"同一个 sha 的多个请求合并成
+ * 一次"，正是为这种情况准备的。自己再写一份缓存就是 DRY 违反，而且会让
+ * "字节到底存了没有"这个判断散落在两个地方。
+ *
+ * ## 为什么空串是安全的
+ *
+ * `useAttachmentUrl` 只在 `sha` 非空时才发起请求，所以"没设过"可以直接传空串
+ * 进去。**条件调用 hook 才是真正的错误**（`sha ? useAttachmentUrl(sha) : null`
+ * 在 sha 由有变无时会少调一个 hook），而这里两个分支调的是同一个 hook。
  */
 export function useAvatarUrl(): string | null {
-  const { api } = useApi();
   const [sha, setSha] = useState(loadAvatarSha);
-  const [url, setUrl] = useState<string | null>(null);
 
-  useEffect(() => {
-    if (!sha) {
-      setUrl(null);
-      return;
-    }
-    let cancelled = false;
-    let objectUrl: string | null = null;
-    api
-      .readAttachment(sha)
-      .then((bytes) => {
-        if (cancelled) return;
-        // 和正文图片走同一种形态：Blob → object URL。
-        // 包一层 Uint8Array 是因为 Tauri 的 ArrayBuffer 可能带 offset。
-        objectUrl = URL.createObjectURL(new Blob([new Uint8Array(bytes)]));
-        setUrl(objectUrl);
-      })
-      .catch(() => {
-        // 字节取不到（清过库、换过机器）就当没设过 —— 界面上退回「我」，
-        // 而不是一个永远转圈的破洞。
-        if (!cancelled) setUrl(null);
-      });
-    return () => {
-      cancelled = true;
-      if (objectUrl) URL.revokeObjectURL(objectUrl);
-    };
-  }, [api, sha]);
-
+  // 别的窗口改了设置、或本页刚设过，localStorage 变更会在这里冒出来。
   useEffect(() => {
     const onStorage = (e: StorageEvent) => {
       if (e.key !== AVATAR_KEY) return;
@@ -90,23 +88,5 @@ export function useAvatarUrl(): string | null {
     return () => window.removeEventListener("storage", onStorage);
   }, []);
 
-  return url;
-}
-
-/** 存一张新头像，存好后返回它的 sha。 */
-export async function uploadAvatar(api: NoteApi, file: File): Promise<string> {
-  const bytes = new Uint8Array(await file.arrayBuffer());
-  const sha = await api.saveAttachment(bytes);
-  saveAvatarSha(sha);
-  return sha;
-}
-
-/**
- * 设过之后立刻刷新。
- *
- * `storage` 事件在**别的**窗口里派发，规范明确说不在改动的那个窗口里发 ——
- * 所以本窗口得手动补一次。这条也是为什么 `useAvatarUrl` 的 `setSha` 会被触发。
- */
-export function announceAvatarChange() {
-  window.dispatchEvent(new StorageEvent("storage", { key: AVATAR_KEY }));
+  return useAttachmentUrl(sha ?? "");
 }

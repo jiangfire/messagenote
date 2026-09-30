@@ -1,7 +1,7 @@
 import { useRef, useState } from "react";
 import { useApi } from "../lib/apiContext";
 import { errorText } from "../lib/errors";
-import { announceAvatarChange, clearAvatarSha, uploadAvatar, useAvatarUrl } from "../lib/avatar";
+import { clearAvatar, uploadAvatar, useAvatarUrl } from "../lib/avatar";
 
 /**
  * 消息流里的头像。
@@ -11,8 +11,6 @@ import { announceAvatarChange, clearAvatarSha, uploadAvatar, useAvatarUrl } from
  *
  * 没有自定义头像时仍显示「我」：那个字符不是占位符，它在纯文字流里承担了
  * "这是对话不是日志"的视觉作用，去掉它整列会塌下去。
- *
- * 悬停时才露出提示文字，是为了让那一列在正常状态下保持安静。
  */
 export function Avatar() {
   const { api } = useApi();
@@ -32,18 +30,11 @@ export function Avatar() {
     setError(null);
     try {
       await uploadAvatar(api, file);
-      // 让本窗口和其它窗口都立刻看到新头像
-      announceAvatarChange();
     } catch (err) {
       setError(errorText(err));
     } finally {
       setBusy(false);
     }
-  }
-
-  function reset() {
-    clearAvatarSha();
-    announceAvatarChange();
   }
 
   return (
@@ -64,7 +55,7 @@ export function Avatar() {
         <button
           type="button"
           className="avatar-clear"
-          onClick={reset}
+          onClick={clearAvatar}
           title="换回默认头像"
           aria-label="换回默认头像"
         >
