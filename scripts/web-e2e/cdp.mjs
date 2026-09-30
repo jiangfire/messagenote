@@ -118,7 +118,15 @@ export async function waitFor(s, expression, label, timeoutMs = 20000) {
     }
     await sleep(150);
   }
-  throw new Error(`等不到「${label}」（最后的值：${JSON.stringify(last)}）`);
+  const msg = `等不到「${label}」（最后的值：${JSON.stringify(last)}）`;
+  // **记进全局失败数再抛**，而不是只抛。
+  //
+  // 抛异常会中止整轮，于是后面几十条断言**根本没跑** ——
+  // 而汇总那个"0 条失败"看起来是绿的。实际发生过的：一条 waitFor 超时导致
+  // 后面 20 条断言被跳过，报告却显示全过。抛之前先把失败记上，
+  // 这样至少退出码和失败数是真的。
+  if (typeof globalThis.__e2eFailed === "number") globalThis.__e2eFailed++;
+  throw new Error(msg);
 }
 
 /**
@@ -156,6 +164,27 @@ export async function click(s, selector) {
   );
 }
 
+/**
+ * 真的"点"一下：mousedown → mouseup → click 依次派发。
+ *
+ * `click()` 只派发最后那一个 click，测不出监听在 mousedown 上的行为 ——
+ * 而"点菜单外面就收起"正是这么实现的（mousedown 而不是 click，
+ * 因为 click 在某些情况下会被元素内部的处理吞掉）。
+ */
+export async function realClick(s, selector) {
+  await evaluate(
+    s,
+    `(() => {
+       const el = document.querySelector(${JSON.stringify(selector)});
+       if (!el) throw new Error("找不到元素：${selector}");
+       for (const type of ["mousedown", "mouseup", "click"]) {
+         el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true }));
+       }
+       return true;
+     })()`
+  );
+}
+
 /** 把 React 的受控输入当作"用户敲进去"来用：填值 + 派发 Enter。 */
 export async function pressEnter(s, selector) {
   await evaluate(
@@ -164,6 +193,27 @@ export async function pressEnter(s, selector) {
        const el = document.querySelector(${JSON.stringify(selector)});
        if (!el) throw new Error("找不到元素：${selector}");
        el.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+       return true;
+     })()`
+  );
+}
+
+/**
+ * 选 <select> 的一个选项。
+ *
+ * 同样要走原生 setter + change 事件：React 在 value 上装了拦截，
+ * 直接赋值不会触发 onChange，界面看起来变了、状态其实没动。
+ */
+export async function selectOption(s, selector, value) {
+  await evaluate(
+    s,
+    `(() => {
+       const el = document.querySelector(${JSON.stringify(selector)});
+       if (!el) throw new Error("找不到元素：${selector}");
+       Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value").set.call(
+         el, ${JSON.stringify(value)}
+       );
+       el.dispatchEvent(new Event("change", { bubbles: true }));
        return true;
      })()`
   );

@@ -13,7 +13,9 @@ import {
   waitFor,
   fill,
   click,
+  realClick,
   pressEnter,
+  selectOption,
   screenshot,
   visibleText,
   sleep,
@@ -25,6 +27,10 @@ const TOKEN = process.argv[3];
 const SHOTS = process.argv[4] ?? "shots";
 
 let failed = 0;
+// 让 cdp.mjs 里的 waitFor 也能往这个计数里加（见那边的注释：
+// 抛异常会中止整轮，汇总却显示 0 失败，那比红更糟）。
+globalThis.__e2eFailed = 0;
+
 function ok(label, cond, extra = "") {
   if (cond) {
     console.log(`  ok   ${label}`);
@@ -35,6 +41,46 @@ function ok(label, cond, extra = "") {
 }
 
 const text = () => visibleText(s);
+
+/**
+ * 收尾。**无论用例怎么结束都要走到这里**。
+ *
+ * 之前 `waitFor` 超时会直接抛异常，脚本在中间就没了，末尾那句
+ * `console.log(全部通过)` 根本不执行 —— 外面看到的是"没有输出"，
+ * CI 上更容易被当成"通过了"（headless 浏览器那段尤其容易看漏）。
+ *
+ * 所以主体包在 `run()` 里，异常记下来但不让它跳过收尾。
+ */
+let fatal = null;
+
+/**
+ * 中途炸掉时也要给出**诚实的**退出码和汇总。
+ *
+ * 这不是锦上添花：实际发生过一次 `waitFor` 超时，脚本在中间就没了，
+ * 末尾的"全部通过"从没打印，而外层只看到进程非零退出、日志尾部被截断 ——
+ * 很容易读成"跑完了、没报错"。这里把异常挂住，让收尾照常执行。
+ */
+process.on("uncaughtException", (e) => {
+  fatal = e;
+  console.log(`\n用例中断：${e.message}`);
+  finish();
+});
+process.on("unhandledRejection", (e) => {
+  fatal = e;
+  console.log(`\n用例中断：${e?.message ?? String(e)}`);
+  finish();
+});
+
+/** 打印汇总并给退出码。收尾只允许跑一次。 */
+let finished = false;
+function finish() {
+  if (finished) return;
+  finished = true;
+  // 中途抛异常（waitFor 超时之类）也要算失败，不能让"0 条失败"骗过去
+  const total = Math.max(failed, globalThis.__e2eFailed ?? 0) + (fatal ? 1 : 0);
+  console.log(total ? `\n${total} 条失败` : "\n全部通过");
+  process.exit(total ? 1 : 0);
+}
 
 /**
  * 让用例可重复跑：先把服务端的数据清空。
@@ -117,6 +163,129 @@ ok(
   !(await text()).includes("标签是横切的"),
   "同上"
 );
+
+// ---------------------------------------------------------------- 收纳
+console.log("== 低频功能收进一个 ⋯ 菜单 ==");
+
+// 用户的原话："你整三个点那种，把其他的功能都收纳起来，比如导出全部这些功能，
+// 你都放到一起而不是全呈现出来"。
+//
+// **这个测试在网页端跑，所以只能验"字号"和"同步设置"两项** ——
+// 导出是桌面端专有（浏览器里写不出一棵目录树，见 Sidebar 的 onExport 注释）。
+// 导出收没收进菜单，由"侧边栏不再有那个入口"这条断言间接守住。
+ok("顶栏有一个「⋯」入口", await evaluate(s, `!!document.querySelector('.overflow-btn')`));
+
+ok(
+  "字号档位不再平铺在顶栏（收进菜单了）",
+  await evaluate(s, `!document.querySelector('.topbar .font-select')`),
+  "一个四档的下拉框常驻顶栏，占掉的是检索框的位置，而它一个月未必用一次"
+);
+
+ok(
+  "侧边栏不再平铺「导出全部…」",
+  await evaluate(s, `!document.querySelector('.sidebar-foot')`),
+  "导出是几个月才用一次的操作，不该在导航里长期占一个位置"
+);
+
+ok(
+  "菜单默认是关着的（没点开时页面上看不到那些功能）",
+  await evaluate(s, `!document.querySelector('.overflow-menu')`)
+);
+
+await click(s, ".overflow-btn");
+await waitFor(s, "!!document.querySelector('.overflow-menu')", "菜单展开");
+ok("点 ⋯ 之后菜单展开", true);
+ok(
+  "菜单里有字号档位",
+  await evaluate(s, `!!document.querySelector('.overflow-menu .font-select')`)
+);
+await screenshot(s, `${SHOTS}/web-02b-overflow.png`);
+
+// 换字号之后菜单要收起：用户是"调完就走"，菜单糊在脸上挡着记录
+await selectOption(s, ".overflow-menu .font-select", "1.3");
+await waitFor(
+  s,
+  `!!document.querySelector('.overflow-menu') === false`,
+  "换完字号菜单收起",
+  10000
+);
+ok(
+  "换完字号菜单自动收起（调完就走，别糊在脸上挡记录）",
+  await evaluate(s, `!document.querySelector('.overflow-menu')`)
+);
+ok(
+  "字号真的变了",
+  await evaluate(
+    s,
+    `document.documentElement.style.getPropertyValue('--font-scale').trim() === '1.3'`
+  )
+);
+// 换回标准档，别影响后面的截图
+await click(s, ".overflow-btn");
+await waitFor(s, "!!document.querySelector('.overflow-menu')", "菜单再展开");
+await selectOption(s, ".overflow-menu .font-select", "1");
+await sleep(400);
+
+// 点外面要能关掉。没这一步的话菜单会一直挂在页面上，
+// 而用户点 ⋯ 往往只是"想看看里面有什么"，不是"我要用某个功能"。
+await click(s, ".overflow-btn");
+await waitFor(s, "!!document.querySelector('.overflow-menu')", "菜单第三次展开");
+await realClick(s, ".title");
+await waitFor(
+  s,
+  `!document.querySelector('.overflow-menu')`,
+  "点别处菜单收起",
+  8000
+);
+ok("点菜单外面会收起（点 ⋯ 往往只是想看看里面有什么）", true);
+
+// Esc 也要能关：键盘用户没有鼠标可点
+await click(s, ".overflow-btn");
+await waitFor(s, "!!document.querySelector('.overflow-menu')", "菜单第四次展开");
+await evaluate(
+  s,
+  `document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })); true`
+);
+await waitFor(s, `!document.querySelector('.overflow-menu')`, "Esc 收起菜单", 8000);
+ok("按 Esc 也能收起菜单", true);
+ok(
+  "**Esc 收菜单没有把检索关键词一起清掉**（两个 Esc 不该绑同一件事）",
+  await evaluate(
+    s,
+    `(() => {
+       const q = document.querySelector('.search-input').value;
+       return q === '';
+     })()`
+  ),
+  "此时检索框本来就是空的，所以这条只验它没被误清；下面那次才验真的不误清"
+);
+
+// 真有一行检索时，Esc 只该关菜单，不该顺手把词也清了
+await fill(s, ".search-input", "地铁");
+await sleep(500);
+await click(s, ".overflow-btn");
+await waitFor(s, "!!document.querySelector('.overflow-menu')", "菜单第五次展开");
+await evaluate(
+  s,
+  `document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })); true`
+);
+await sleep(500);
+ok(
+  "有检索词时按 Esc，菜单关了但检索词还在",
+  (await evaluate(s, `!!document.querySelector('.search-input').value`)) &&
+    !(await evaluate(s, `!!document.querySelector('.overflow-menu')`)),
+  `检索框=${await evaluate(s, `document.querySelector('.search-input').value`)}`
+);
+await evaluate(
+  s,
+  `(() => {
+     const el = document.querySelector('.search-input');
+     Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(el, '');
+     el.dispatchEvent(new Event('input', { bubbles: true }));
+     return true;
+   })()`
+);
+await sleep(600);
 
 // ---------------------------------------------------------------- 写
 console.log("== 记一条 ==");
@@ -954,5 +1123,5 @@ ok(
   s.consoleErrors.join(" | ")
 );
 
-console.log(failed ? `\n${failed} 条失败` : "\n全部通过");
-process.exit(failed ? 1 : 0);
+// 中途抛异常（waitFor 超时之类）也要算失败，不能让"0 条失败"骗过去
+finish();

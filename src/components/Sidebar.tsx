@@ -9,14 +9,6 @@ interface Props {
   onSelect: (v: View) => void;
   onCreateChannel: (name: string) => void;
   onDeleteChannel: (id: string) => void;
-  /**
-   * 导出全部记录。
-   *
-   * **只有桌面端会传它。** 浏览器里写不出一棵目录树（按频道分目录 +
-   * `attachments/`），所以不传时整个入口都不渲染 —— 而不是渲染一个
-   * 点下去没反应的按钮。
-   */
-  onExport?: () => void;
 }
 
 /**
@@ -41,7 +33,6 @@ export function Sidebar({
   onSelect,
   onCreateChannel,
   onDeleteChannel,
-  onExport,
 }: Props) {
   const [adding, setAdding] = useState(false);
   const [draft, setDraft] = useState("");
@@ -152,17 +143,6 @@ export function Sidebar({
           </div>
         )}
       </div>
-      {onExport && (
-        <div className="section sidebar-foot">
-          <button
-            className="nav-item"
-            onClick={onExport}
-            title="把全部记录导出成 Markdown（按频道分目录，图片一起带走）"
-          >
-            <span className="nav-name">导出全部…</span>
-          </button>
-        </div>
-      )}
     </aside>
   );
 }

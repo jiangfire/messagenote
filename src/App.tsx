@@ -16,6 +16,7 @@ import { Stream } from "./components/Stream";
 import { Composer } from "./components/Composer";
 import { SyncBadge } from "./components/SyncBadge";
 import { SyncSettings } from "./components/SyncSettings";
+import { OverflowMenu } from "./components/OverflowMenu";
 import { UpdateNotice } from "./components/UpdateNotice";
 
 const PAGE_SIZE = 200;
@@ -104,6 +105,50 @@ const FONT_SCALES = [
 function loadFontScale(): number {
   const raw = Number(localStorage.getItem(FONT_SCALE_KEY));
   return FONT_SCALES.some((s) => s.value === raw) ? raw : 1;
+}
+
+/**
+ * 同步状态**值不值得占顶栏一个位置**。
+ *
+ * 只有"用户该知道但可能不知道"的情况才占：
+ * - 没配同步：新装的桌面端，用户还不知道多设备那件事，值得说一句
+ * - 同步失败：数据可能没存下来，这是必须打断的事
+ * - 已同步 / 待同步：没有新信息，藏进 ⋯ 就行
+ *
+ * 判断放在这里而不是 `SyncBadge` 里，是为了让"顶栏那个胶囊"和"菜单里那一行"
+ * 用同一套措辞 —— 两处各写一遍的话，迟早会分叉成"顶栏说失败、菜单说已同步"。
+ */
+function syncNeedsAttention(configured: boolean, status: SyncStatus | null): boolean {
+  if (!configured) return true;
+  return status !== null && !status.ok;
+}
+
+/** 菜单里的那一行同步状态。词和顶栏胶囊一致，只是没有那个圆点。 */
+function SyncRow({
+  configured,
+  status,
+  onOpen,
+}: {
+  configured: boolean;
+  status: SyncStatus | null;
+  onOpen: () => void;
+}) {
+  let text = "未配置同步";
+  if (configured) {
+    if (!status) text = "待同步";
+    else if (status.ok) {
+      text =
+        status.conflicts > 0
+          ? `已同步 · 新增冲突副本 ${status.conflicts}`
+          : `已同步 · 推 ${status.pushed} 拉 ${status.pulled}`;
+    } else text = `同步失败 · ${status.message}`;
+  }
+
+  return (
+    <button className="overflow-item" onClick={onOpen} title="打开同步设置">
+      {text}
+    </button>
+  );
 }
 
 export default function App() {
@@ -359,7 +404,10 @@ export default function App() {
     localStorage.setItem(FONT_SCALE_KEY, String(fontScale));
   }, [fontScale]);
 
-  // 全局快捷键是 Rust 侧注册的；这里只处理窗口内的 Esc
+  // 全局快捷键是 Rust 侧注册的；这里只处理窗口内的 Esc。
+  //
+  // 菜单开着的时候 Esc 归菜单管（它在 capture 阶段就 `stopPropagation` 了，
+  // 事件根本走不到这里）—— 关菜单和清检索词是两件事，不该一次按完。
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
       if (e.key === "Escape" && query) {
@@ -510,33 +558,24 @@ export default function App() {
         }}
         onCreateChannel={(name) => void run(() => api.createChannel(name))}
         onDeleteChannel={(id) => void run(() => api.deleteChannel(id))}
-        onExport={desktop ? () => void exportAll() : undefined}
       />
 
       <main className="main">
         <header className="topbar">
           <h1 className="title">{title}</h1>
-          {desktop && (
+
+          {/* 同步状态**只在出问题时**留在顶栏。
+              正常同步是个没有信息量的绿点，而"我这条到底存哪儿了"是用户会问的
+              问题 —— 答案不该藏起来。而一个四档下拉框常年占着检索框的位置、
+              几个月才用一次，就该收进 ⋯。见 OverflowMenu 的说明。 */}
+          {desktop && syncNeedsAttention(syncConfigured, syncStatus) && (
             <SyncBadge
               configured={syncConfigured}
               status={syncStatus}
               onOpen={() => setSettingsOpen(true)}
             />
           )}
-          {/* 字号档位。放在检索框边上：都是"看"的调节，不和写入路径抢位置。 */}
-          <select
-            className="font-select"
-            value={fontScale}
-            title="界面字号"
-            aria-label="界面字号"
-            onChange={(e) => setFontScale(Number(e.target.value))}
-          >
-            {FONT_SCALES.map((s) => (
-              <option key={s.value} value={s.value}>
-                字号：{s.label}
-              </option>
-            ))}
-          </select>
+
           <div className="search-wrap">
             <input
               ref={searchRef}
@@ -551,6 +590,61 @@ export default function App() {
               </button>
             )}
           </div>
+
+          {/* 低频功能都收在这儿：字号、导出、同步设置。 */}
+          <OverflowMenu title="更多功能">
+            {(close) => (
+              <>
+                <div className="overflow-sec">
+                  <span className="overflow-label">界面字号</span>
+                  <select
+                    className="font-select"
+                    value={fontScale}
+                    onChange={(e) => {
+                      setFontScale(Number(e.target.value));
+                      // 调完就走：菜单糊在脸上会挡住用户接下来要看的记录
+                      close();
+                    }}
+                  >
+                    {FONT_SCALES.map((s) => (
+                      <option key={s.value} value={s.value}>
+                        {s.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                {desktop && (
+                  <div className="overflow-sec">
+                    <span className="overflow-label">同步</span>
+                    <SyncRow
+                      configured={syncConfigured}
+                      status={syncStatus}
+                      onOpen={() => {
+                        setSettingsOpen(true);
+                        close();
+                      }}
+                    />
+                  </div>
+                )}
+
+                {/* 导出**只有桌面端有**（浏览器里写不出一棵目录树），
+                    所以网页端的菜单里不出现这一行 —— 而不是渲染一个点下去
+                    没反应的按钮。 */}
+                {desktop && (
+                  <button
+                    className="overflow-item"
+                    onClick={() => {
+                      close();
+                      void exportAll();
+                    }}
+                  >
+                    导出全部记录…
+                  </button>
+                )}
+              </>
+            )}
+          </OverflowMenu>
         </header>
 
         {notices.length > 0 && (
