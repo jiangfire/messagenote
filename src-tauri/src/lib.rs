@@ -42,9 +42,25 @@ static CAPTURE_SHOWN_AT: AtomicI64 = AtomicI64::new(0);
 
 // ---------------------------------------------------------------- 主窗口
 
+/// 把主窗口拿到前面来。
+///
+/// 「第二个实例启动」和「托盘唤起」都要这个动作，所以只留一份实现 ——
+/// 两份迟早会分叉成"从托盘点出来是还原过的、从图标点出来还是最小化的"。
+fn show_main(app: &AppHandle) {
+    let Some(win) = app.get_webview_window(MAIN_LABEL) else {
+        return;
+    };
+    let _ = win.show();
+    let _ = win.unminimize();
+    let _ = win.set_focus();
+}
+
 /// 显示/隐藏主窗口。
 ///
 /// 「已经在前台就隐藏」这个行为是刻意的：托盘的单击既当"唤起"又当"收起"。
+///
+/// 注意它和 [`show_main`] 的区别：这里是**切换**，用户主动点托盘才用它。
+/// 第二个实例启动时绝不能用它 —— 那会把用户已经开着的窗口藏起来。
 fn toggle_main(app: &AppHandle) {
     let Some(win) = app.get_webview_window(MAIN_LABEL) else {
         return;
@@ -52,9 +68,7 @@ fn toggle_main(app: &AppHandle) {
     if win.is_visible().unwrap_or(false) && win.is_focused().unwrap_or(false) {
         let _ = win.hide();
     } else {
-        let _ = win.show();
-        let _ = win.unminimize();
-        let _ = win.set_focus();
+        show_main(app);
     }
 }
 
@@ -154,13 +168,36 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let outcome = tauri::Builder::default()
+    // ---- 单实例 ----
+    //
+    // 用户重复点图标（或开机自启之后又手动点一次）时，**第二个进程只该把已经
+    // 开着的那个拿到前面来，然后自己退出**。没有这一层，第二个进程会抢同一个
+    // `messagenote.sqlite`、再挂一个托盘图标，用户看到的是"点了没反应" ——
+    // 而实际上多了一个常驻进程。
+    //
+    // **逃生口是 `MESSAGENOTE_DB`**：设了它说明调用方知道自己在干什么
+    // （见 setup 里对它的说明，主要用途就是同机跑两个实例验证同步）。
+    // 少了这个例外，"验证同步"这件事在开发机上就没法做了。
+    let single_instance = std::env::var("MESSAGENOTE_DB").map_or(true, |p| p.trim().is_empty());
+
+    // 这个插件**必须第一个注册**（官方文档的要求）：它在 setup 阶段就要决定
+    // "我是不是第一个实例"，排到别的插件后面会发现不了已经存在的那个。
+    let builder = tauri::Builder::default();
+    let builder = if single_instance {
+        builder.plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            // 第一个实例收到的回调。用户按图标时期待的就是"把那个拿来"，
+            // 所以这里是 show 而不是 toggle —— toggle 可能把窗口藏起来。
+            show_main(app);
+        }))
+    } else {
+        builder
+    };
+
+    let outcome = builder
         // 自动更新。检查/下载/校验签名都在 Rust 侧，界面只负责问用户一句。
-        //
-        // `process` 插件只为了一个命令：装完之后重启（Windows 上 NSIS 安装完
-        // 本来就会拉起新版本，但显式重启让三端行为一致，也省得依赖安装器）。
+        // 装完之后的重启走 `commands::relaunch`（它要先把单实例占的名字放掉），
+        // 所以这里不需要 tauri-plugin-process。
         .plugin(tauri_plugin_updater::Builder::new().build())
-        .plugin(tauri_plugin_process::init())
         // 导出时选目标目录。权限只给主窗口，见 capabilities/dialog.json。
         .plugin(tauri_plugin_dialog::init())
         .plugin(
@@ -292,6 +329,7 @@ pub fn run() {
             commands::collect_garbage_attachments,
             commands::export_markdown,
             commands::render_message_markdown,
+            commands::relaunch,
         ])
         .run(tauri::generate_context!());
 

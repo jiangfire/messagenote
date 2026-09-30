@@ -1,7 +1,6 @@
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
-import { relaunch } from "@tauri-apps/plugin-process";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { api as commands } from "./api";
 import type { DesktopApi, NoteApi } from "./apiContext";
@@ -88,7 +87,10 @@ export const tauriDesktop: DesktopApi = {
     // 意义：更新包是从网上拿的，没有签名校验就等于让任何人给你换一个 exe。
     await pendingUpdate.downloadAndInstall();
     // Windows 上 NSIS 装完本来也会拉起新版本，但显式重启让行为不依赖安装器。
-    await relaunch();
+    // **走自己的命令，不用插件的 relaunch**：那一步要先把单实例插件占的名字
+    // 放掉，否则新进程会以为老的还活着，而老的正准备退出 ——
+    // 结果是"更新完应用不见了"。见 `commands::relaunch`。
+    await commands.relaunch();
   },
 
   // ------------------------------------------------------------ 导出

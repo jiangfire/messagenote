@@ -247,6 +247,21 @@ pub fn render_message_markdown(
     crate::export::render_one(&conn, &id, utc_offset_minutes)
 }
 
+/// 装完更新之后重启自己。
+///
+/// **不能直接用插件自带的重启。** `tauri::process::restart` 是"起一个新进程，
+/// 然后立刻 `std::process::exit`"：新进程启动时会去问单实例插件"我是不是第一个"，
+/// 而老进程往往还没退干净 —— 于是新进程把参数交出去、自己退掉，老进程同时也在退，
+/// **结果一个都不剩**（表现是"更新完应用不见了"）。插件为此留了一个
+/// `destroy`：先把自己占的那个名字放掉，新进程才会认为自己是第一个。
+///
+/// 顺序不能反：`destroy` 必须在 `restart` 之前。
+#[tauri::command]
+pub fn relaunch(app: tauri::AppHandle) {
+    tauri_plugin_single_instance::destroy(&app);
+    app.restart();
+}
+
 // ---------------------------------------------------------------- 同步
 
 #[tauri::command]

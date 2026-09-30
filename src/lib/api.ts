@@ -104,6 +104,15 @@ export const api = {
   hideCapture: () => invoke<void>("hide_capture"),
 
   /**
+   * 装完更新之后重启自己。
+   *
+   * **不用 `@tauri-apps/plugin-process` 的 `relaunch`**：那一步得先把单实例插件
+   * 占的名字放掉，否则新进程会以为老的还活着（而老的正准备退出），
+   * 结果是"更新完应用不见了"。见 Rust 侧的 `commands::relaunch`。
+   */
+  relaunch: () => invoke<void>("relaunch"),
+
+  /**
    * 本次启动记下的**非致命**警告（比如全局快捷键被别的程序占用）。
    *
    * 挂载时读一次。这些警告产生于 Rust 侧的 setup 阶段 —— 那时界面还没加载，

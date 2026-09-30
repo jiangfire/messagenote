@@ -26,15 +26,20 @@ tauri-plugin-global-shortcut = "2"
 # 自动更新。桌面端已经分发出去了 —— 没有它，用户手上那份就是**死版本**，
 # 每次发新版都得让人重新下载安装包。
 #
-# `updater` 负责检查/下载/校验签名；`process` 只为了一个命令：装完之后重启。
-# 不用 cfg 限定平台：这个项目就只出 Windows 桌面端，写了只是噪音。
+# `updater` 负责检查/下载/校验签名。装完之后的重启**不用** tauri-plugin-process：
+# 那一步要先放开单实例插件占的名字（见 `commands::relaunch`），
+# 所以那条路径是自己的一个命令。
 tauri-plugin-updater = "2"
-tauri-plugin-process = "2"
 
 # 导出时选目标目录。Tauri v2 没有内置的文件对话框，标准做法就是这个插件。
 # 权限只给主窗口（见 capabilities/dialog.json）—— 捕获浮层是个只有一个输入框的
 # 小窗，它没有任何理由需要"挑一个目录"的能力。
 tauri-plugin-dialog = "2"
+
+# 只跑一个实例。没有它，重复点图标（或开机自启 + 手动再点一次）会开出第二个
+# 进程：两个进程抢同一个 SQLite 文件、各挂一个托盘图标，而用户看到的是
+# "点了没反应"。见 lib.rs 里的装配与逃生口说明。
+tauri-plugin-single-instance = "2"
 
 # 单条复制时把图片内联成 data URI。手写 base64 是纯风险（漏了填充、算错 6 位组
 # 都不会报错，只会得到一张画不出来的图），而它本来就在依赖树里（0.22.1）。

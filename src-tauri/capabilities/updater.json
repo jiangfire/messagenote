@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "updater",
-  "description": "自动更新的权限只给主窗口。捕获浮层是个无边框的小输入框，它没有任何理由需要「下载并安装一个新版本」的能力。",
+  "description": "自动更新的权限只给主窗口。捕获浮层是个无边框的小输入框，它没有任何理由需要「下载并安装一个新版本」的能力。重启走自己的命令（见 commands.rs 的 relaunch），所以这里不再需要 process:allow-restart。",
   "windows": ["main"],
-  "permissions": ["updater:default", "process:allow-restart"]
+  "permissions": ["updater:default"]
 }
