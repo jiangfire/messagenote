@@ -43,6 +43,10 @@
 | 文件 | 干什么 |
 | --- | --- |
 | `cdp-eval.mjs` | 极简 CDP 求值器：`node cdp-eval.mjs '<url正则>' '<JS表达式>'`。**其它脚本都靠它**。窗口靠 URL 区分：主窗口是 `tauri\.localhost/$`，浮层是 `capture\.html`。 |
+| `fake-server.mjs` | 替身服务端：只实现桌面端真正会打的 5 个端点，用环境变量控制行为（心跳间隔、上传必失败、握手故意延迟）。**下面 R1/R7/R8 三套都靠它。** |
+| `sse-lifetime.mjs` | **R1**：量 SSE 连接活了多久。替身把心跳调成 8 秒、观察 40 秒 —— 修复前 25 秒必被 `timeout_recv_body` 的总预算掐断。 |
+| `sync-starve-verify.mjs` | **R7**：让 `/api/blob` 全部返 500，断言拉取的消息**仍然进了本地库**。 |
+| `mainthread-verify.mjs` | **R8**：让 `test_sync_connection` 打到延迟 8 秒的端点，期间从 CDP 连续探测界面，量中位延迟。 |
 | `paste-verify.ps1` + `paste-db.py` | 合成真实全局快捷键 + `Ctrl+V` 粘一张 12×12 的 PNG，再查库断言"字节的 sha256 == 正文里写的 sha"且"解出来真的是 12×12"。**跑之前保存剪贴板、跑完还原。** |
 | `export-verify.mjs` + `export-db.py` | 用应用自己的写命令造数据 → 调 `export_markdown`（全量 + 四种筛选）→ 断言文件树、front-matter、**附件相对路径真能取到那份字节**（不是"字符串长这样"）、筛选的区间端点含不含在内、以及导出面板本身（菜单 → 面板 → 控件 → 日期写反被拦住）。 |
 | `copy-verify.mjs` | 单条复制：断言图被内联成 data URI，并在 Node 这边**独立解码**再和原字节逐字节比。 |
@@ -76,7 +80,38 @@ pwsh -NoProfile -File scripts\desktop-verify\paste-verify.ps1
 产物和输出都落在仓库根的 `.scratch/` 下（gitignore）。`export-*` 那对可以用
 `--work <目录>` / 第一个参数换工作目录，想跑两次对比时有用。
 
-## 三个坑（都踩过，写在这里免得下一个人再踩）
+## R1 / R7 / R8：三套同步相关的真机验证
+
+这三项都出在 `src-tauri/src/sync.rs` 与 `sse.rs`，`cargo test` 里有对应的
+单元测试，但**都覆盖不到真机这一段**：真实 HTTP 往返、真实 ureq 超时语义、
+真实主线程。所以各配了一套脚本。
+
+三套共用一个**替身服务端**（`fake-server.mjs`）。不用真服务端是因为它们
+各自需要真服务端给不了的东西：观察连接活了多久、让上传失败但拉取成功、
+让握手慢下来。替身只实现桌面端真正会打的那 5 个端点。
+
+```powershell
+# R1：SSE 连接必须活过 25 秒。替身把心跳调成 8 秒，于是"活过 34 秒"= 两次心跳
+$env:MESSAGENOTE_TOKEN = 'sse-verify-token-0123456789abcdefghijklmnop'
+$env:HEARTBEAT_MS = '8000'
+node scripts\desktop-verify\fake-server.mjs     # 前台或另开一个窗口
+node scripts\desktop-verify\sse-lifetime.mjs
+
+# R7：上传全败时拉取不能被饿死。FAIL_BLOB=1 让 /api/blob 全部返 500
+$env:FAIL_BLOB = '1'
+node scripts\desktop-verify\fake-server.mjs
+node scripts\desktop-verify\sync-starve-verify.mjs
+
+# R8：慢命令飞行期间界面不能冻结。SLOW_MS 让握手端点故意慢 8 秒
+$env:FAIL_BLOB = '0'; $env:SLOW_MS = '8000'
+node scripts\desktop-verify\fake-server.mjs
+node scripts\desktop-verify\mainthread-verify.mjs
+```
+
+三套脚本都是**只读 DOM / 查库 + 计时**，不合成按键、不抢前台焦点，可以和
+其它验证共存，也可以在应用开着的时候随时跑。
+
+## 六个坑（都踩过，写在这里免得下一个人再踩）
 
 - **截图在 Tauri v2 上不可信。** DirectComposition，`CopyFromScreen` 抓出来是
   空白 —— README 里也写过。能看见真相的是 CDP：直接读 DOM。
@@ -89,3 +124,20 @@ pwsh -NoProfile -File scripts\desktop-verify\paste-verify.ps1
   `export-verify.mjs` 里第二段就是点 ⋯ → 点「导出记录…」→ 改控件 → 读 DOM。
   给 React 的受控输入赋值要走原生 setter（`HTMLInputElement.prototype` 上的
   那个 `value` setter），直接 `el.value = x` 它收不到，React 记着自己写进去的值。
+- **替身服务端在 pull 响应里推 `changed` 会形成反馈回路。** 拉取是被动读取，
+  给订阅者推信号就变成「拉取 → 唤醒同步 → 再拉取」。实测 60 秒内 16000+ 次
+  pull，顺带耗尽本机临时端口，客户端报 `os error 10048` —— 验证结论全被污染。
+  真服务端也只在**写入**时推。替身因此在 pull 上加了速率闸门（>200 次就拒答），
+  好让回路响亮地失败，而不是给出一个假的结论。
+- **拉下来的消息必须落在本地真实存在的频道里。** `message.channel_id` 有外键
+  约束，指向不存在的频道时整条 INSERT 失败 —— 于是"拉取执行了"却查不到任何
+  痕迹，脚本会误判成"pull 被饿死"。替身默认用 `inbox`，可用 `CHANNEL_ID` 改。
+- **判读标记必须每轮唯一。** R7 最初用固定的 `R7-PULL-MARKER`，而上一轮的
+  消息还留在库里、且固定 id + HLC 幂等意味着再拉也不会更新它 —— 脚本于是拿着
+  残留判了一个**假通过**（那一轮 `pulled: 0` 却"通过"了）。现在替身每次启动
+  生成一个 `runId` 编进正文，脚本在触发前先断言它此刻不在库里。
+  另外 R7 判的是**库**而不是界面：那一轮同步的最终状态是失败，前端拿到失败
+  状态就不重载时间线，于是"库里有了、界面上没出现"——那是正确行为。
+- **R8 的长命令得真的长。** 起初用 `export_markdown`，在这个小库上只要 33 毫秒，
+  压根占不住主线程，"没冻结"是因为命令太短而不是因为修好了。换成
+  `test_sync_connection` 打到延迟 8 秒的握手端点，结论才站得住。
