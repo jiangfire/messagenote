@@ -219,8 +219,33 @@ export default function App() {
     loadedCount.current = messages.length;
   }, [messages.length]);
 
+  /**
+   * 本次组件生命周期内发出的重取序号。
+   *
+   * 每个在途请求领一个号，回来时先核对「我还是最新的那个」——
+   * 不是就直接丢弃结果。用来挡的是**响应乱序**：
+   *
+   *   快速连点两个频道 → 发出请求 A、B → B 先回、A 后回
+   *     → 没有守卫的话后到的 A 会覆盖 B，界面停在**上一个频道**上
+   *
+   * 网页端 100~300 ms 的延迟就能复现，桌面端被 SQLite 的速度掩盖了。
+   * 而且它不会自愈 —— 直到用户再点一次。
+   *
+   * 用自增序号而不是 AbortController：后者更彻底（真的掐掉请求），
+   * 但会把"取消"这件事传进数据层，而两端实现不一样、还得各自保证
+   * 取消后不再落 state。序号是纯前端的事，也更容易在没有网络时测。
+   */
+  const loadSeq = useRef(0);
+
+  /**
+   * 检索的过期守卫。理由同 `loadSeq`，但**独立计数** ——
+   * 两者的失效互不相干：视图切得再快也不该让一次检索结果作废，反过来也一样。
+   */
+  const searchSeq = useRef(0);
+
   const loadMessages = useCallback(
     async (v: View) => {
+      const seq = ++loadSeq.current;
       // 重取时**保持已展开的窗口大小**。否则用户往回翻了很久、随手改一条记录，
       // 列表会立刻缩回最近 200 条，滚动位置也跟着跳 ——
       // 编辑一条不该让你丢掉正在看的那段历史。
@@ -228,6 +253,8 @@ export default function App() {
       // 时间筛选是时间线的属性：频道/标签视图不筛（和筛选条只在时间线出现保持一致）
       const since = v.type === "timeline" ? sinceMsOf(timeFilterRef.current) : null;
       const page = await fetchPage(api, v, limit, null, since);
+      // **已经有人发起更新的请求了** → 这次的响应是过期的，丢掉。
+      if (seq !== loadSeq.current) return;
       // 后端按时间倒序返回（便于分页），界面按正序渲染
       setMessages([...page.items].reverse());
       setHasMore(page.hasMore);
@@ -324,20 +351,29 @@ export default function App() {
   useEffect(() => {
     const q = query.trim();
     if (!q) {
+      // **序号也要推进。** 清 timer 只挡得住「还没发出去的那些」——
+      // 已经发出去、正飞在半空的那个请求照样会回来把旧结果复活，
+      // 表现是空查询下挂着一个结果列表，而且不再自愈。
+      searchSeq.current++;
       setResults(null);
       setResultsHasMore(false);
       return;
     }
     const timer = setTimeout(async () => {
+      const seq = ++searchSeq.current;
       try {
         setError(null);
         const page = await api.searchMessages(q, SEARCH_PAGE_SIZE, 0);
+        // 检索词已经变了（或者已经清空）→ 这批结果是上一个词的，丢掉
+        if (seq !== searchSeq.current) return;
         setResults(page.items);
         setResultsHasMore(page.hasMore);
       } catch (e) {
+        if (seq !== searchSeq.current) return;
         setError(errorText(e));
       }
     }, SEARCH_DEBOUNCE_MS);
+    // clearTimeout 只挡得住**还没开始**的那个；已经在途的那个靠上面的序号。
     return () => clearTimeout(timer);
   }, [api, query]);
 
@@ -374,6 +410,57 @@ export default function App() {
       setError(errorText(e));
     } finally {
       setBusy(false);
+    }
+  }
+
+  /**
+   * ⋯ 菜单里的两个附件维护动作。
+   *
+   * **两者都要确认、也都要报结果。** 它们低频但有后果：回收会把字节从库里
+   * 摘掉，清标记会让下一轮同步把全部附件重传一遍。不确认的话，
+   * 用户点错了也说不清；不报结果的话，按钮按下去像坏了。
+   *
+   * 清完标记顺手触发一次同步：不然用户还得自己知道要去点「立即同步」，
+   * 而那一步是整个修复里最容易漏掉的一步。
+   */
+  async function collectGarbage() {
+    if (!desktop) return;
+    if (
+      !confirm(
+        "回收不再被任何记录引用的附件字节？\n\n" +
+          "被回收的图会变成「待下载」—— 下次同步能从服务端取回来的会自动补上，" +
+          "取不回来的就找不回来了。"
+      )
+    ) {
+      return;
+    }
+    try {
+      const n = await desktop.collectGarbageAttachments();
+      await refresh(view);
+      setNotices([`回收了 ${n} 份附件字节`]);
+    } catch (e) {
+      setError(errorText(e));
+    }
+  }
+
+  async function resetUploadFlags() {
+    if (!desktop) return;
+    if (
+      !confirm(
+        "把所有附件标记成「未上传」？\n\n" +
+          "用于服务端从旧备份恢复之后补齐附件 —— 清完之后会立刻同步一次，" +
+          "把本机能拿到的附件重新传上去。附件很多的话这一步会传很久。"
+      )
+    ) {
+      return;
+    }
+    try {
+      const n = await desktop.resetUploadFlags();
+      setNotices([`清掉了 ${n} 个「已上传」标记，正在重新上传附件`]);
+      // 命令立刻返回，进度走 `sync://status` 事件（`SyncBadge` 那边在听）。
+      await desktop.syncNow();
+    } catch (e) {
+      setError(errorText(e));
     }
   }
 
@@ -629,6 +716,35 @@ export default function App() {
                   >
                     导出记录…
                   </button>
+                )}
+
+                {/* 附件维护。两个入口都刻意藏在"维护"这个分组下面：
+                    它们既不是常规操作，也不是每天都要用的东西，
+                    但没有它们，"手动回收字节"和"灾难恢复后补齐附件"
+                    这两件 README 里写着的事就完全没有途径做。
+                    仅桌面端（字节的存放在网页端是服务端的职责）。 */}
+                {desktop && (
+                  <div className="overflow-sec">
+                    <span className="overflow-label">维护</span>
+                    <button
+                      className="overflow-item"
+                      onClick={() => {
+                        close();
+                        void collectGarbage();
+                      }}
+                    >
+                      回收没被引用的附件…
+                    </button>
+                    <button
+                      className="overflow-item"
+                      onClick={() => {
+                        close();
+                        void resetUploadFlags();
+                      }}
+                    >
+                      重新上传全部附件…
+                    </button>
+                  </div>
                 )}
               </>
             )}

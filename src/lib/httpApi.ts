@@ -62,7 +62,19 @@ export interface HttpApiOptions {
   session: string;
   /** 收到 401 时调用 —— 界面据此清掉会话、回到登录页。 */
   onUnauthorized?: () => void;
+  /**
+   * 服务端**滑动续期**之后把新的过期时刻回传过来时调用。
+   *
+   * 没有它的话这件事对客户端完全不可见：服务端把 `expires_at` 往前推，
+   * 但 localStorage 里那个值停在登录那一刻，而每次打开页面都拿它判一次 ——
+   * 于是服务端注释写的目标（"每天都在用的人不该在第 7 天被踢回登录页"）
+   * 压根没实现，活跃用户仍然每 7 天被踢一次。
+   */
+  onSessionRenewed?: (expiresAt: number) => void;
 }
+
+/** 服务端续期之后把这个头带回来。见 `store::session_is_valid`。 */
+const HEADER_SESSION_EXPIRES = "X-Session-Expires";
 
 export function httpApi(opts: HttpApiOptions): NoteApi {
   const base = trimBase(opts.baseUrl);
@@ -82,6 +94,16 @@ export function httpApi(opts: HttpApiOptions): NoteApi {
       throw new UnauthorizedError();
     }
     if (!resp.ok) throw new Error(await errorText(resp));
+
+    // **必须在读 body 之前取头** —— body 一旦被消费就没法再取别的信息了。
+    // 顺带说明为什么它不是"每次请求都写一遍存储"：服务端只在真的续期时
+    // 才带这个头，没续期时是缺席的。
+    const renewed = resp.headers.get(HEADER_SESSION_EXPIRES);
+    if (renewed) {
+      const at = Number(renewed);
+      if (Number.isFinite(at)) opts.onSessionRenewed?.(at);
+    }
+
     // 删除类端点回 204，没有 body
     if (resp.status === 204) return undefined as T;
     return (await resp.json()) as T;
@@ -165,16 +187,6 @@ export function httpApi(opts: HttpApiOptions): NoteApi {
       }
       if (!resp.ok) throw new Error(await errorText(resp));
       return new Uint8Array(await resp.arrayBuffer());
-    },
-
-    hasAttachment: async (sha256) => {
-      // 网页端没有本地库 —— 字节要么在服务端，要么还没有。
-      // 直接用 HEAD 问一下，比取一遍再判断便宜得多。
-      const resp = await fetch(`${base}/api/blob/${encodeURIComponent(sha256)}`, {
-        method: "HEAD",
-        headers: { Authorization: `Bearer ${opts.session}` },
-      });
-      return resp.ok;
     },
   };
 }

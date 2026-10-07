@@ -39,16 +39,3 @@ export function formatDayLabel(ms: number): string {
     : `${d.getFullYear()}年${d.getMonth() + 1}月${d.getDate()}日`;
   return `${base} ${WEEKDAYS[d.getDay()]}`;
 }
-
-/** 消息正文的纯文本摘要，用于搜索结果等场景（去掉 Markdown 记号）。 */
-export function plainSummary(body: string, max = 160): string {
-  const t = body
-    .replace(/```[\s\S]*?```/g, " ")
-    .replace(/`([^`]*)`/g, "$1")
-    .replace(/!\[[^\]]*\]\([^)]*\)/g, " ")
-    .replace(/\[([^\]]*)\]\([^)]*\)/g, "$1")
-    .replace(/[*_>#~-]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-  return t.length > max ? `${t.slice(0, max)}…` : t;
-}

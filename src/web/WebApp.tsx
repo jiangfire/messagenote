@@ -56,6 +56,14 @@ export default function WebApp() {
 
   /** 离线队列里压着几条。0 表示没有，界面不显示任何东西。 */
   const [queued, setQueued] = useState(0);
+  /**
+   * 队列卡住了吗（以及为什么）。
+   *
+   * 没有它的话，一条**永久失败**的记录（毒丸，比如服务端一直说这条太长）
+   * 会把整个队列堵死，而界面上只是「N 条正在补发…」停在那里不动 ——
+   * 用户分不清是"还没联网"还是"有东西发不出去"，也没有任何办法自己解决。
+   */
+  const [queueStuck, setQueueStuck] = useState<string | null>(null);
 
   const accept = useCallback((baseUrl: string, s: Session) => {
     const value: Stored = { baseUrl, session: s.session, expiresAt: s.expiresAt };
@@ -78,14 +86,40 @@ export default function WebApp() {
    * 就 `drop(item.id)` —— 整队条目既没到服务端、又从队列里消失了。
    * 重放必须直连 `base`。
    */
+  /**
+ * 服务端滑动续期了，写回本地 —— **刻意不更新 React state**。
+ *
+ * 只写 localStorage 就够了：`isFresh` 读的是 localStorage 里的值，
+ * 下次打开页面就是新的。
+ *
+ * 为什么不走 `setStored`：那会让 `stored` 变 → `api` 的 useMemo 依赖变 →
+ * `base` 和 `api` 全部重建 → **离线队列的重放 effect 重跑一遍**
+ * （见下面那个 effect，依赖是 `base`）。续期是每个请求都可能发生的，
+ * 也就是说这一轮同步可能顺手重放好几次 —— 队列里的东西虽然是幂等的，
+ * 但那是没有必要的网络往返，而且在弱网下会拖慢真正要发的东西。
+ */
+const onSessionRenewed = useCallback((expiresAt: number) => {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (!raw) return;
+      const v = JSON.parse(raw) as Stored;
+      if (!v.baseUrl || !v.session) return;
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({ ...v, expiresAt }));
+    } catch {
+      // 存不进去就算了：最坏结果是下次打开页面多登一次，
+      // 而一个同步的存储失败不该把整个应用搞崩。
+    }
+  }, []);
+
   const base = useMemo(() => {
     if (!stored) return null;
     return httpApi({
       baseUrl: stored.baseUrl,
       session: stored.session,
       onUnauthorized,
+      onSessionRenewed,
     });
-  }, [stored, onUnauthorized]);
+  }, [stored, onUnauthorized, onSessionRenewed]);
 
   const api = useMemo(() => {
     if (!base) return null;
@@ -155,7 +189,10 @@ export default function WebApp() {
         // 频道要还原成**入队时**的那个，不是重放时界面正开着的那个
         await base.appendMessage(item.body, item.channelId ?? null, item.id);
       });
-      if (alive) setQueued(r.remaining);
+      if (alive) {
+        setQueued(r.remaining);
+        setQueueStuck(r.stopped?.reason ?? null);
+      }
     };
 
     void run();
@@ -214,9 +251,11 @@ export default function WebApp() {
       */}
       {queued > 0 && (
         <div className="offline-pill" role="status">
-          {navigator.onLine
-            ? `${queued} 条正在补发…`
-            : `${queued} 条已离线保存，联网后自动发送`}
+          {queueStuck
+            ? `${queued} 条发不出去（${queueStuck}）—— 内容有问题的可以改短再试`
+            : navigator.onLine
+              ? `${queued} 条正在补发…`
+              : `${queued} 条已离线保存，联网后自动发送`}
         </div>
       )}
 

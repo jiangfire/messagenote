@@ -107,13 +107,29 @@ export function ensureAttachment(api: NoteApi, sha256: string): boolean {
 }
 
 /** 换数据源时清空（现在的入口用不到，但留个明确的收口，别让人去手改 Map）。 */
-export function clearAttachmentCache() {
+function resetIfSourceChanged(api: NoteApi) {
+  if (lastSource === api) return;
+  lastSource = api;
+  if (cache.size === 0) return;
   for (const entry of cache.values()) {
     if (entry.url) URL.revokeObjectURL(entry.url);
   }
   cache.clear();
   notify();
 }
+
+/**
+ * 上一次取字节时用的 `api`。
+ *
+ * 缓存只按 sha 分桶，不认数据源 —— 但"取不到"这个结论**依赖数据源**：
+ * 服务端 A 上 401 取不到的字节，换到有权限的 B 上是有的。留着 `failed`
+ * 标记的话，那张图会永远停在"图片还没下载下来"，而且没有任何办法让它重试
+ * （重试的前提就是没有 `failed` 标记）。
+ *
+ * 所以数据源一换就把整个缓存作废。这也让 `clearAttachmentCache` 那条
+ * "换数据源时清空"的约定真正有了执行点，而不是一段注释。
+ */
+let lastSource: NoteApi | null = null;
 
 /**
  * 订阅"缓存变了"。模块级函数，引用永远稳定，
@@ -141,6 +157,7 @@ export function useAttachmentUrl(sha: string): string | null {
   const { api } = useApi();
 
   useLayoutEffect(() => {
+    resetIfSourceChanged(api);
     if (sha) ensureAttachment(api, sha);
   }, [api, sha]);
 
@@ -209,6 +226,9 @@ export function useAttachmentImages(
   }, [html]);
 
   useLayoutEffect(() => {
+    // 先认数据源：换了源的话，下面读到的缓存已经是另一个源的了。
+    resetIfSourceChanged(api);
+
     const root = container.current;
     if (!root) return;
 

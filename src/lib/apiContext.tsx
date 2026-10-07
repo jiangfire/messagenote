@@ -87,8 +87,6 @@ export interface NoteApi {
   saveAttachment(bytes: Uint8Array<ArrayBuffer>): Promise<string>;
   /** 取附件字节。字节还没到手时 reject。 */
   readAttachment(sha256: string): Promise<Uint8Array<ArrayBuffer>>;
-  /** 字节在不在本地。界面据此显示占位图。 */
-  hasAttachment(sha256: string): Promise<boolean>;
 }
 
 /**
@@ -163,6 +161,28 @@ export interface DesktopApi {
    * 而不是把一句数据库错误摔到用户脸上。
    */
   renderMessageMarkdown(id: string, utcOffsetMinutes: number): Promise<string | null>;
+
+  // ------------------------------------------------------------ 附件维护
+  //
+  // 两者都是**显式动作**，没有自动路径 —— 见 `db::reset_upload_flags` 与
+  // `blob::gc_unreferenced` 上的理由。返回被处理的条数，界面据此报一句结果。
+
+  /**
+   * 回收不再被任何记录引用的附件字节，返回清掉的条数。
+   *
+   * 只把 `bytes` 置空、**保留行**，所以它变成"待下载"：万一判错了
+   * （引用它的记录还没同步过来），下一轮同步会把图取回来，而不是永久消失。
+   */
+  collectGarbageAttachments(): Promise<number>;
+
+  /**
+   * 清掉全部附件的「已上传」标记，返回被清掉的条数。
+   *
+   * **灾难恢复后**才用得到：服务端从旧备份恢复过，它手上的附件比客户端
+   * 以为的少，而客户端标着"传过了"就再也不会重传 —— 别的设备上那些图
+   * 于是永远打不开。清完之后同步一次即可补齐。
+   */
+  resetUploadFlags(): Promise<number>;
 }
 
 export interface ApiBundle {

@@ -582,6 +582,15 @@ kbd {
   color: var(--danger);
 }
 
+/* 复制没有声音也没有动画，不换个颜色的话用户根本不知道点没点成 */
+.copy-mark.ok {
+  color: var(--accent);
+}
+
+.copy-mark.fail {
+  color: var(--danger);
+}
+
 /* ---------------- 标签 ---------------- */
 
 .tag-chip {

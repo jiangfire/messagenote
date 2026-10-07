@@ -36,6 +36,45 @@ interface Props {
 /** 距顶部多少像素开始预加载下一页。留出余量，用户不会撞到"墙"。 */
 const LOAD_MORE_THRESHOLD_PX = 320;
 
+/**
+ * 把一段文字放进剪贴板，成功返回 true。
+ *
+ * Clipboard API 只在安全上下文（HTTPS / localhost）里存在，而服务端部署
+ * 常常就是明文 HTTP —— 这时候 `navigator.clipboard` 是 undefined，
+ * 直接调会抛异常，用户看到的是"点了没反应"。
+ *
+ * 降级路径用一个屏幕外的 textarea + `execCommand("copy")`：它早就被标记为
+ * 废弃，但在不安全的上下文里是唯一还能用的办法。拿不到用户手势之外的
+ * 权限时会失败，所以返回 false 而不是假装成功。
+ */
+async function writeClipboard(text: string): Promise<boolean> {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch {
+    // 落到下面的降级路径
+  }
+
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    // 放在视口外而不是 display:none —— 隐藏元素无法被选中，命令会失败。
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.top = "0";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand("copy");
+    document.body.removeChild(ta);
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
 export function Stream({
   messages,
   channels,
@@ -202,24 +241,34 @@ function MessageRow({ message, channels, label, onEdit, onDelete, onMove, onTags
    * 和全量导出**走同一个渲染器** —— 各写一份的话，同一段内容会变成两种样子。
    *
    * 附件带不走（剪贴板里放不了文件），所以正文里仍是 `attachment:<sha>`。
-   * 失败时退回复制原文：那仍然是这条笔记的文字，丢的只是外挂的元信息，
-   * 比让"复制"这个动作什么都没发生要好。
+   * 取不到渲染结果时退回复制原文：那仍然是这条笔记的文字，丢的只是外挂的
+   * 元信息，比让「复制」什么都没发生要好。
+   *
+   * **而且必须给出反馈。** 复制这个动作看不见、摸不到，而明文 HTTP 下
+   * Clipboard API 根本不存在 —— 不给反馈的话用户只能反复点，
+   * 分不清是没点到还是失败了。
    */
+  const [copyState, setCopyState] = useState<"ok" | "fail" | null>(null);
+
   async function copyMarkdown() {
-    if (!desktop) {
-      await navigator.clipboard.writeText(message.body);
-      return;
+    let text = message.body;
+    if (desktop) {
+      try {
+        const md = await desktop.renderMessageMarkdown(
+          message.id,
+          -new Date().getTimezoneOffset()
+        );
+        // null = 这条已经不在了（在别处被删掉）。退回原文比什么都不做强。
+        text = md ?? message.body;
+      } catch {
+        text = message.body;
+      }
     }
-    try {
-      const md = await desktop.renderMessageMarkdown(
-        message.id,
-        -new Date().getTimezoneOffset()
-      );
-      // null = 这条已经不在了（在别处被删掉）。退回原文比什么都不做强。
-      await navigator.clipboard.writeText(md ?? message.body);
-    } catch {
-      await navigator.clipboard.writeText(message.body);
-    }
+
+    const ok = await writeClipboard(text);
+    setCopyState(ok ? "ok" : "fail");
+    // 成功也撤掉：不然「已复制」会一直挂着，变成一个假状态
+    setTimeout(() => setCopyState(null), 2500);
   }
 
   const [editing, setEditing] = useState(false);
@@ -378,7 +427,13 @@ function MessageRow({ message, channels, label, onEdit, onDelete, onMove, onTags
           title={desktop ? "复制成 Markdown（带频道/标签/时间）" : "复制原文"}
           onClick={() => void copyMarkdown()}
         >
-          ⧉
+          <span
+            className={
+              copyState === "ok" ? "copy-mark ok" : copyState === "fail" ? "copy-mark fail" : "copy-mark"
+            }
+          >
+            {copyState === "ok" ? "✓" : copyState === "fail" ? "!" : "⧉"}
+          </span>
         </button>
         <button className="icon-btn" title="添加标签" onClick={() => setTagging(true)}>
           #

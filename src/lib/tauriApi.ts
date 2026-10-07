@@ -123,6 +123,16 @@ export const tauriDesktop: DesktopApi = {
   renderMessageMarkdown(id, utcOffsetMinutes) {
     return invoke<string | null>("render_message_markdown", { id, utcOffsetMinutes });
   },
+
+  // ------------------------------------------------------------ 附件维护
+
+  collectGarbageAttachments() {
+    return invoke<number>("collect_garbage_attachments");
+  },
+
+  resetUploadFlags() {
+    return invoke<number>("reset_upload_flags");
+  },
 };
 
 /**

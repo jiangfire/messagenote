@@ -98,8 +98,6 @@ export const api = {
     return new Uint8Array(buf);
   },
 
-  hasAttachment: (sha256: string) => invoke<boolean>("has_attachment", { sha256 }),
-
   /** 收起捕获浮层。走 Rust 侧命令，保证"如何收起"只有一个实现。 */
   hideCapture: () => invoke<void>("hide_capture"),
 
@@ -144,6 +142,18 @@ export const api = {
    */
   testSyncConnection: (url: string, token: string) =>
     invoke<HealthResponse>("test_sync_connection", { url, token }),
+
+  // ------------------------------------------------------------ 附件维护
+  //
+  // 这两个都是**显式动作**，都收在 ⋯ 菜单的「维护」里（见 App.tsx）。
+  // 它们没有自动触发路径是有原因的：一个是 O(附件 × 记录) 的全表扫描，
+  // 另一个要向服务端核对全部 sha —— 都只值得在真的要修的时候付这个代价。
+
+  /** 回收不再被任何记录引用的附件字节，返回清掉的条数。 */
+  collectGarbageAttachments: () => invoke<number>("collect_garbage_attachments"),
+
+  /** 清掉全部「已上传」标记，返回被清掉的条数。灾难恢复后用它补齐附件。 */
+  resetUploadFlags: () => invoke<number>("reset_upload_flags"),
 };
 
 // `errorText` 搬去了 `./errors` —— 网页端不该为了一个错误格式化函数

@@ -98,6 +98,14 @@ export interface ReplayResult {
   sent: number;
   /** 还压在队列里的条数（包括这次没发成功的那条和它后面的）。 */
   remaining: number;
+  /**
+   * 队列**卡在哪一条**上、为什么。`null` 表示顺利，或者根本没东西要发。
+   *
+   * 有这个字段是因为一条永久失败的记录（毒丸）会把整个队列堵死，
+   * 而界面上看只是「N 条正在补发…」停在那里不动 —— 用户没有任何线索
+   * 知道是"还没联网"还是"有东西发不出去"。
+   */
+  stopped: { item: PendingCapture; reason: string } | null;
 }
 
 /**
@@ -108,18 +116,39 @@ export interface ReplayResult {
  * **第一条失败就停。** 不跳过它去发后面的：队列是按时间排的，跳过会让
  * 时间线错乱；而且失败通常意味着"还没恢复联网"，后面那些也一样发不出去，
  * 白试一遍。
+ *
+ * 失败要**分类上报**，不能一律吞掉。一条**永久失败**的项（毒丸，比如
+ * 服务端一直说这条内容太长）会卡住整个队列 —— 后面所有的笔记都发不出去，
+ * 而界面只看到"补发没完成"。没有任何地方说得出为什么。
+ *
+ * 所以：
+ * - **网络类**（TypeError）：正常情况，下次 `online` 事件会再来一次。
+ * - **别的错误**：多半是这条内容本身有问题，再试一万次也一样。
+ *   记进 console 并在结果里带上，让界面能说人话，而不是永远显示"正在补发"。
  */
 export async function replay(
   send: (item: PendingCapture) => Promise<void>
 ): Promise<ReplayResult> {
   const items = await pending();
   let sent = 0;
+  let stopped: { item: PendingCapture; reason: string } | null = null;
 
   for (const item of items) {
     try {
       await send(item);
-    } catch {
+    } catch (e) {
       // 还没恢复联网，或者服务端出错了。留在队列里，下次再来。
+      const network = e instanceof TypeError;
+      stopped = { item, reason: network ? "网络不可达" : errorReason(e) };
+      if (!network) {
+        // **非网络错误要说话。** 一条永久失败的记录会把整个队列堵死，
+        // 而用户能看到的只有「N 条正在补发…」一直不变 —— 没有任何线索
+        // 指向"是第 3 条内容有问题"。
+        console.error(
+          `[MessageNote] 离线队列在「${item.body.slice(0, 40)}」这条上停住了：` +
+            `${stopped.reason}。后面的 ${items.length - sent - 1} 条要等这条能过去。`
+        );
+      }
       break;
     }
     // **发出去了才删。** 反过来的话，进程在中间被杀掉就是一条永久丢失的记录 ——
@@ -128,5 +157,11 @@ export async function replay(
     sent += 1;
   }
 
-  return { sent, remaining: await count() };
+  return { sent, remaining: await count(), stopped };
+}
+
+/** 从一个错误里取出人能读的说明。 */
+function errorReason(e: unknown): string {
+  if (e instanceof Error && e.message) return e.message;
+  return String(e);
 }
