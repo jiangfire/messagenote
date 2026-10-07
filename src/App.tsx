@@ -845,6 +845,8 @@ export default function App() {
                 onDelete={(id) => run(() => api.deleteMessage(id))}
                 onMove={(id, cid) => run(() => api.moveMessage(id, cid))}
                 onTags={(id, t) => run(() => api.setMessageTags(id, t))}
+                // 采纳建议后只要刷新：标签已经由 Rust 写进库了
+                onAccepted={() => run(async () => undefined)}
                 // 检索结果是往**下**翻的，而且用明确的按钮而不是滚动自动加载
                 moreAt="bottom"
                 hasMore={resultsHasMore}
@@ -860,6 +862,8 @@ export default function App() {
               onDelete={(id) => run(() => api.deleteMessage(id))}
               onMove={(id, cid) => run(() => api.moveMessage(id, cid))}
               onTags={(id, t) => run(() => api.setMessageTags(id, t))}
+              // 采纳建议后只要刷新：标签已经由 Rust 写进库了
+              onAccepted={() => run(async () => undefined)}
               hasMore={hasMore}
               loadingOlder={loadingOlder}
               onLoadOlder={loadOlder}

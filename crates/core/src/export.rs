@@ -239,6 +239,15 @@ fn yaml_string(s: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
+            // **其余控制字符转义成 \xNN。**
+            //
+            // NUL、ESC 这类字符在 YAML 双引号标量里是**非法的**，原样写出去
+            // 会让整份 front-matter 解析失败 —— 而失败是**静默**的：读的人
+            // 不会看到报错，只会觉得标签莫名少了几条。
+            //
+            // 上游（`suggest::looks_like_a_tag`）已经拒掉控制字符了，但导出
+            // 是**读用户自己存的数据**，不能假设上游永远干净。
+            c if c.is_control() => out.push_str(&format!("\\x{:02X}", c as u32)),
             _ => out.push(c),
         }
     }
@@ -486,6 +495,25 @@ mod tests {
             updated_at: 0,
             body,
         }
+    }
+
+    /// front-matter 里出现裸控制字符，YAML 解析会**静默失败** ——
+    /// 读的人不会看到报错，只会觉得标签莫名少了几条。
+    ///
+    /// 上游（AI 建议）已经拒掉控制字符了，但导出读的是**用户自己存的数据**，
+    /// 不能假设上游永远干净。
+    #[test]
+    fn control_characters_in_a_tag_are_escaped_not_passed_through() {
+        // NUL 与 ESC 必须变成 \xNN，而不是原样进双引号标量
+        assert_eq!(yaml_string("a\0b"), "\"a\\x00b\"");
+        assert_eq!(yaml_string("\u{1b}[31m"), "\"\\x1B[31m\"");
+        // 引号、反斜杠、换行这些原本就转义了，别被这次改动弄坏
+        assert_eq!(yaml_string(r#"重要: 待办"#), r#""重要: 待办""#);
+        assert_eq!(yaml_string("a\"b"), r#""a\"b""#);
+        assert_eq!(yaml_string("a\\b"), r#""a\\b""#);
+        assert_eq!(yaml_string("a\nb"), r#""a\nb""#);
+        // 普通中日韩标签原样保留
+        assert_eq!(yaml_string("项目"), "\"项目\"");
     }
 
     #[test]

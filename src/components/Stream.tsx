@@ -16,6 +16,14 @@ interface Props {
   /** 归档到频道 —— 这是主要的整理动作 */
   onMove: (id: string, channelId: string) => Promise<void>;
   onTags: (id: string, tags: string[]) => Promise<void>;
+  /**
+   * 采纳 AI 建议之后重新读一次列表。
+   *
+   * **它和 `onTags` 是两件事**：采纳时标签已经由 Rust 命令写进库了，
+   * 这里只需要重新读取来反映出来。走 `onTags` 会用渲染快照**整体重写**
+   * 标签，把刚采纳的那条悄悄覆盖掉。
+   */
+  onAccepted?: (id: string) => Promise<void>;
   /** 还有更早的记录可以往前翻 */
   hasMore?: boolean;
   loadingOlder?: boolean;
@@ -84,6 +92,7 @@ export function Stream({
   onDelete,
   onMove,
   onTags,
+  onAccepted,
   hasMore = false,
   loadingOlder = false,
   onLoadOlder,
@@ -198,6 +207,7 @@ export function Stream({
               onDelete={onDelete}
               onMove={onMove}
               onTags={onTags}
+              onAccepted={onAccepted}
             />
           </div>
         );
@@ -230,9 +240,10 @@ interface RowProps {
   onDelete: (id: string) => Promise<void>;
   onMove: (id: string, channelId: string) => Promise<void>;
   onTags: (id: string, tags: string[]) => Promise<void>;
+  onAccepted?: (id: string) => Promise<void>;
 }
 
-function MessageRow({ message, channels, label, onEdit, onDelete, onMove, onTags }: RowProps) {
+function MessageRow({ message, channels, label, onEdit, onDelete, onMove, onTags, onAccepted }: RowProps) {
   const { desktop } = useApi();
 
   /**
@@ -284,6 +295,11 @@ function MessageRow({ message, channels, label, onEdit, onDelete, onMove, onTags
   // 分得开 —— 见下面 `.tag-chip.suggested` 的样式。
   const [suggestions, setSuggestions] = useState<TagSuggestion[]>([]);
   const [suggesting, setSuggesting] = useState(false);
+  /**
+   * 采纳中的锁。连点两个建议 chip 时，第二次必须等第一次落库完再发 ——
+   * 不加锁的话两个 `set_message_tags` 会并发，而它是**整体替换**。
+   */
+  const [accepting, setAccepting] = useState(false);
   /** 一次性提示：这一条 AI 没给出标签 / 正文被截了 / 端点报错了。 */
   const [suggestNote, setSuggestNote] = useState<string | null>(null);
 
@@ -338,15 +354,26 @@ function MessageRow({ message, channels, label, onEdit, onDelete, onMove, onTags
    *
    * 失败时**不能把 chip 藏掉**：那是"看起来成功了"的假状态，
    * 用户会以为标签已经加上而它并没有。
+   *
+   * **这里只负责刷新列表，不再调 `onTags`。** `acceptTagSuggestion`
+   * 已经在 Rust 里把标签写进库了；而 `set_message_tags` 是**整体替换**，
+   * 不是合并。再用 `message.tags` 这份渲染快照重写一次，同一行连点两个
+   * chip 就会静默丢标签：第二次点时 Rust 写的是 A+B，随后前端拿着
+   * **仍不含 A** 的旧快照发出 `[旧, B]`，A 被覆盖删除，且没有任何报错。
    */
   async function acceptSuggestion(name: string) {
     if (!desktop) return;
+    if (accepting) return; // in-flight 锁：连点不该发出两次写请求
+    setAccepting(true);
     try {
       await desktop.acceptTagSuggestion(message.id, name);
       setSuggestions((prev) => prev.filter((s) => s.name !== name));
-      await onTags(message.id, [...message.tags, name]);
+      // 只刷新，不重写：数据已经在库里了。
+      await onAccepted?.(message.id);
     } catch (e) {
       setSuggestNote(errorText(e));
+    } finally {
+      setAccepting(false);
     }
   }
 

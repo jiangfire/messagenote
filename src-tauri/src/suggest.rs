@@ -120,6 +120,14 @@ fn looks_like_a_tag(s: &str) -> bool {
         && s.chars().count() <= MAX_TAG_CHARS
         // 句读。出现它们就说明这是一句话被误当成了标签。
         && !s.chars().any(|c| "，。；：！？、,.!?;:\n\t".contains(c))
+        // **不含控制字符。** NUL、ESC 这些既不是句读也不是空白，会一路
+        // 混过去：`\x1b[31mred` 在界面上是一段红色文字，NUL 更能让下游的
+        // YAML 双引号标量直接变成非法值 —— 而读的人**不会看到报错**，
+        // 只会发现标签少了几个。
+        //
+        // 模型吐出控制字符不常见，但正文里的提示注入能诱导它这么回，
+        // 而这些字符没有任何当标签的正当用途，一律拒掉。
+        && !s.chars().any(char::is_control)
         // **不含空白。** 这是挡住英文散文的那一道：模型很爱回一句
         // "Sure! Here are some tags: ..." —— 按标点它会被挡掉，但去掉标点
         // 再按空格拆的话，剩下的每个单词都"像"一个标签。
@@ -331,5 +339,27 @@ mod tests {
         // 标签长度上限是共享规则（`normalize::tags`），这里不许绕开它
         let too_long = "长".repeat(200);
         assert!(parse_tags(&format!("[\"{too_long}\"]")).is_empty());
+    }
+
+    /// 控制字符既不是句读也不是空白，会一路混过"排除句读 + 排除空白"两道。
+    ///
+    /// 而它们的下场很具体：NUL / ESC 进了导出物的 front-matter 就让整段 YAML
+    /// 解析失败 —— **静默**失败，读的人只发现标签少了几个。
+    #[test]
+    fn control_characters_never_become_a_tag() {
+        // 裸 NUL、ANSI 转义序列、带 BEL 的串
+        assert!(!looks_like_a_tag("a\0b"));
+        assert!(!looks_like_a_tag("\u{1b}[31mred"));
+        assert!(!looks_like_a_tag("项目\u{7}"));
+        // 经由 parse_tags 走一遍完整路径：这些字符在候选里必须被剔掉。
+        //
+        // 两点细节，都是踩出来的：
+        //  · 必须嵌入**真实**控制字符。解析器按字符扫、不做 JSON 反转义，
+        //    写成 "A" 那种 6 位转义字面量，测到的是字面量而不是控制字符。
+        //  · 控制字符要放在**中间**。`piece.trim()` 会剥掉首尾的控制字符
+        //    （前导 ESC 会被削成 "31mred"），那是既有行为、且削出来的串
+        //    本身无害 —— 有害的是**嵌在标签内部**的那种。
+        let answer = format!("[\"a\0b\", \"red\u{1b}esc\", \"正常标签\"]");
+        assert_eq!(parse_tags(&answer), vec!["正常标签"]);
     }
 }

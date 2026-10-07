@@ -317,7 +317,9 @@ async fn export_zip(
         to_ms: q.to_ms,
         utc_offset_minutes: q.utc_offset_minutes.unwrap_or(0),
     };
-    let out = crate::export::build_zip(&state.store, &query).await?;
+    // 走 `gated_` 而不是裸 `build_zip`：并发闸门在这里，
+    // 免得"忘了限流"变成一次无声的回归。
+    let out = crate::export::gated_build_zip(&state.store, &query).await?;
 
     let file_name = crate::export::zip_file_name(&query);
     Ok((

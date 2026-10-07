@@ -317,13 +317,30 @@ pub fn accept_tag_suggestion(
     let conn = db.conn()?;
     let now = messagenote_core::hlc::now_ms();
 
+    // **先验证、后写标签。**
+    //
+    // 顺序反了的话，这条命令就等于"接受任意字符串当标签"：非建议来源的
+    // name（含界面上早就过期的 chip、或别的入口塞进来的值）会直接进
+    // `message_tag`，而 `accept_suggestion` 明明有一条"凭空来的必须失败"
+    // 的测试守着 —— 只是它的返回值原先被 `?;` 丢掉了，测试守的正是
+    // 被丢掉的那一半。
+    //
+    // 两步之间没有共享事务，但顺序已经够：先确认"这确实是这张消息的一条
+    // 未采纳建议"，失败就直接返回、不碰标签表。
+    if !crate::suggest::accept_suggestion(&conn, &message_id, &name, now)? {
+        return Err(AppError::Msg(format!(
+            "这条已经不是「{message_id}」的待采纳建议了，请重新生成一次。"
+        )));
+    }
+
+    // 已在标签里就别重写：`set_message_tags` 是**整体替换**，重写一次
+    // 等于把标签顺序和分组重新洗一遍。
     let existing = db::message_tags(&conn, &message_id)?;
     if !existing.contains(&name) {
-        let mut next = existing.clone();
-        next.push(name.clone());
+        let mut next = existing;
+        next.push(name);
         db::set_message_tags(&conn, &message_id, &next)?;
     }
-    crate::suggest::accept_suggestion(&conn, &message_id, &name, now)?;
     Ok(())
 }
 

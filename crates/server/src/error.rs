@@ -55,6 +55,15 @@ pub enum ServerError {
     #[error("{0}")]
     PayloadTooLarge(String),
 
+    /// 同一时刻的导出请求太多（网页端导出的并发闸门）。会回 429。
+    ///
+    /// 和 413 分开是因为**处置方式不同**：413 是"永远别再发这么大的"，
+    /// 429 是"**等一会儿再发**" —— 换个时间重试就能成功，所以文案要指向
+    /// "稍后重试"而不是"换个做法"。混在一起的话客户端会照着 413 的提示
+    /// 去缩小筛选范围，而问题其实只是"刚才有人在导"。
+    #[error("{0}")]
+    TooManyExports(String),
+
     #[error("{0}")]
     Msg(String),
 }
@@ -75,6 +84,10 @@ impl IntoResponse for ServerError {
             // 不是内部结构。藏起来的话用户只剩一个没头没尾的 413。
             ServerError::PayloadTooLarge(msg) => {
                 (StatusCode::PAYLOAD_TOO_LARGE, msg).into_response()
+            }
+            // 同上，可以回细节：用户需要知道"等一下"而不是"你的请求有问题"
+            ServerError::TooManyExports(msg) => {
+                (StatusCode::TOO_MANY_REQUESTS, msg).into_response()
             }
             other => {
                 tracing::error!(error = %other, "请求处理失败");
@@ -114,5 +127,15 @@ impl ServerError {
     /// 服务端不肯接（太大）。会回 413。
     pub fn payload_too_large(text: impl Into<String>) -> Self {
         ServerError::PayloadTooLarge(text.into())
+    }
+
+    /// 已经有导出在进行（并发闸门）。会回 429。
+    pub fn too_many_exports() -> Self {
+        ServerError::TooManyExports(
+            "现在已有一次导出在进行中，请等它完成再试。\
+             同时导出多个大库会占掉大量内存，服务端宁可让你稍后重试，\
+             也不想直接被挤爆。"
+                .into(),
+        )
     }
 }
