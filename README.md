@@ -506,7 +506,7 @@ $env:MESSAGENOTE_MIGRATE_TEST_DB = "…\副本.sqlite"
 cargo test -p messagenote -- --ignored --nocapture
 ```
 
-## 当前限制（v1.7.0）
+## 当前限制（v1.8.0）
 
 诚实地列出来，避免误判成熟度：
 
