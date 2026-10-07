@@ -64,13 +64,31 @@ export default function WebApp() {
     setNeedLogin(false);
   }, []);
 
-  const api = useMemo(() => {
+  /**
+   * 不带离线兜底的**原始** httpApi。
+   *
+   * 单独拆出来，是因为有两套语义在打架：
+   * - **交互发送**（下面那个 `api`）：失败就入队、返回假回执、不抛错 ——
+   *   让用户写的东西看起来安全了，输入框也能清空。
+   * - **重放**（`web/outbox.ts`）：失败就停、留在队列、抛错 ——
+   *   队列是按时间排的，坏一条就得整体停在这儿等下次。
+   *
+   * 曾经重放用的是**带兜底的那个**，于是两层撞在一起：网络抖一下、
+   * `fetch` 抛 TypeError，兜底层把它**重新入队**并返回假成功，重放层以为发成了
+   * 就 `drop(item.id)` —— 整队条目既没到服务端、又从队列里消失了。
+   * 重放必须直连 `base`。
+   */
+  const base = useMemo(() => {
     if (!stored) return null;
-    const base = httpApi({
+    return httpApi({
       baseUrl: stored.baseUrl,
       session: stored.session,
       onUnauthorized,
     });
+  }, [stored, onUnauthorized]);
+
+  const api = useMemo(() => {
+    if (!base) return null;
 
     return {
       ...base,
@@ -116,22 +134,26 @@ export default function WebApp() {
         }
       },
     };
-  }, [stored, onUnauthorized]);
+  }, [base]);
 
   /**
    * 重放离线队列。
    *
    * 挂载时也跑一次：用户很可能正是"断网时关掉页面、联网后才重新打开"，
    * 只监听 `online` 事件的话那一批会一直躺在里面。
+   *
+   * **直连 `base`，不走上面那个带兜底的 `api`** —— 兜底层会把失败的条目
+   * 重新入队并返回假成功，重放层就会把刚重新入队的条目删掉（丢数据）。
+   * 重放的"失败就停、留在队列"语义由 `replay` 自己的 catch 负责。
    */
   useEffect(() => {
-    if (!api) return;
+    if (!base) return;
     let alive = true;
 
     const run = async () => {
       const r = await replay(async (item) => {
         // 频道要还原成**入队时**的那个，不是重放时界面正开着的那个
-        await api.appendMessage(item.body, item.channelId ?? null, item.id);
+        await base.appendMessage(item.body, item.channelId ?? null, item.id);
       });
       if (alive) setQueued(r.remaining);
     };
@@ -143,7 +165,7 @@ export default function WebApp() {
       alive = false;
       window.removeEventListener("online", onOnline);
     };
-  }, [api]);
+  }, [base]);
 
   /**
    * 服务端推送的订阅。

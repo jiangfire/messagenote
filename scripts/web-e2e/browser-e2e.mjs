@@ -1080,6 +1080,84 @@ ok("只补发了一条（幂等键挡住了重复重放）", times === 1, `出�
 await waitFor(s, `!document.querySelector('.offline-pill')`, "提示消失", 10000);
 ok("队列清空之后提示消失", !(await evaluate(s, `!!document.querySelector('.offline-pill')`)));
 
+// ------------------------------------------------- 重放途中断网（不能丢数据）
+console.log("== 重放途中断网：队列必须原样留在那儿 ==");
+
+// 这条守的是一个**丢数据**的 bug，而且触发条件很窄：
+// 浏览器说自己在联网（navigator.onLine === true），但 fetch 抛 TypeError。
+// 瞬时网络抖动、代理掐连接、NAT 表项过期 —— 都是这个形态。
+//
+// 曾经重放复用了"交互发送"那层带兜底的包装：包装层把 TypeError 当成"离线"，
+// 于是**把同一条重新入队**并返回一张假回执；重放层以为发成了，就把这条
+// `drop()` 掉。一整队条目于是既没到服务端、又从队列里消失，界面还显示补发完成。
+//
+// 造这个场景不能用 `setOffline`（那样 navigator.onLine 会是 false，
+// 走的是另一条分支）。要拦的是**请求本身**：setBlockedURLs 让 /api/message
+// 打不通，而浏览器仍然认为自己在线。
+
+const flakeMarker = [`抖动一${Date.now()}`, `抖动二${Date.now()}`];
+
+await setOffline(true);
+// 等浏览器真的翻过来。CDP 的设置是异步生效的，抢跑的话
+// navigator.onLine 还是 true，笔记会被直接发出去而不是入队。
+await waitFor(s, `navigator.onLine === false`, "浏览器报告已离线", 10000);
+
+for (const m of flakeMarker) {
+  await fill(s, ".composer-input", m);
+  await pressEnter(s, ".composer-input");
+}
+// 两条都要在队列里，别只等到一条就开始下一步
+await waitFor(
+  s,
+  `!!document.querySelector('.offline-pill') &&
+     document.querySelector('.offline-pill').innerText.includes('${flakeMarker.length}')`,
+  `两条离线记录入队（${flakeMarker.length}）`,
+  15000
+);
+
+// 在线，但接口打不通
+await s.send("Network.setBlockedURLs", { urls: ["*/api/message*"] });
+await setOffline(false);
+
+// 恢复联网会触发 'online'，重放自动开跑。给它足够的时间把两条都试一遍。
+await sleep(4000);
+
+// **核心断言**：队列必须还是那两条。
+// 修复前这里会是 0 —— 包装层重新入队、重放层紧接着删掉，净效果是消失。
+ok(
+  "重放途中请求失败，两条记录仍然留在队列里（没有被假回执吞掉）",
+  (await evaluate(s, `document.querySelector('.offline-pill')?.innerText ?? ''`)).includes(
+    `${flakeMarker.length}`
+  ),
+  `队列提示：${JSON.stringify(
+    await evaluate(s, `document.querySelector('.offline-pill')?.innerText ?? '（没有提示）'`)
+  )}`
+);
+ok(
+  "它们也确实没到服务端（所以队列留着是对的，不是重复）",
+  !(await text()).includes(flakeMarker[0])
+);
+
+// 通了之后自己再试一次：这次要真的补发出去，且各出现**一次**
+await s.send("Network.setBlockedURLs", { urls: [] });
+await evaluate(s, `window.dispatchEvent(new Event('online')); true`);
+
+await waitFor(
+  s,
+  `${JSON.stringify(flakeMarker[0])} &&
+     document.body.innerText.includes(${JSON.stringify(flakeMarker[1])})`,
+  "恢复之后两条都补发出去",
+  15000
+);
+for (const m of flakeMarker) {
+  const n = await evaluate(
+    s,
+    `(document.body.innerText.match(new RegExp(${JSON.stringify(m)}, 'g')) || []).length`
+  );
+  ok(`「${m}」补发了一次且只有一次`, n === 1, `出现了 ${n} 次`);
+}
+await waitFor(s, `!document.querySelector('.offline-pill')`, "补完之后提示消失", 10000);
+
 // ---------------------------------------------------------------- 离线打开
 console.log("== 离线打开：断网也能把页面拉起来 ==");
 
