@@ -150,7 +150,40 @@ pub fn plan_query(query: &str) -> Option<QueryPlan> {
         .collect::<Vec<_>>()
         .join(" AND ");
 
-    Some(QueryPlan::Fts { match_expr, words })
+    // **精确过滤用的不是原始的 `words`，而是剥掉标点后的那些。**
+    //
+    // 索引侧 `to_index_text` 会丢掉所有非字母数字字符（FTS 的 bigram token
+    // 里也没有它们），所以搜「笔记。」时粗筛能命中正文含「笔记」的记录；
+    // 但末尾的 `matches_all` 要求正文包含**带标点的字面串**「笔记。」——
+    // 命中被整体剔掉，返回空。
+    //
+    // 中文输入法带出标点极其常见，而用户看到的是「搜不到」而不是报错。
+    // 这是**假阴性**：内容明明在库里，界面却说没有。
+    //
+    // 所以这里的判据要和索引那一侧对齐。同样一批词，LIKE 分支仍然用字面
+    // 语义不变（那条路径没有分词，用户的原话就是我们要的字面）。
+    //
+    // **纯标点的词要丢掉**：剥完变空串的话，`matches_all` 里的
+    // `lower.contains("")` 恒为真 —— 那一个词就等于"不过滤"，
+    // 整批候选都会被放行，假阳性全回来了。
+    let filter_words: Vec<String> = words
+        .iter()
+        .map(|w| strip_punct(w))
+        .filter(|w| !w.is_empty())
+        .collect();
+
+    Some(QueryPlan::Fts {
+        match_expr,
+        words: filter_words,
+    })
+}
+
+/// 去掉所有非字母数字字符。
+///
+/// 和 `to_index_text` 丢掉字符的那一步保持一致 —— 过滤必须和索引用同一套
+/// 字符集合，否则「索引里有、过滤时找不到」，也就是假阴性。
+pub fn strip_punct(s: &str) -> String {
+    s.chars().filter(|c| c.is_alphanumeric()).collect()
 }
 
 /// 精确过滤：要求 `words` 中每一个都作为**原始子串**出现在正文里。
@@ -230,5 +263,56 @@ mod tests {
     #[test]
     fn like_pattern_escapes_wildcards() {
         assert_eq!(like_pattern("50%_x"), "%50\\%\\_x%");
+    }
+/// **搜带标点的词不能返回空。**
+    ///
+    /// 这是**假阴性**：内容明明在库里，界面却说搜不到。中文输入法带出标点
+    /// 极其常见（「笔记。」「会议,」），而用户看到的不是报错，是"没有结果"。
+    ///
+    /// 机制：FTS 的 bigram token 在 `to_index_text` 里丢掉了标点，所以粗筛能
+    /// 命中正文含「笔记」的记录；但末尾的精确过滤要求正文包含**带标点的
+    /// 字面串**「笔记。」—— 命中被整体剔掉。
+    ///
+    /// 反向验证过：把 `filter_words` 改回原始 `words`（不剥标点），
+    /// 这两条立刻红。
+    #[test]
+    fn a_query_with_trailing_punctuation_still_matches() {
+        let QueryPlan::Fts { words, .. } = plan_query("笔记。").expect("非空查询") else {
+            panic!("双字以上应走 FTS");
+        };
+        assert_eq!(
+            words,
+            vec!["笔记".to_string()],
+            "过滤用的词必须和索引一样剥掉标点",
+        );
+        assert!(
+            matches_all("这是一条笔记。", &words),
+            "正文含「笔记」就该命中 —— 用户搜的是「笔记。」，不是那个句号"
+        );
+    }
+
+    /// 纯标点的词剥完是空串，而空串 `contains` 恒真 —— 那等于"不过滤"，
+    /// 假阳性会全回来。必须丢掉。
+    #[test]
+    fn a_punctuation_only_word_is_dropped_from_the_filter() {
+        let Some(QueryPlan::Fts { words, .. }) = plan_query("笔记 。") else {
+            panic!("双字以上应走 FTS");
+        };
+        assert_eq!(
+            words,
+            vec!["笔记".to_string()],
+            "空串必须被丢掉，否则整批候选都放行"
+        );
+    }
+
+    /// 剥标点之后**假阳性仍然被挡住** —— 「笔」「记」被逗号隔开时不该
+    /// 合成「笔记」。这是 `matches_all` 存在的全部理由，不能为了修
+    /// 假阴性顺手把它放松掉。
+    #[test]
+    fn stripping_punctuation_still_rejects_cross_boundary_matches() {
+        assert!(
+            !matches_all("拿起了笔，记下", &["笔记".to_string()]),
+            "跨标点合成的「笔记」仍必须被拒绝",
+        );
     }
 }

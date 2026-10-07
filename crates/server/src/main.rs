@@ -56,10 +56,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "MessageNote 同步服务端已启动（请确保前面有 TLS 反向代理）"
     );
 
+    // **必须同时听 SIGTERM。**
+    //
+    // 原来只监听 `ctrl_c()`（SIGINT），于是 `docker compose stop`、
+    // `docker stop`、Kubernetes 滚动更新、`systemctl stop` 发来的 SIGTERM
+    // **全部收不到** —— 容器被强杀，`with_graceful_shutdown` 形同虚设。
+    //
+    // 而优雅退出恰恰是这里最需要的：在途的 push 被截断在半路，客户端会看到
+    // 连接被掐而不是正常结束（表现为「这一轮同步失败了」），而 SQLite
+    // 侧可能正写着一批变更。
+    //
+    // 两个信号都接，任一先到就退出。注意 SIGTERM 在容器里**必须自己注册**：
+    // tokio 不会替你把 SIGTERM 转成 ctrl_c。
     axum::serve(listener, api::router(state))
         .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-            tracing::info!("收到中断信号，正在退出");
+            let ctrl_c = async {
+                let _ = tokio::signal::ctrl_c().await;
+            };
+
+            #[cfg(unix)]
+            let terminate = async {
+                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                {
+                    Ok(mut s) => {
+                        s.recv().await;
+                    }
+                    // 装不上监听器就当它不存在 —— 少了 SIGTERM 不能让程序起不来
+                    Err(e) => {
+                        tracing::warn!("无法监听 SIGTERM，只能靠 SIGINT 退出：{e}");
+                        std::future::pending::<()>().await;
+                    }
+                }
+            };
+
+            #[cfg(not(unix))]
+            let terminate = std::future::pending::<()>();
+
+            tokio::select! {
+                _ = ctrl_c => tracing::info!("收到 SIGINT，正在退出"),
+                _ = terminate => tracing::info!("收到 SIGTERM，正在退出"),
+            }
         })
         .await?;
 

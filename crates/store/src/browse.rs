@@ -286,7 +286,11 @@ pub fn search(
     limit: i64,
     offset: i64,
 ) -> rusqlite::Result<Vec<SearchHit>> {
-    let limit = limit.clamp(1, 200);
+    // 上限刻意比 `search_page` 对外的 200 多留一条余量：`search_page`
+    // 会调 `limit + 1` 来回答"还有没有更多"，而这里的 clamp 会把那个 201
+    // 压回 200 —— 于是 `has_more` 在 limit=200 时恒为 false，"加载更多"
+    // 永远不出现，而结果明明还有。
+    let limit = limit.clamp(1, 201);
     let offset = offset.max(0);
     let Some(plan) = search::plan_query(query) else {
         return Ok(Vec::new());
@@ -416,6 +420,11 @@ pub fn search_page(
     // **不会**替我们多取一条 —— 早先的版本想当然地以为它会，
     // 于是 `items.len() > limit` 恒为假，`has_more` 永远是 false：
     // 界面上的"加载更多"从来不出现，而结果明明还有。
+    //
+    // **而 `search` 内部还有一次 clamp(1, 200)** —— 它会把 limit=200 时
+    // 要来的 201 条重新压回 200，`has_more` 又恒为假。所以多要的那一条
+    // 必须在**两处 clamp 都算得开**的前提内：200 是对外的每页上限，
+    // 内部这一次请求不该再被同一个上限卡住。
     let mut items = search(conn, query, limit + 1, offset)?;
     let has_more = items.len() as i64 > limit;
     items.truncate(limit as usize);

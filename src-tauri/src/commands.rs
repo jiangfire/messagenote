@@ -179,7 +179,12 @@ pub fn get_startup_warnings() -> Vec<String> {
 ///
 /// 调用方拿到 sha 之后要把它以 `attachment:<sha>` 的形式写进正文 ——
 /// 正文就是笔记本身，附件靠这个引用被发现。见 `messagenote_core::attachment`。
-#[tauri::command]
+///
+/// **必须标 `async`**：Tauri v2 的同步命令在**主线程内联执行**，
+/// 而这一条要在 IPC 上反序列化一整个字节数组（25 MB 的图在 JSON 里膨胀约 4 倍）。
+/// 不标的话，粘贴一张大图期间托盘点击、全局快捷键、窗口事件、捕获浮层的 IPC
+/// 全部排队 —— 表现是"贴了张图之后界面卡住"。
+#[tauri::command(async)]
 pub fn save_attachment(db: State<'_, Db>, bytes: Vec<u8>) -> AppResult<String> {
     let conn = db.conn()?;
     db::save_attachment(&conn, &bytes)
@@ -190,28 +195,38 @@ pub fn save_attachment(db: State<'_, Db>, bytes: Vec<u8>) -> AppResult<String> {
 /// 返回 `tauri::ipc::Response` 而不是 `Vec<u8>`：前者走**原始字节**通道，
 /// 后者会被序列化成 JSON 数组 —— 一张 2 MB 的图会变成约 8 MB 的文本
 /// （每个字节最多要 4 个字符），在 IPC 上来回搬。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn read_attachment(db: State<'_, Db>, sha256: String) -> AppResult<tauri::ipc::Response> {
     let conn = db.conn()?;
     let (_mime, bytes) = db::read_attachment(&conn, &sha256)?;
     Ok(tauri::ipc::Response::new(bytes))
 }
 
-/// 附件字节在不在本地。界面据此决定是显示占位图还是直接渲染。
-#[tauri::command]
-pub fn has_attachment(db: State<'_, Db>, sha256: String) -> AppResult<bool> {
-    let conn = db.conn()?;
-    Ok(db::blob::has_blob(&conn, &sha256)?)
-}
-
 /// 回收不再被任何记录引用的附件字节，返回清掉的字节数。
 ///
 /// 刻意做成**显式动作**而不是自动的：它是 O(附件 × 记录) 的扫描，
 /// 而且判错的代价是永久删掉用户的图。见 `messagenote_store::blob`。
-#[tauri::command]
+///
+/// **必须标 `async`**：全表扫描没有上界，图和记录多了就是几秒。
+#[tauri::command(async)]
 pub fn collect_garbage_attachments(db: State<'_, Db>) -> AppResult<i64> {
     let conn = db.conn()?;
     Ok(db::blob::gc_unreferenced(&conn)?)
+}
+
+/// 把所有本地附件的「已上传」标记清掉，返回被清掉的条数。
+///
+/// **灾难恢复之后的修复入口**，什么时候用：服务端从一个较早的备份恢复过，
+/// 于是它手上的附件比客户端以为的少 —— 而客户端因为每张图都标着
+/// 「传过了」，再也不会重传，表现是**别的设备上那些图永远打不开**。
+/// 清完标记点一次「立即同步」就能补齐。
+///
+/// 为什么不做成自动的：那需要每轮同步都向服务端核对全部 sha，
+/// 对一个只在灾难恢复后才用得上的场景来说代价不对。见 `db::reset_upload_flags`。
+#[tauri::command(async)]
+pub fn reset_upload_flags(db: State<'_, Db>) -> AppResult<usize> {
+    let conn = db.conn()?;
+    db::reset_upload_flags(&conn)
 }
 
 /// 把整个库导出成一棵 Markdown 目录树。
@@ -226,7 +241,10 @@ pub fn collect_garbage_attachments(db: State<'_, Db>) -> AppResult<i64> {
 ///
 /// `filter` 省略（或 `null`）= 全量导出。给了就只导命中的那部分：频道 / 标签 /
 /// 时间区间，三者可任意组合。**区间是闭区间**，理由见 `crate::export`。
-#[tauri::command]
+/// **必须标 `async`**：导出是**不设上界的文件 I/O** —— 一份图多的库要写几十
+/// 上百 MB。同步命令跑在主线程上（见 `save_attachment` 那段说明），所以导出的
+/// 整个过程里托盘、全局快捷键、捕获浮层的 IPC 全在排队。
+#[tauri::command(async)]
 pub fn export_markdown(
     db: State<'_, Db>,
     dir: String,
@@ -305,9 +323,15 @@ pub fn get_sync_status(worker: State<'_, SyncWorker>) -> Option<SyncStatus> {
 
 /// 测试连接。只发一个很小的探活请求，不落任何数据。
 ///
-/// 这个是同步命令（会阻塞），但它是用户明确点的动作、只发一个请求、
-/// 而且不持有数据库锁，所以不会连累其它操作。
-#[tauri::command]
+/// **必须标 `async`**：这条会**阻塞最长 30 秒**（`http.rs` 的整体超时）。
+/// 它确实是用户明确点的动作、只发一个请求、不持有数据库锁 —— 但那句
+/// 「不会连累其它操作」原来只对**数据库锁**成立，对**主线程**不成立：
+/// 服务端不可达时，整个应用在这 30 秒里零响应，托盘、全局快捷键、
+/// 窗口事件、捕获浮层的 IPC 全部排队。
+///
+/// 这恰恰是最容易踩中的一类：地址填错、服务器关机 —— 用户点一下「测试连接」
+/// 然后界面就死了，只能等。
+#[tauri::command(async)]
 pub fn test_sync_connection(url: String, token: String) -> AppResult<HealthResponse> {
     crate::http::HttpServerApi::new(&url, &token)?.handshake()
 }

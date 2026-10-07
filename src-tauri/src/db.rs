@@ -252,21 +252,47 @@ fn migrate(conn: &Connection) -> AppResult<()> {
     // 注意 `PRAGMA foreign_keys` 在事务内是空操作，必须在 BEGIN 之前执行。
     conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
 
-    if current < 1 {
-        conn.execute_batch(SCHEMA_V1)?;
-    }
-    if current < 2 {
-        conn.execute_batch(SCHEMA_V2)?;
-    }
-    if current < 3 {
-        conn.execute_batch(SCHEMA_V3)?;
+    // **整个迁移必须在一个事务里。**
+    //
+    // `execute_batch` 逐语句自动提交，原来那样裸跑的后果是：中途断电 /
+    // 磁盘满 → 前面几条语句已经落库、`user_version` 却没推进 → 下次启动重跑，
+    // 撞上 "duplicate column name"（V2 的 `ALTER TABLE ADD COLUMN` 不是幂等的）
+    // → `open()` 失败 → `fatal::report` 循环退出，用户侧无解。
+    //
+    // V1/V3 是 `CREATE ... IF NOT EXISTS`（幂等）掩盖了这个问题，但 V2 里的
+    // `ALTER TABLE ADD COLUMN`、`CREATE TABLE tag_v2`、`DROP TABLE` 都不是。
+    //
+    // DDL 在 SQLite 里是可事务的，所以整个 V1→V3 + `user_version` 一次提交：
+    // 要么全做完，要么全没做，下次启动老老实实从头来。
+    conn.execute_batch("BEGIN;")?;
+    let r = (|| -> AppResult<()> {
+        if current < 1 {
+            conn.execute_batch(SCHEMA_V1)?;
+        }
+        if current < 2 {
+            conn.execute_batch(SCHEMA_V2)?;
+        }
+        if current < 3 {
+            conn.execute_batch(SCHEMA_V3)?;
+        }
+        // user_version 不支持参数绑定，只能拼字符串；拼的是编译期常量，无注入风险。
+        conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
+        Ok(())
+    })();
+
+    match r {
+        Ok(()) => {
+            conn.execute_batch("COMMIT;")?;
+        }
+        Err(e) => {
+            // 回滚掉这一轮，**并且要把失败原样带出去**：一个半迁移的库比
+            // 一个明确打不开的库更坏 —— 前者会静默带着残缺的结构继续跑。
+            let _ = conn.execute_batch("ROLLBACK;");
+            return Err(e);
+        }
     }
 
-    // user_version 不支持参数绑定，只能拼字符串；拼的是编译期常量，无注入风险。
-    conn.execute_batch(&format!(
-        "PRAGMA user_version = {SCHEMA_VERSION};
-         PRAGMA foreign_keys = ON;"
-    ))?;
+    conn.execute_batch("PRAGMA foreign_keys = ON;")?;
     Ok(())
 }
 
@@ -372,6 +398,21 @@ pub fn create_channel(conn: &Connection, name: &str) -> AppResult<Channel> {
 
 pub fn rename_channel(conn: &Connection, id: &str, name: &str) -> AppResult<()> {
     let name = normalize::channel_name(name).map_err(AppError::msg)?;
+
+    // **改名也要查重名**，和创建一样（服务端 `Store::rename_channel` 同）。
+    // 原来只有 create 查、rename 不查，于是侧边栏能出现两个一模一样的名字，
+    // 用户分不出哪条记录在哪个里面。这个校验不对称没有任何理由。
+    let clash: Option<String> = conn
+        .query_row(
+            "SELECT id FROM channel WHERE name = ?1 AND deleted_at IS NULL AND id <> ?2",
+            params![name, id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if clash.is_some() {
+        return Err(AppError::msg(format!("频道「{name}」已存在")));
+    }
+
     let tx = conn.unchecked_transaction()?;
     let hlc = clock_next(&tx)?;
     let n = tx.execute(
@@ -752,10 +793,12 @@ pub fn read_attachment(conn: &Connection, sha256: &str) -> AppResult<(String, Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::SystemTime;
 
     // 主代码里不再直接构造 Hlc（推进逻辑已经搬进共享层），只有测试需要
     use messagenote_core::hlc::Hlc;
     use messagenote_core::models::SearchHit;
+    use rusqlite::OptionalExtension;
 
     /// 测试只关心"搜到几条、是哪几条"，不关心分页 —— 统一取第一页。
     ///
@@ -784,6 +827,189 @@ mod tests {
     }
 
     #[test]
+/// **迁移中途失败必须整个回滚，不能留下半迁移的库。**
+    ///
+    /// 这是"应用变砖"那条路径的根因。原来 `execute_batch` 逐语句自动提交：
+    /// V1/V3 是 `CREATE ... IF NOT EXISTS`（幂等）所以看不出问题，但 **V2 里的
+    /// `ALTER TABLE ADD COLUMN`、`CREATE TABLE tag_v2`、`DROP TABLE` 都不是**。
+    /// 中途断电或磁盘满 →
+    ///
+    ///   前几条语句已落库，`user_version` 没推进
+    ///     → 下次启动重跑 V2 → "duplicate column name"
+    ///     → `open()` 失败 → `fatal::report` 循环退出，用户侧无解
+    ///
+    /// 修法是把 V1→V3 + `user_version` 包进单个事务（`PRAGMA foreign_keys`
+    /// 留在事务外 —— 它在事务内本来就是空操作）。
+    ///
+    /// 这里用**真实文件库**而不是内存库：只有落盘的中途失败才是真的
+    /// （断电就是文件库上的事）。先造一个 user_version=1 的库（V1 已应用），
+    /// 接着让 V2 失败，看 V1 的成果有没有被回滚掉。
+    #[test]
+    fn a_failed_migration_rolls_back_completely() {
+        let dir = std::env::temp_dir().join(format!(
+            "messagenote-migrate-{}-{}",
+            std::process::id(),
+            // 并发跑测试时目录要唯一
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("db.sqlite");
+
+        // ---- 先造一个只跑到 V1 的库 ----
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(SCHEMA_V1).unwrap();
+            conn.execute_batch(&format!("PRAGMA user_version = 1;")).unwrap();
+        }
+
+        // ---- 让 V2 必然失败：在 message 表上先占一个同名列 ----
+        // （V2 就是给 message 加列，所以预先加上它，那句 ADD COLUMN 会撞名）
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("ALTER TABLE message ADD COLUMN hlc_wall INTEGER NOT NULL DEFAULT 0;")
+                .unwrap();
+        }
+
+        let conn = Connection::open(&path).unwrap();
+        let before: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(before, 1, "前置条件：库的版本还停在 1");
+
+        let err = migrate(&conn).expect_err("V2 撞名，迁移必须失败");
+        assert!(
+            err.to_string().to_lowercase().contains("duplicate"),
+            "失败原因应当是那句 ADD COLUMN 撞名，实际：{err}"
+        );
+
+        // **核心断言**：失败之后一切都没变 ——
+        //  user_version 还是 1（没被推进）
+        //  V1 建出来的表还在（没被卷走）
+        //  V2 的新结构不存在（没留下半截）
+        let after: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            after, 1,
+            "失败之后 user_version 不能被推进 —— 否则下次启动会以为迁移做完了"
+        );
+
+        let has_message: Option<String> = conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='message'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap();
+        assert!(
+            has_message.is_some(),
+            "V1 建出来的 message 表不该被回滚掉：回滚要回到**迁移之前**的状态，不是回滚成空库"
+        );
+
+        // 没有残留的 V2 中间产物（tag_v2）
+        let tag_v2: Option<String> = conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='tag_v2'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap();
+        assert!(
+            tag_v2.is_none(),
+            "失败之后不该留下 V2 的半成品表 tag_v2 —— 它会让下次重跑撞上不同的错"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 迁移成功时版本号照常推进，而且是真的落库了（不是只在内存里）。
+    #[test]
+    fn a_successful_migration_advances_the_version() {
+        let dir = std::env::temp_dir().join(format!(
+            "messagenote-migrate-ok-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("db.sqlite");
+
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(SCHEMA_V1).unwrap();
+            conn.execute_batch(&format!("PRAGMA user_version = 1;")).unwrap();
+        }
+
+        {
+            let conn = Connection::open(&path).unwrap();
+            migrate(&conn).expect("V1→V3 应当成功");
+        }
+
+        // **重新打开**（换一个连接）看落盘结果 —— 事务提交与否要看新连接
+        let conn = Connection::open(&path).unwrap();
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION, "迁移成功后版本号必须推进到最新");
+
+        // 而且 V2 的新结构真的在
+        let cols = conn
+            .prepare("PRAGMA table_info(message)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<String>, _>>()
+            .unwrap();
+        assert!(
+            cols.contains(&"hlc_wall".to_string()),
+            "迁移后的表结构要完整可用（V2 给 message 补的列必须在），实际：{cols:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+/// **`limit` 顶到上限时 `has_more` 仍然是���。**
+    ///
+    /// 潜伏 bug：`search_page` 调 `search(limit + 1)` 来多要一条，而
+    /// `search` 内部有一道 `clamp(1, 200)` —— 当 `limit` 正好是 200 时，
+    /// 要来的 201 被压回 200，`items.len() > limit` 恒为假。
+    ///
+    /// 表现是「结果正好超过 200 条时，加载更多按钮不出现」，而内容明明
+    /// 还在库里。当前 UI 用 60，所以这是个**潜伏**问题 —— 等有人把每页
+    /// 调到 200 它才会发作，而那时没人会想到去查检索层。
+    ///
+    /// 断言必须真的造出 **limit 条以上** 的命中，否则 `has_more` 为 false
+    /// 是正确的，这条测试就成了空跑。
+    #[test]
+    fn has_more_is_still_true_when_the_page_size_is_at_its_limit() {
+        let db = mem();
+        {
+            let conn = db.conn().unwrap();
+            for i in 0..205 {
+                append_message(&conn, &format!("第 {i} 条记录"), None).unwrap();
+            }
+        }
+
+        let conn = db.conn().unwrap();
+        let page = search_page(&conn, "记录", 200, 0).expect("检索");
+        assert_eq!(page.items.len(), 200, "一页应当正好给满 200 条");
+        assert!(
+            page.has_more,
+            "库里还有 5 条没给出来，has_more 必须是 true —— \
+             而它曾经因为内部那个 clamp(1, 200) 恒为 false"
+        );
+
+        // 再翻一页还能拿到剩下的那几条
+        let next = search_page(&conn, "记录", 200, 200).expect("翻页");
+        assert_eq!(next.items.len(), 5, "第二页应当正好是剩下的 5 条");
+        assert!(!next.has_more, "这一次是真的没有了");
+    }
+    }
     fn fresh_database_lands_on_the_latest_schema_version() {
         let db = mem();
         let conn = db.conn().unwrap();

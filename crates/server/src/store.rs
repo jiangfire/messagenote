@@ -232,6 +232,22 @@ impl Store {
         )?;
 
         let current: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+
+        // **库比这个二进制新时必须拒绝启动。**
+        //
+        // 不检查的后果是"带病运行"：新版本加的列在这儿不存在，于是**每一个**
+        // 请求都 500，而用户看到的只是一串"服务端内部错误"。他既不会想到是
+        // 版本不匹配，也无从知道该升级哪个 —— 因为错误信息里一个字都没提。
+        //
+        // 明确拒绝的话，错误信息能直接告诉他该做什么。
+        if current > SCHEMA_VERSION {
+            return Err(ServerError::Msg(format!(
+                "这个数据库的版本（{current}）比这个服务端（{SCHEMA_VERSION}）新。\
+                 请把服务端升级到最新版本再启动 —— 否则每个请求都会失败，\
+                 而日志里只有一堆看不懂的 SQL 错误。"
+            )));
+        }
+
         if current < SCHEMA_VERSION {
             conn.execute_batch(SCHEMA)?;
             // v2 加了检索索引。已经有数据的服务端升级上来时，建了表却是空的 ——
@@ -590,7 +606,11 @@ impl Store {
                 .map(|w| w.hlc.wall)
                 .unwrap_or(0);
             tx.commit()?;
-            return Err(ServerError::Msg(format!(
+            // **409 而不是 500。** 请求本身没有错，错的是**当前状态** ——
+            // 另一台设备刚改过同一条。客户端对这两者的处置正好相反：
+            // 409 是"重新读一次再决定怎么办"，500 是"服务端坏了，等会儿重试"。
+            // 回 500 会让用户以为笔记系统出故障了，而实际只需要刷新一下。
+            return Err(ServerError::conflict(format!(
                 "这次修改被另一台设备上更新的版本覆盖了（对方时间戳 {wall}），请刷新后重试"
             )));
         }
@@ -935,6 +955,28 @@ impl Store {
 
     pub fn rename_channel(&self, id: &str, name: &str) -> ServerResult<()> {
         let name = normalize::channel_name(name).map_err(ServerError::bad_request)?;
+
+        // **改名也要查重名**，和创建一样。
+        //
+        // 原来只有 create 查、rename 不查 —— 于是「工作」能改名成「项目」，
+        // 而「项目」本来就存在：侧边栏出现两个一模一样的名字，用户完全
+        // 分不出哪条记录在哪个里面。这个校验不对称没有任何理由，
+        // 而补上它的代价只有几行。
+        {
+            let conn = self.conn()?;
+            let clash: Option<String> = conn
+                .query_row(
+                    "SELECT id FROM channel
+                      WHERE name = ?1 AND deleted_at IS NULL AND id <> ?2",
+                    params![name, id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if clash.is_some() {
+                return Err(ServerError::bad_request(format!("频道「{name}」已存在")));
+            }
+        }
+
         let mut p = self.channel_payload(id)?;
         p.name = name;
         p.updated_at = now_ms();
@@ -996,15 +1038,32 @@ impl Store {
         })
     }
 
-    /// 这个会话现在有效吗。
+    /// 这个会话现在有效吗；如果刚刚续过期，返回**续期之后**的过期时刻。
+    ///
+    /// 返回 `None` = 无效（不存在 / 已过期 / 空串）。
+    ///
+    /// **为什么要把新的过期时刻带出去**：服务端原本只写库、不回传，而客户端
+    /// 把它存在 localStorage 里当唯一的过期判据。于是滑动续期这件事
+    /// **对客户端完全不可见** —— localStorage 里的值停在登录那一刻，
+    /// 每次重新打开页面都拿那个旧值判一次。
+    ///
+    /// 结果就是：服务端注释写的目标（"一个每天都在用的人不该在第 7 天被踢回
+    /// 登录页"）**压根没实现**，而且客户端预检让这件事照样发生。
+    /// 活跃用户每 7 天被踢一次，很可能正是在他写到一半的时候。
+    ///
+    /// 所以续期之后必须让客户端知道。调用方（鉴权中间件）把它放进
+    /// `X-Session-Expires` 响应头，网页端更新 localStorage。
+    ///
+    /// 没续期时返回的就是库里那个值（客户端拿到自己已经知道的时间，
+    /// 不会造成多余的存储写入）。桌面端不用会话，所以完全不受影响。
     ///
     /// 注意这里的比较**不是常量时间的**（SQLite 的主键查找会在第一个不同的
     /// 字节处短路）。之所以可以接受：令牌是 122 位随机值，要通过 HTTP 观测到
     /// 亚微秒级的差异来逐字节还原它，不现实。长期令牌那条路径仍然走
     /// `constant_time_eq`，因为那个是人选的、熵低得多。
-    pub fn session_is_valid(&self, token: &str) -> ServerResult<bool> {
+    pub fn session_is_valid(&self, token: &str) -> ServerResult<Option<i64>> {
         if token.is_empty() {
-            return Ok(false);
+            return Ok(None);
         }
         let conn = self.conn()?;
         let now = now_ms();
@@ -1018,7 +1077,7 @@ impl Store {
             .optional()?;
 
         let Some(expires_at) = expires_at else {
-            return Ok(false);
+            return Ok(None);
         };
 
         // **滑动续期**：剩余寿命不足一半时把它推满。
@@ -1028,19 +1087,38 @@ impl Store {
         // 不是"用了很久的"。
         //
         // 只续到一半以下才写库：每个请求都 UPDATE 一次是纯粹的浪费。
+        let mut current = expires_at;
         if expires_at - now < SESSION_TTL_MS / 2 {
+            current = now + SESSION_TTL_MS;
             conn.execute(
                 "UPDATE session SET expires_at = ?2 WHERE token = ?1",
-                params![token, now + SESSION_TTL_MS],
+                params![token, current],
             )?;
         }
-        Ok(true)
+        Ok(Some(current))
     }
 
     /// 吊销一个会话。这是引入会话机制的主要收益 —— 签名令牌做不到这件事。
     pub fn drop_session(&self, token: &str) -> ServerResult<()> {
         let conn = self.conn()?;
         conn.execute("DELETE FROM session WHERE token = ?1", params![token])?;
+        Ok(())
+    }
+
+    /// 把某个会话的到期时刻改成指定值（epoch 毫秒）。
+    ///
+    /// **只为测试存在**，因为滑动续期的触发条件是「剩余寿命不足一半」，
+    /// 而寿命随时间下降 —— 让测试等几小时是不现实的。生产代码没有任何地方
+    /// 调它，界面上也永远不会出现「把你的会话改到什么时候过期」。
+    ///
+    /// 它同时是那条测试的**唯一**做法：把到期时间改成「已经快到了」，
+    /// 下一次请求就必须触发续期，而客户端必须在响应里看到新的时刻。
+    pub fn set_session_expiry(&self, token: &str, expires_at: i64) -> ServerResult<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            "UPDATE session SET expires_at = ?2 WHERE token = ?1",
+            params![token, expires_at],
+        )?;
         Ok(())
     }
 }
@@ -1558,6 +1636,18 @@ fn validate_client_id(id: &str) -> ServerResult<String> {
     Ok(id.to_string())
 }
 
+/// **常量实体不许被 push 覆盖。**
+///
+/// 收件箱（`inbox`）是服务端 seed 出来的固定行：所有没归档的记录都指向它。
+/// 不校验的话，一条 `id="inbox"` 的频道变更就能把它改名、改 kind、甚至删掉 ——
+/// 而**所有设备**都会拉到那条变更。
+///
+/// 这在已认证前提下是个纵深防御缺口：客户端（包括网页端）本来不该发这种变更，
+/// 但服务端不该把库的完整性交给"对端守规矩"这一件事。拦下来回 400。
+fn is_constant_channel_id(id: &str) -> bool {
+    id == "inbox"
+}
+
 /// 把一条已接受的变更落库，并打上新的 seq。
 ///
 /// 时间字段一律取自变更本身（含墓碑的 `deleted_at`，用 payload 的
@@ -1569,6 +1659,21 @@ fn upsert(conn: &Connection, c: &Change, seq: i64) -> ServerResult<()> {
     match c.kind {
         EntityKind::Channel => {
             let p: ChannelPayload = decode(c)?;
+            // **常量实体不许被 push 覆盖。**
+            //
+            // 收件箱（`inbox`）是服务端 seed 出来的固定行：所有没归档的记录
+            // 都指向它。不校验的话，一条 `id="inbox"` 的频道变更就能把它改名、
+            // 改 kind、甚至删掉 —— 而**所有设备**都会拉到那条变更。
+            //
+            // 这在已认证前提下是个纵深防御缺口：客户端（包括网页端）本来不该
+            // 发这种变更，但服务端不该把库的完整性交给"对端守规矩"这一件事。
+            // 拦下来回 400，让对端知道哪儿错了。
+            if is_constant_channel_id(&c.id) {
+                return Err(ServerError::bad_request(format!(
+                    "「{}」是内置频道，不能通过同步被修改",
+                    c.id
+                )));
+            }
             conn.execute(
                 "INSERT INTO channel
                    (id, name, kind, sort_order, created_at, updated_at, device_id,
@@ -1689,12 +1794,26 @@ fn upsert(conn: &Connection, c: &Change, seq: i64) -> ServerResult<()> {
 }
 
 fn decode<T: serde::de::DeserializeOwned>(c: &Change) -> ServerResult<T> {
-    let data = c
-        .data
-        .clone()
-        .ok_or_else(|| ServerError::Msg(format!("变更缺少 data：{} {}", c.kind.as_str(), c.id)))?;
+    let data = c.data.clone().ok_or_else(|| {
+        // **400 而不是 500**：这是"对方发来的东西不对"，不是服务端炸了。
+        // 走 `Msg` 会回 500，而客户端看到 500 会重试同一批 ——
+        // 一批永远推不上去的变更于是被无限重试，而原因藏在服务端日志里。
+        //
+        // 注意墓碑（`deleted: true`）的 data **可以是 null**：协议里明说了
+        // 删掉的行不必带内容（见 `wire::Change`）。所以只有**非墓碑**
+        // 缺 data 才是对方发错了。
+        if c.deleted {
+            ServerError::bad_request(format!(
+                "墓碑变更不该带 data：{} {}",
+                c.kind.as_str(),
+                c.id
+            ))
+        } else {
+            ServerError::bad_request(format!("变更缺少 data：{} {}", c.kind.as_str(), c.id))
+        }
+    })?;
     serde_json::from_value(data)
-        .map_err(|e| ServerError::Msg(format!("变更 data 解析失败（{}）：{e}", c.id)))
+        .map_err(|e| ServerError::bad_request(format!("变更 data 解析失败（{}）：{e}", c.id)))
 }
 
 #[cfg(test)]
@@ -2367,12 +2486,12 @@ mod tests {
     fn a_session_can_be_revoked() {
         let s = store();
         let sess = s.create_session().unwrap();
-        assert!(s.session_is_valid(&sess.session).unwrap());
+        assert!(s.session_is_valid(&sess.session).unwrap().is_some());
         assert!(sess.expires_at > now_ms(), "过期时间必须在将来");
 
         s.drop_session(&sess.session).unwrap();
         assert!(
-            !s.session_is_valid(&sess.session).unwrap(),
+            s.session_is_valid(&sess.session).unwrap().is_none(),
             "吊销之后必须**立刻**失效 —— 这正是会话相对签名令牌的收益，\
              也决定了我们不能用无状态签名令牌"
         );
@@ -2382,7 +2501,7 @@ mod tests {
     fn an_expired_session_is_rejected() {
         let s = store();
         let sess = s.create_session().unwrap();
-        assert!(s.session_is_valid(&sess.session).unwrap());
+        assert!(s.session_is_valid(&sess.session).unwrap().is_some());
 
         {
             let conn = s.conn().unwrap();
@@ -2393,7 +2512,7 @@ mod tests {
             .unwrap();
         }
         assert!(
-            !s.session_is_valid(&sess.session).unwrap(),
+            s.session_is_valid(&sess.session).unwrap().is_none(),
             "过期会话必须失效"
         );
 
@@ -2448,7 +2567,7 @@ mod tests {
         }
 
         assert!(
-            s.session_is_valid(&sess.session).unwrap(),
+            s.session_is_valid(&sess.session).unwrap().is_some(),
             "还没过期，应当有效"
         );
 
@@ -2469,7 +2588,7 @@ mod tests {
 
         // 刚续过期的不该被反复写库
         let before_second = after;
-        assert!(s.session_is_valid(&sess.session).unwrap());
+        assert!(s.session_is_valid(&sess.session).unwrap().is_some());
         let after_second: i64 = s
             .conn()
             .unwrap()

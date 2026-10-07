@@ -89,6 +89,26 @@ const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 /// 而且报的是"请求体过大"这种和附件八竿子打不着的错。
 const MAX_BLOB_BODY: usize = messagenote_core::attachment::MAX_ATTACHMENT_BYTES;
 
+/// JSON 请求体的上限。
+///
+/// **axum 的默认是 2 MB，而这个默认值在这里是有害的**，两个后果：
+///
+/// - `/api/sync/push` 一次推一整批变更（桌面端 `BATCH` = 400 条）。一批变更的
+///   JSON 总量越过 2 MB 就 413，而桌面端会**原批重试** —— 于是这台设备的同步
+///   永久循环在"推 → 413 → 再推"里，再也出不去。服务端 `MAX_BATCH = 1000`
+///   在这个限制下也永远达不到。
+/// - `/api/message` 一条超大正文直接 413，报的还是"请求体过大"这种和
+///   "内容太长了"八竿子打不着的错。
+///
+/// 上限取正文上限 [`normalize::MAX_BODY_CHARS`] 的两倍再留些余量：正文按
+/// 字符算（64K 汉字 = 192 KB），加上 JSON 转义、字段名和一批变更的元数据，
+/// 留出足够的空间又不至于让请求体无上限地涨。
+/// 上限按「一批变更里装得下现实中的笔记」来定：`BATCH` 是 400 条，
+/// 一条正文上限 64K 字符。全按上限算会是 76 MB，那属于病态情况；
+/// 现实里一条笔记几百到几千字，400 条也就几 MB。取 32 MB 给足余量，
+/// 同时不至于让请求体无上限地涨。
+const MAX_JSON_BODY: usize = 32 * 1024 * 1024;
+
 pub struct AppState {
     pub store: Store,
     /// 单用户场景下就是一个长期凭据。多用户才需要账号体系。
@@ -99,20 +119,36 @@ pub fn router(state: Arc<AppState>) -> Router {
     let protected = Router::new()
         .route("/api/sync/handshake", get(handshake))
         .route("/api/sync/pull", get(pull))
-        .route("/api/sync/push", post(push))
+        // push 一批 JSON，必须放开请求体上限 —— 见 MAX_JSON_BODY。
+        .route(
+            "/api/sync/push",
+            post(push).layer(DefaultBodyLimit::max(MAX_JSON_BODY)),
+        )
         .route("/api/timeline", get(timeline))
         .route("/api/timeline/stats", get(timeline_stats))
         .route("/api/channels", get(channels))
         .route("/api/tags", get(tags))
         .route("/api/search", get(search))
         // 写入。全部由服务端代笔 —— 见文件头的说明。
-        .route("/api/message", post(create_message))
+        // 写端点也要放开请求体上限：一条长笔记不该撞上 axum 那个 2 MB 的默认值。
+        .route(
+            "/api/message",
+            post(create_message).layer(DefaultBodyLimit::max(MAX_JSON_BODY)),
+        )
         .route(
             "/api/message/{id}",
-            patch(edit_message).delete(remove_message),
+            patch(edit_message)
+                .delete(remove_message)
+                .layer(DefaultBodyLimit::max(MAX_JSON_BODY)),
         )
-        .route("/api/message/{id}/move", post(move_message))
-        .route("/api/message/{id}/tags", put(set_message_tags))
+        .route(
+            "/api/message/{id}/move",
+            post(move_message).layer(DefaultBodyLimit::max(MAX_JSON_BODY)),
+        )
+        .route(
+            "/api/message/{id}/tags",
+            put(set_message_tags).layer(DefaultBodyLimit::max(MAX_JSON_BODY)),
+        )
         .route("/api/channel", post(create_channel))
         .route(
             "/api/channel/{id}",
@@ -167,6 +203,13 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+/// 会话续期之后把这个头带回给客户端。
+///
+/// 网页端把它写进 localStorage —— 见 `store::session_is_valid` 的说明：
+/// 服务端在滑动续期，但客户端只看自己存的那个值，于是**活跃用户每 7 天
+/// 仍��被踢回登录页**，而且很可能正在写到一半。
+const HEADER_SESSION_EXPIRES: &str = "X-Session-Expires";
+
 /// 鉴权：**长期令牌**（桌面端的同步客户端）或**短期会话**（网页端）都放行。
 ///
 /// 两条路并存是刻意的：桌面端本来就把令牌存在自己机器的数据库里，让它改走
@@ -178,17 +221,25 @@ async fn require_token(
 ) -> Result<Response, StatusCode> {
     let presented = bearer(req.headers());
 
-    // `||` 短路：长期令牌命中时不会白查一次数据库
-    let ok = constant_time_eq(presented.as_bytes(), state.token.as_bytes())
-        || state.store.session_is_valid(presented).unwrap_or(false);
+    // 长期令牌优先：它不需要查库（桌面端每轮同步都要打这几个端点），
+    // 也不该收到续期头 —— 它没有过期时间，桌面端自己管。
+    if constant_time_eq(presented.as_bytes(), state.token.as_bytes()) {
+        return Ok(next.run(req).await);
+    }
 
-    if ok {
-        Ok(next.run(req).await)
-    } else {
+    // 会话这条路拿到的是**续期之后**的过期时刻（None = 无效）。
+    let Some(expires) = state.store.session_is_valid(presented).unwrap_or(None) else {
         // 记日志但**不回显任何细节**：不告诉对方凭据是对是错、格式对不对。
         tracing::warn!("鉴权失败，已拒绝请求");
-        Err(StatusCode::UNAUTHORIZED)
+        return Err(StatusCode::UNAUTHORIZED);
+    };
+
+    let mut res = next.run(req).await;
+    // 客户端拿它更新本地那份过期时间 —— 不带的话，滑动续期对它不可见。
+    if let Ok(v) = expires.to_string().parse() {
+        res.headers_mut().insert(HEADER_SESSION_EXPIRES, v);
     }
+    Ok(res)
 }
 
 // ---------------------------------------------------------------- 会话
@@ -263,17 +314,25 @@ fn scope_of(q: &TimelineQuery) -> ServerResult<Scope<'_>> {
         .map_err(|e| ServerError::BadRequest(e.to_string()))
 }
 
-/// `beforeCreatedAt` 和 `beforeId` **必须一起给**。
+/// `beforeCreatedAt` 和 `beforeId` **必须一起给**，只给一个要回 400。
 ///
 /// 只给时间戳等于退回单键游标：同一毫秒内写入的多条会被整批跳过，
-/// 往前翻时凭空少掉一段，而且不报错。
-fn cursor_of(q: &TimelineQuery) -> Option<Cursor> {
+/// 往前翻时凭空少掉一段，而且**不报错** —— 用户只会觉得"有些记录不见了"，
+/// 而这个项目最不能接受的就是笔记无声无息地消失。
+///
+/// 原来这里静默当"没有游标"（回到第一页）：更隐蔽，因为用户看到的是
+/// 「点加载更多，结果又回到了开头」，而没有任何一处提示参数写错了。
+fn cursor_of(q: &TimelineQuery) -> ServerResult<Option<Cursor>> {
     match (&q.before_created_at, &q.before_id) {
-        (Some(created_at), Some(id)) => Some(Cursor {
+        (Some(created_at), Some(id)) => Ok(Some(Cursor {
             created_at: *created_at,
             id: id.clone(),
-        }),
-        _ => None,
+        })),
+        (None, None) => Ok(None),
+        _ => Err(ServerError::BadRequest(
+            "beforeCreatedAt 和 beforeId 必须成对给出：只给一个会让往前翻漏掉记录"
+                .into(),
+        )),
     }
 }
 
@@ -282,7 +341,7 @@ async fn timeline(
     Query(q): Query<TimelineQuery>,
 ) -> ServerResult<Json<MessagePage>> {
     let scope = scope_of(&q)?;
-    let cursor = cursor_of(&q);
+    let cursor = cursor_of(&q)?;
     Ok(Json(state.store.list_messages(
         scope,
         q.limit.unwrap_or(DEFAULT_TIMELINE_LIMIT),

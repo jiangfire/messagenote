@@ -28,6 +28,17 @@ pub enum ServerError {
     #[error("{0}")]
     Unauthorized(String),
 
+    /// **服务端代笔时撞上了更新版本**（比如另一台设备刚改过同一条）。
+    ///
+    /// 单独一类是为了让它回 **409** 而不是 500 —— 这两种情况在客户端那里的
+    /// 处置完全相反：409 是"重新读一次再决定怎么办"，而 500 是"服务端坏了，
+    /// 等会儿再试"。回 500 会让用户以为笔记系统出故障了，而实际只需要刷新。
+    ///
+    /// 和 [`BadRequest`](Self::BadRequest) 分开也是这个理由：请求本身没有错，
+    /// 错的是**当前状态**。409 的字面意思就是"状态冲突"。
+    #[error("{0}")]
+    Conflict(String),
+
     /// 东西不在这儿。
     ///
     /// 单独一类是为了回 **404**：附件是按 sha 取字节的，客户端要靠这个状态码
@@ -50,6 +61,7 @@ impl IntoResponse for ServerError {
             // 客户端自己发错的东西，说清楚比藏起来有用
             ServerError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
             ServerError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, msg).into_response(),
+            ServerError::Conflict(msg) => (StatusCode::CONFLICT, msg).into_response(),
             ServerError::NotFound(msg) => (StatusCode::NOT_FOUND, msg).into_response(),
             other => {
                 tracing::error!(error = %other, "请求处理失败");
@@ -79,5 +91,10 @@ impl ServerError {
     /// 找不到。会回 404。
     pub fn not_found(text: impl Into<String>) -> Self {
         ServerError::NotFound(text.into())
+    }
+
+    /// 状态冲突（代笔撞上了更新版本）。会回 409，细节原样带给客户端。
+    pub fn conflict(text: impl Into<String>) -> Self {
+        ServerError::Conflict(text.into())
     }
 }

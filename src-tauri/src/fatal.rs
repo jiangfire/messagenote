@@ -52,7 +52,14 @@ pub fn report(message: &str) -> ! {
 /// 有些问题不该拦启动（比如全局快捷键被别的程序占用），但用户仍然需要知道，
 /// 否则他会一直以为是应用坏了。写进文件，stderr 上也留一份（debug 构建可见）。
 ///
-/// 覆盖写而不是追加：这里的语义是"本次启动的警告"，不是累积日志。
+/// **追加写。** 原来这里是覆盖写（`fs::write`），理由是"这里的语义是本次启动的
+/// 警告，不是累积日志"—— 但那样磁盘上就**永远只剩最后一条**：
+/// 启动时记了三条，文件里只有第三条，而用户翻日志想看"刚才都提示了什么"
+/// 看到的是残缺的。进程内的 [`STARTUP_WARNINGS`] 是完整的，只有文件不是，
+/// 这种"两处都叫日志、内容却不一样"的分裂比缺日志更误导。
+///
+/// 上限用 64 KB：真跑到这个量说明有东西在疯狂刷屏，再多对排查没有帮助。
+/// 写失败一律忽略 —— 记一条警告不该让启动失败。
 pub fn note_warning(message: &str) {
     eprintln!("[MessageNote 警告] {message}");
 
@@ -64,9 +71,36 @@ pub fn note_warning(message: &str) {
     let Some(path) = log_path("startup-warnings.log") else {
         return;
     };
-    let _ = std::fs::create_dir_all(path.parent().unwrap_or(&path));
-    let _ = std::fs::write(&path, format!("{message}\n"));
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = append_capped(&path, format!("{message}\n"));
 }
+
+/// 追加写，并在超过 [`WARNING_LOG_CAP`] 时截断重写（只留最后若干行）。
+fn append_capped(path: &std::path::Path, line: String) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let too_big = std::fs::metadata(path).map(|m| m.len() > WARNING_LOG_CAP).unwrap_or(false);
+    if too_big {
+        // 只保留最后 200 行：真跑到 64 KB 说明有东西在疯狂刷屏，
+        // 再多对排查也没有帮助，而把整个文件留在那儿只会越来越难翻。
+        if let Ok(old) = std::fs::read_to_string(path) {
+            let all: Vec<&str> = old.lines().collect();
+            let start = all.len().saturating_sub(200);
+            let mut f = std::fs::File::create(path)?;
+            for l in &all[start..] {
+                writeln!(f, "{l}")?;
+            }
+        }
+    }
+
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    f.write_all(line.as_bytes())
+}
+
+/// 警告日志的上限。超过就截断成最后 200 行。
+const WARNING_LOG_CAP: u64 = 64 * 1024;
 
 /// 取出本次启动记下的警告，供界面显示。
 ///

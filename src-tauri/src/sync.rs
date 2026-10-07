@@ -800,14 +800,16 @@ pub fn sync_once(store: &dyn LocalStore, api: &dyn ServerApi) -> AppResult<SyncR
         report.conflicts += store.commit_push_result(&outgoing, &resp)?; // 锁：写
     }
 
-    // ---- 附件先传上去 ----
-    //
-    // 放在推变更**之后**：引用了这张图的那条消息先到，别的设备才知道该来取。
-    // 反过来也不会错（取不到就等下一轮），但先推消息能让另一台设备
-    // **第一次同步就看到图**，而不是先看到破图、45 秒后才补上。
-    report.blobs_up = blobs_up(store, api, BLOB_BATCH)?;
-
     // ---- 拉 ----
+    //
+    // **放在上传附件之前**，这是有意的：一条慢链路上的大图会让上传超时，
+    // 而上传失败原来会**中止整轮** —— 于是 pull 永远轮不到，下一轮又卡在
+    // 同一个附件上。结果是「推送能出去、拉取停摆」，而用户看到的只有一个
+    // 附件上传错误。
+    //
+    // 把拉取排在前面，两边就都活了：浏览体验（把别处的更新取回来）优先于
+    // 推送体验（把自己��东西送上去），而上传失败最多让这一轮返回 Err，
+    // 不再连累拉取。
     let mut since = store.current_cursor()?; // 锁：读
     loop {
         let resp = api.pull(since, BATCH)?; // 无锁 ◄────────────┐
@@ -822,7 +824,14 @@ pub fn sync_once(store: &dyn LocalStore, api: &dyn ServerApi) -> AppResult<SyncR
         }
     }
 
-    // ---- 附件再取回来 ----
+    // ---- 附件传上去 ----
+    //
+    // 放在拉之后。仍然是「消息先到、图后到」：变更推完之后别的设备才知道
+    // 该来取这张图（见上面的 push），而这一轮刚拉到的正文里引用了哪些图，
+    // 此时 `commit_pull_batch` 已经登记好了。
+    report.blobs_up = blobs_up(store, api, BLOB_BATCH)?;
+
+    // ---- 附件取回来 ----
     //
     // 放在拉之后：这一轮刚拉到的正文里可能引用了本地没有的图，
     // `commit_pull_batch` 已经把那些登记成待下载了（见 `register_referenced`）。
@@ -1522,6 +1531,107 @@ mod tests {
     ///
     /// 刻意用 `try_conn` 而不是 `conn`：一旦有人把锁的粒度退回去，
     /// 这个测试必须是**失败**，不能是**挂起**。挂起的测试会被当成"跑得慢"。
+/// **上传失败不能把拉取饿死。**
+    ///
+    /// 顺序原来是这样：`push → blobs_up → pull → blobs_down`，而
+    /// `blobs_up` 里 `api.put_blob(&bytes)?` 失败就**中止整轮**。
+    ///
+    /// 一张 25 MB 的图在慢上行上很容易超过 `http.rs` 里那 30 秒的整体超时：
+    /// 于是这一轮 pull 永远不执行，下一轮又卡在同一个附件上 ——
+    /// **推送能出去，拉取停摆**，状态栏持续报错。下载侧对单个失败是
+    /// 「记一笔继续」，上传侧却是整轮中止，这个不对称没有理由。
+    ///
+    /// 修法是调序：pull 提到 blobs_up 之前。浏览（把别人的东西取回来）
+    /// 优先于推送（把自己��东西送出去）。
+    ///
+    /// 所以这里断言的不是「上传成功」，而是**上传失败时拉取照样发生**。
+    #[test]
+    fn a_failing_blob_upload_does_not_starve_the_pull() {
+        // ---- 服务端那边先有一条本机没有的笔记 ----
+        let server = MemoryServer::new();
+        let remote_device = device("upload-starve-remote");
+        {
+            let c = remote_device.conn().unwrap();
+            db::append_message(&c, "远端写的笔记", None).unwrap();
+        }
+        sync_until_quiet(&remote_device, &server);
+
+        // ---- 本机有一个传不上去的附件 ----
+        // 注意 scope：guard 必须在 sync_once 之前放掉，否则会拿同一把锁两次而死锁
+        // （这正是 `the_database_is_not_locked_while_the_network_is_busy` 守的性质）。
+        let a = device("upload-starve-a");
+        let sha = {
+            let c = a.conn().unwrap();
+            let sha = db::save_attachment(&c, b"fake-png-bytes").expect("存本地附件");
+            db::search_page(&c, "远端写的笔记", 10, 0).expect("检索");
+            sha
+        };
+
+        // ---- 上传必失败的 api ----
+        let api = FailingUploadServer {
+            inner: server,
+            pulls: Arc::new(AtomicUsize::new(0)),
+        };
+        let pulls = Arc::clone(&api.pulls);
+
+        // 这一轮整体必然返回 Err（上传确实失败了）—— 失败要如实冒出来
+        let r = sync_once(&a, &api);
+        assert!(
+            r.is_err(),
+            "上传端构造的就是要失败的：失败必须如实冒出来，不能被吞掉"
+        );
+
+        // **核心断言**：拉取被执行了。
+        // 修复前 blobs_up 在 pull 前面，这里会是 0 —— 别人的笔记永远拉不下来，
+        // 而用户看到的只有一个附件上传错误。
+        assert!(
+            pulls.load(Ordering::SeqCst) > 0,
+            "上传失败之后拉取一次都没跑 —— 大图卡住上传的同时，本机再也拉不到任何东西"
+        );
+
+        // 而且那条远端笔记**真的落库了**（不只是调用发生过）
+        {
+            let conn = a.conn().unwrap();
+            assert_eq!(
+                db::search_page(&conn, "远端写的笔记", 10, 0)
+                    .expect("检索")
+                    .items
+                    .len(),
+                1,
+                "远端那条应当已经拉下来"
+            );
+
+            // 那个附件仍然待上传（失败不该把本地数据弄丢）
+            let up = db::pending_uploads(&conn, 10).expect("看待上传");
+            assert_eq!(
+                up.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>(),
+                vec![sha.as_str()],
+                "上传失败后本地那份字节必须还留着等下一轮"
+            );
+        }
+    }
+
+    /// 内存服务端，但**附件上传一律失败**（模拟慢链路上的超时）。
+    struct FailingUploadServer {
+        inner: MemoryServer,
+        pulls: Arc<AtomicUsize>,
+    }
+
+    impl ServerApi for FailingUploadServer {
+        fn push(&self, changes: &[Change]) -> AppResult<PushResponse> {
+            self.inner.push(changes)
+        }
+
+        fn pull(&self, since: i64, limit: i64) -> AppResult<PullResponse> {
+            self.pulls.fetch_add(1, Ordering::SeqCst);
+            self.inner.pull(since, limit)
+        }
+
+        fn put_blob(&self, _bytes: &[u8]) -> AppResult<BlobResponse> {
+            // 30 秒整体超时就是这个形状：请求发出去了，没回来。
+            Err(AppError::Msg("上传超时".into()))
+        }
+    }
     #[test]
     fn the_database_is_not_locked_while_the_network_is_busy() {
         let db = Arc::new(device("device-lock-probe"));
