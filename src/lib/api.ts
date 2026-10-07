@@ -3,12 +3,15 @@ import type {
   Channel,
   Cursor,
   HealthResponse,
+  LlmConfig,
   Message,
   MessagePage,
   SearchPage,
+  SuggestResult,
   SyncConfig,
   SyncStatus,
   TagCount,
+  TagSuggestion,
   TimelineStats,
 } from "./types";
 
@@ -154,6 +157,23 @@ export const api = {
 
   /** 清掉全部「已上传」标记，返回被清掉的条数。灾难恢复后用它补齐附件。 */
   resetUploadFlags: () => invoke<number>("reset_upload_flags"),
+
+  // ------------------------------------------------------------ AI 标签建议
+
+  getLlmConfig: () => invoke<LlmConfig>("get_llm_config"),
+
+  setLlmConfig: (config: LlmConfig) => invoke<void>("set_llm_config", { config }),
+
+  /** 这条记录上**还没采纳**的建议。已采纳的不再返回。 */
+  listTagSuggestions: (messageId: string) =>
+    invoke<TagSuggestion[]>("list_tag_suggestions", { messageId }),
+
+  /** 让模型提标签。**最长 60 秒的阻塞往返** —— Rust 侧标了 `async`。 */
+  suggestTags: (messageId: string) => invoke<SuggestResult>("suggest_tags", { messageId }),
+
+  /** 采纳一条建议：把它变成真标签，并把这条建议标记成已采纳。 */
+  acceptTagSuggestion: (messageId: string, name: string) =>
+    invoke<void>("accept_tag_suggestion", { messageId, name }),
 };
 
 // `errorText` 搬去了 `./errors` —— 网页端不该为了一个错误格式化函数

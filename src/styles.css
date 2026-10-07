@@ -591,6 +591,27 @@ kbd {
   color: var(--danger);
 }
 
+/* 建议态 chip：虚线 + 半透明，和实心的真标签一眼分得开。
+   这不是装饰 —— 分不清哪个已经生效时，用户要么不敢点，要么以为没生效
+   又点一次（结果反而把标签删了）。 */
+.tag-chip.suggested {
+  background: transparent;
+  border: 1px dashed var(--border);
+  color: var(--muted);
+  cursor: pointer;
+  font: inherit;
+}
+
+.tag-chip.suggested:hover {
+  border-color: var(--accent);
+  border-style: solid;
+  color: var(--accent);
+}
+
+.suggest-note {
+  margin-top: 4px;
+}
+
 /* ---------------- 标签 ---------------- */
 
 .tag-chip {

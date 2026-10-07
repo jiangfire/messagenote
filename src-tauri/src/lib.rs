@@ -18,7 +18,9 @@ pub mod sync;
 
 mod commands;
 mod fatal;
+mod llm;
 mod sse;
+mod suggest;
 mod sync_worker;
 
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -327,6 +329,12 @@ pub fn run() {
             commands::read_attachment,
             commands::collect_garbage_attachments,
             commands::reset_upload_flags,
+            commands::reset_upload_flags,
+            commands::get_llm_config,
+            commands::set_llm_config,
+            commands::list_tag_suggestions,
+            commands::suggest_tags,
+            commands::accept_tag_suggestion,
             commands::export_markdown,
             commands::render_message_markdown,
             commands::relaunch,

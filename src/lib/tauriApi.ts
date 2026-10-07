@@ -4,7 +4,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { api as commands } from "./api";
 import type { DesktopApi, NoteApi } from "./apiContext";
-import type { ExportSummary, SyncStatus } from "./types";
+import type { ExportSummary, LlmConfig, SuggestResult, SyncStatus, TagSuggestion } from "./types";
 
 /** 后台同步线程推上来的状态事件名，与 `sync_worker.rs` 的 `STATUS_EVENT` 一致。 */
 const SYNC_STATUS_EVENT = "sync://status";
@@ -132,6 +132,28 @@ export const tauriDesktop: DesktopApi = {
 
   resetUploadFlags() {
     return invoke<number>("reset_upload_flags");
+  },
+
+  // ------------------------------------------------------------ AI 标签建议
+
+  getLlmConfig() {
+    return invoke<LlmConfig>("get_llm_config");
+  },
+
+  setLlmConfig(config) {
+    return invoke<void>("set_llm_config", { config });
+  },
+
+  listTagSuggestions(messageId) {
+    return invoke<TagSuggestion[]>("list_tag_suggestions", { messageId });
+  },
+
+  suggestTags(messageId) {
+    return invoke<SuggestResult>("suggest_tags", { messageId });
+  },
+
+  acceptTagSuggestion(messageId, name) {
+    return invoke<void>("accept_tag_suggestion", { messageId, name });
   },
 };
 

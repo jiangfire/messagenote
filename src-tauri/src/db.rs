@@ -38,7 +38,7 @@ use messagenote_store::{clock, normalize};
 
 use crate::error::{AppError, AppResult};
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 const SCHEMA_V1: &str = r#"
 CREATE TABLE IF NOT EXISTS meta (
@@ -200,6 +200,42 @@ CREATE TABLE IF NOT EXISTS attachment (
 );
 "#;
 
+/// AI 的**标签建议**（v4）。
+///
+/// ## 为什么建议要落库，而不是每次现算
+///
+/// ROADMAP 那条约束是"每次重跑都变的结果会毁掉信任"。同一个模型、同一段正文，
+/// 温度不为 0 仍然会给出不一样的答案 —— 所以"建议"必须是一份**被记住的东西**：
+/// 用户昨天看到的三个标签，今天不该变成另外三个。
+///
+/// ## 它是建议态，不是标签
+///
+/// 表名叫 `tag_suggestion` 而不是 `message_tag`：它**不参与**任何检索、
+/// 导出、标签云或同步。用户点一下之后才走 `set_message_tags`，那才会
+/// 落进 `message_tag`。这是"AI 绝不能静默改数据"那条约束在结构上的落点 ——
+///
+/// ## 不进变更日志
+///
+/// 同附件表的理由，而且更强：建议**是本机的、私人的**。它由本机的模型调用
+/// 产生，别的设备上既没有同样的上下文，也未必配了同一个模型；把它同步出去
+/// 会让另一台设备凭空多出一堆它从没建议过的标签。
+const SCHEMA_V4: &str = r#"
+CREATE TABLE IF NOT EXISTS tag_suggestion (
+  message_id  TEXT NOT NULL,
+  name        TEXT NOT NULL,
+  -- 生成这条建议时用的模型标识。**换模型后要能分得清** —— 否则"为什么建议
+  -- 变了"永远没有答案。
+  model       TEXT NOT NULL DEFAULT '',
+  created_at  INTEGER NOT NULL,
+  -- 这条建议被采纳过没有。采纳之后仍然留着：用户可能想看"当初它建议了什么"，
+  -- 而更重要的是，重新跑一次时它已经在表里，不会又变成一条待办 chip。
+  accepted_at INTEGER,
+  PRIMARY KEY (message_id, name)
+);
+CREATE INDEX IF NOT EXISTS idx_suggestion_open
+  ON tag_suggestion(message_id) WHERE accepted_at IS NULL;
+"#;
+
 /// 数据库句柄。用 `Mutex` 包一层足够：单用户、写入极少、每次操作都是毫秒级。
 pub struct Db {
     inner: Mutex<Connection>,
@@ -275,6 +311,9 @@ fn migrate(conn: &Connection) -> AppResult<()> {
         if current < 3 {
             conn.execute_batch(SCHEMA_V3)?;
         }
+        if current < 4 {
+            conn.execute_batch(SCHEMA_V4)?;
+        }
         // user_version 不支持参数绑定，只能拼字符串；拼的是编译期常量，无注入风险。
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
         Ok(())
@@ -329,6 +368,70 @@ fn seed(conn: &Connection) -> AppResult<()> {
          VALUES (?1, '收件箱', 'inbox', 0, 0, 0, '', 0, 0, 0)",
         params![INBOX_ID],
     )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------- 读取单条
+
+/// 一条记录现在的正文。
+///
+/// 给那些**要整段正文**的调用方用：渲染 Markdown、AI 提标签。
+/// 刻意不返回 `Message` —— 那会把 `dirty` / `device_id` 这些只属于写入路径的
+/// 字段漏给只想读段文字的调用方。
+pub fn message_body(conn: &Connection, id: &str) -> AppResult<String> {
+    conn.query_row(
+        "SELECT body FROM message WHERE id = ?1 AND deleted_at IS NULL",
+        params![id],
+        |r| r.get(0),
+    )
+    .map_err(|_| AppError::Msg("这条记录已经不在了".into()))
+}
+
+/// 一条记录现有的标签。
+///
+/// "已删的标签"（`tag.deleted_at IS NOT NULL`）不算数 —— 那和检索里的
+/// [`browse::search`] 保持同一套语义，否则界面上会出现"搜不到但看得见"的标签。
+pub fn message_tags(conn: &Connection, id: &str) -> AppResult<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT t.name
+           FROM message_tag mt
+           JOIN tag t ON t.name = mt.tag
+          WHERE mt.message_id = ?1
+            AND mt.deleted_at IS NULL
+            AND t.deleted_at IS NULL
+          ORDER BY t.name",
+    )?;
+    let rows = stmt.query_map(params![id], |r| r.get::<_, String>(0))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+// ---------------------------------------------------------------- AI 配置
+
+const LLM_BASE_KEY: &str = "llm_base_url";
+const LLM_KEY_KEY: &str = "llm_api_key";
+const LLM_MODEL_KEY: &str = "llm_model";
+
+/// 读 AI 配置。没配过就是三个空串（= 未配置）。
+pub fn get_llm_config(conn: &Connection) -> AppResult<crate::llm::LlmConfig> {
+    Ok(crate::llm::LlmConfig {
+        base_url: clock::get(conn, LLM_BASE_KEY)?.unwrap_or_default(),
+        api_key: clock::get(conn, LLM_KEY_KEY)?.unwrap_or_default(),
+        model: clock::get(conn, LLM_MODEL_KEY)?.unwrap_or_default(),
+    })
+}
+
+/// 写 AI 配置。
+///
+/// **跟着同步配置一起存在本地库里**，而不是单独一个配置文件：这样备份
+/// （Litestream 只跟一个 `.sqlite`）天然带上它，而密钥和笔记在同一个备份里
+/// 是可接受的 —— 用户备份自己的笔记，本来就是备份自己的数据。
+///
+/// 它**不进变更日志**（`clock::set` 走的是 `meta` 表，不是 `change`），
+/// 所以另一台设备不会突然冒出一个指向本机 key 的配置。
+pub fn set_llm_config(conn: &Connection, cfg: &crate::llm::LlmConfig) -> AppResult<()> {
+    clock::set(conn, LLM_BASE_KEY, cfg.base_url.trim().trim_end_matches('/'))?;
+    clock::set(conn, LLM_KEY_KEY, cfg.api_key.trim())?;
+    clock::set(conn, LLM_MODEL_KEY, cfg.model.trim())?;
     Ok(())
 }
 
@@ -826,7 +929,6 @@ mod tests {
         .expect("读取 HLC")
     }
 
-    #[test]
 /// **迁移中途失败必须整个回滚，不能留下半迁移的库。**
     ///
     /// 这是"应用变砖"那条路径的根因。原来 `execute_batch` 逐语句自动提交：
@@ -973,7 +1075,9 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
-/// **`limit` 顶到上限时 `has_more` 仍然是���。**
+    }
+
+    /// **`limit` 顶到上限时 `has_more` 仍然是真。**
     ///
     /// 潜伏 bug：`search_page` 调 `search(limit + 1)` 来多要一条，而
     /// `search` 内部有一道 `clamp(1, 200)` —— 当 `limit` 正好是 200 时，
@@ -1009,7 +1113,12 @@ mod tests {
         assert_eq!(next.items.len(), 5, "第二页应当正好是剩下的 5 条");
         assert!(!next.has_more, "这一次是真的没有了");
     }
-    }
+
+    /// 全新库应当直接落在最新 schema 版本上。
+    ///
+    /// 守住的是"加了一版迁移却忘了加分支"这类漏 —— 那会让**新装的用户**
+    /// 拿到的库少了新表，而只有打开旧库升级的人才会看到问题。
+    #[test]
     fn fresh_database_lands_on_the_latest_schema_version() {
         let db = mem();
         let conn = db.conn().unwrap();

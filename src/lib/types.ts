@@ -153,3 +153,48 @@ export interface ExportFilter {
   /** 时间范围上界（epoch 毫秒，**含端点**）。 */
   toMs?: number | null;
 }
+
+/**
+ * AI 标签建议。**只有桌面端有** —— 它要调用户自己配的模型端点，
+ * 而模型端点不存在于服务端。
+ */
+export interface LlmConfig {
+  /**
+   * 端点根地址，填到 `/v1` 为止，例如 `https://api.openai.com/v1`
+   * 或 `http://localhost:11434/v1`（Ollama）。
+   *
+   * 拼 `chat/completions` 是应用的事 —— 各家对这个前缀的叫法不统一
+   * （base_url / api_base / 有的干脆不要 `/v1`），让用户猜只会填错。
+   */
+  baseUrl: string;
+  /** API key。**本地模型（Ollama / LM Studio）可以留空。** */
+  apiKey: string;
+  /** 模型名，例如 `gpt-4o-mini`、`deepseek-chat`、`qwen2.5:7b`。 */
+  model: string;
+}
+
+/**
+ * 一条**建议态**的标签。
+ *
+ * 它和 `Message.tags` 是**两个不同的东西**：这里的不参与检索、不进导出、
+ * 不进标签云，也不同步到别的设备。用户点一下之后才会变成真标签。
+ */
+export interface TagSuggestion {
+  messageId: string;
+  name: string;
+  /** 生成它的模型。换模型之后"为什么建议变了"才有答案。 */
+  model: string;
+  createdAt: number;
+}
+
+/**
+ * 一次建议的结果。
+ *
+ * `truncated` **必须**被界面说出来：正文太长时 AI 只读到了开头，
+ * 而用户不知道 —— 于是他会以为 AI 看的是他写的全部。
+ */
+export interface SuggestResult {
+  /** 新增的建议。已经建议过的不会重复出现（用户看到的 chip 不会换一批）。 */
+  tags: string[];
+  truncated: boolean;
+}

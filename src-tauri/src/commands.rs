@@ -229,6 +229,113 @@ pub fn reset_upload_flags(db: State<'_, Db>) -> AppResult<usize> {
     db::reset_upload_flags(&conn)
 }
 
+// ---------------------------------------------------------------- AI 标签建议
+
+#[tauri::command]
+pub fn get_llm_config(db: State<'_, Db>) -> AppResult<crate::llm::LlmConfig> {
+    let conn = db.conn()?;
+    db::get_llm_config(&conn)
+}
+
+#[tauri::command]
+pub fn set_llm_config(db: State<'_, Db>, config: crate::llm::LlmConfig) -> AppResult<()> {
+    let conn = db.conn()?;
+    db::set_llm_config(&conn, &config)
+}
+
+/// 这条记录上还没采纳的建议。
+#[tauri::command]
+pub fn list_tag_suggestions(
+    db: State<'_, Db>,
+    message_id: String,
+) -> AppResult<Vec<crate::suggest::TagSuggestion>> {
+    let conn = db.conn()?;
+    crate::suggest::open_suggestions(&conn, &message_id)
+}
+
+/// 让模型给这条记录提标签，并把结果**记成建议**。
+///
+/// **必须标 `async`**：这是一次最长 60 秒的网络往返，而且是在等一个外部服务。
+/// 标错的话整个窗口在模型思考期间完全冻住 —— 界面上的转圈都转不起来。
+///
+/// 返回 `{ tags, truncated }`：
+/// - `tags` —— **新增**的建议。已经建议过的不重复返回（用户看到的那几个 chip
+///   不会因为重跑而变成另一批）。
+/// - `truncated` —— 正文太长被截过。**必须让用户知道**，否则他会以为 AI 读的是
+///   他写的全部。
+#[tauri::command(async)]
+pub fn suggest_tags(
+    db: State<'_, Db>,
+    message_id: String,
+) -> AppResult<SuggestResult> {
+    let (cfg, body) = {
+        let conn = db.conn()?;
+        let cfg = db::get_llm_config(&conn)?;
+        let body = db::message_body(&conn, &message_id)?;
+        (cfg, body)
+    };
+
+    let (tags, truncated) = crate::llm::suggest_tags(&cfg, &body)?;
+    if tags.is_empty() {
+        return Ok(SuggestResult {
+            tags,
+            truncated,
+        });
+    }
+
+    let conn = db.conn()?;
+    // 幂等：只落"新"的那几条。
+    let fresh = crate::suggest::put_suggestions(
+        &conn,
+        &message_id,
+        &tags,
+        cfg.model.trim(),
+        messagenote_core::hlc::now_ms(),
+    )?;
+    // 只回新增的那些 —— 已经摆在那儿的 chip 不该"刷新"一次。
+    let tags = if fresh == tags.len() {
+        tags
+    } else {
+        crate::suggest::open_suggestions(&conn, &message_id)?
+            .into_iter()
+            .map(|s| s.name)
+            .collect()
+    };
+    Ok(SuggestResult { tags, truncated })
+}
+
+/// 采纳一条建议：**同时**把它变成真标签。
+///
+/// 两件事在**同一个事务**里做完，是因为中间断掉会留下一条"已采纳但没标签"
+/// 的建议 —— 用户再点一次只会得到"已经用过了"，而标签并没有加上。
+#[tauri::command(async)]
+pub fn accept_tag_suggestion(
+    db: State<'_, Db>,
+    message_id: String,
+    name: String,
+) -> AppResult<()> {
+    let conn = db.conn()?;
+    let now = messagenote_core::hlc::now_ms();
+
+    let existing = db::message_tags(&conn, &message_id)?;
+    if !existing.contains(&name) {
+        let mut next = existing.clone();
+        next.push(name.clone());
+        db::set_message_tags(&conn, &message_id, &next)?;
+    }
+    crate::suggest::accept_suggestion(&conn, &message_id, &name, now)?;
+    Ok(())
+}
+
+/// 一次建议的结果。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SuggestResult {
+    pub tags: Vec<String>,
+    /// 正文太长被截过 —— 界面必须把这句话说出来。
+    pub truncated: bool,
+}
+
 /// 把整个库导出成一棵 Markdown 目录树。
 ///
 /// **附件的字节不经过前端**：这里直接从 SQLite 读出来写盘。一份图多的库有几十

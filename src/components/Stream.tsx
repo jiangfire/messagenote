@@ -1,9 +1,10 @@
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
-import type { Channel, Message } from "../lib/types";
+import type { Channel, Message, TagSuggestion } from "../lib/types";
 import { dayKey, formatDayLabel, formatTime } from "../lib/format";
 import { Markdown } from "./Markdown";
 import { Avatar } from "./Avatar";
 import { useApi } from "../lib/apiContext";
+import { errorText } from "../lib/errors";
 
 interface Props {
   messages: Message[];
@@ -277,6 +278,78 @@ function MessageRow({ message, channels, label, onEdit, onDelete, onMove, onTags
   const [tagDraft, setTagDraft] = useState("");
   const [moving, setMoving] = useState(false);
 
+  // ---------------------------------------------------------- AI 标签建议
+  //
+  // **建议态，不是标签。** 点一下才生效，而且生效前它和真标签在视觉上必须
+  // 分得开 —— 见下面 `.tag-chip.suggested` 的样式。
+  const [suggestions, setSuggestions] = useState<TagSuggestion[]>([]);
+  const [suggesting, setSuggesting] = useState(false);
+  /** 一次性提示：这一条 AI 没给出标签 / 正文被截了 / 端点报错了。 */
+  const [suggestNote, setSuggestNote] = useState<string | null>(null);
+
+  // 建议是**按消息取的**，而每一行都是一个独立的组件实例 —— 所以挂载时
+  // 各读各的。没有这一下的话，用户滚回去会看到一条"凭空多了几个标签"的记录。
+  useEffect(() => {
+    if (!desktop) return;
+    let alive = true;
+    void (async () => {
+      try {
+        const list = await desktop.listTagSuggestions(message.id);
+        if (alive) setSuggestions(list);
+      } catch {
+        // 读失败不该在每条记录上冒一个错 —— 没读到就是没有建议
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [desktop, message.id]);
+
+  async function runSuggest() {
+    if (!desktop || suggesting) return;
+    setSuggesting(true);
+    setSuggestNote(null);
+    try {
+      const r = await desktop.suggestTags(message.id);
+      if (r.tags.length > 0) {
+        setSuggestions(await desktop.listTagSuggestions(message.id));
+      }
+      // **两个"没结果"都必须说出来。** 静默失败的话，用户只会以为 AI
+      // 什么都没想出来 —— 而真实原因可能是正文太长、端点错了、key 不对。
+      setSuggestNote(
+        r.tags.length > 0
+          ? null
+          : r.truncated
+            ? "模型没有给出标签（正文很长，它只读到了开头 4000 字）"
+            : "模型没有给出标签（可能这条内容确实没什么可标的）"
+      );
+    } catch (e) {
+      setSuggestNote(errorText(e));
+    } finally {
+      setSuggesting(false);
+    }
+  }
+
+  /**
+   * 采纳一条建议。
+   *
+   * **点一下才生效** —— 这是 ROADMAP 里"AI 绝不能静默改数据"那条约束在
+   * 界面上的形状：模型说完就闭嘴，改不改由用户决定。
+   *
+   * 失败时**不能把 chip 藏掉**：那是"看起来成功了"的假状态，
+   * 用户会以为标签已经加上而它并没有。
+   */
+  async function acceptSuggestion(name: string) {
+    if (!desktop) return;
+    try {
+      await desktop.acceptTagSuggestion(message.id, name);
+      setSuggestions((prev) => prev.filter((s) => s.name !== name));
+      await onTags(message.id, [...message.tags, name]);
+    } catch (e) {
+      setSuggestNote(errorText(e));
+    }
+  }
+
   useEffect(() => {
     setDraft(message.body);
   }, [message.body]);
@@ -359,7 +432,7 @@ function MessageRow({ message, channels, label, onEdit, onDelete, onMove, onTags
           </div>
         )}
 
-        {(message.tags.length > 0 || tagging) && (
+        {(message.tags.length > 0 || tagging || desktop) && (
           <div className="msg-tags">
             {message.tags.map((t) => (
               <span key={t} className="tag-chip small">
@@ -369,6 +442,46 @@ function MessageRow({ message, channels, label, onEdit, onDelete, onMove, onTags
                 </button>
               </span>
             ))}
+
+            {/*
+                建议态 chip。**必须和真标签长得不一样。**
+
+                它是虚线边框 + 半透明的，同一行里"实心 chip"是真标签、
+                "虚线 chip"是建议 —— 一眼能分出来。不这么做的后果不是"不好看"，
+                而是用户分不清哪个已经生效了，于是不敢点，或者以为没生效
+                又点一次（结果反而把它删了）。
+            */}
+            {suggestions.map((s) => (
+              <button
+                key={s.name}
+                className="tag-chip small suggested"
+                title={`模型建议的标签（${s.model}），点一下就变成真标签`}
+                onClick={() => void acceptSuggestion(s.name)}
+              >
+                {s.name}
+                <span className="tag-x">＋</span>
+              </button>
+            ))}
+
+            {suggesting ? (
+              <span className="muted small">正在想标签…</span>
+            ) : (
+              /* 按钮**恒常显示**（桌面端），不按"配没配模型"藏起来。
+                 曾经想藏，但那样会带来一个更糟的问题：每行自己读一次配置，
+                 用户在设置里配好了之后，**已经挂在屏幕上的那些行不会刷新**，
+                 于是出现"我明明配了但按钮就是不出现"——而他没有任何办法
+                 知道自己哪里没对上。
+                 改成点一下给一句可操作的话（"AI 还没配好：还没填模型地址"），
+                 问题就消失了。 */
+              <button
+                className="btn tiny ghost"
+                title="让模型给这条记录提几个标签（只是建议，不会自动改你的数据）"
+                onClick={() => void runSuggest()}
+              >
+                ＋ AI 建议标签
+              </button>
+            )}
+
             {tagging && (
               <input
                 className="tag-input"
@@ -390,6 +503,8 @@ function MessageRow({ message, channels, label, onEdit, onDelete, onMove, onTags
             )}
           </div>
         )}
+
+        {suggestNote && <div className="muted small suggest-note">{suggestNote}</div>}
 
         {moving && (
           <div className="move-row">
