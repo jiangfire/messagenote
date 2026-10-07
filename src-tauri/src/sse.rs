@@ -9,13 +9,27 @@
 //! 看起来一模一样。所以推送负责快，轮询负责兜底 —— 少了轮询，
 //! 这条连接一死，同步就**永久停摆**且不报错。
 //!
-//! ## 为什么不能设整体超时
+//! ## 超时怎么设的（这里踩过坑，别改回去）
 //!
-//! SSE 是一条**故意不结束**的响应。`timeout_global` 会在固定时间之后把它
-//! 掐掉，表现是每隔一段时间重连一次、中间那些推送全丢。这里只设
-//! `timeout_recv_body`：它约束的是"两次读到数据之间最长隔多久"，而服务端
-//! 每 15 秒发一次心跳，所以正常情况下永远不会触发；真触发了就说明这条
-//! 连接已经名存实亡，断开重连是对的。
+//! ureq 3 里**没有**「空闲超时」这个概念，只有各阶段的**预算**，而预算
+//! **不随每次读重启**：
+//!
+//! - `timeout_global` / `timeout_per_call`：整次调用，从 DNS 到读完正文。
+//! - `timeout_recv_response`：只管**等响应头**，响应头一到就失效。
+//! - `timeout_recv_body`：**最容易误解的一个**。它的预算锚定在
+//!   「响应头收完」那一刻，是**整个正文**的总时长 —— ureq 自己的文档原话
+//!   是 "The budget is not restarted for each read"。
+//!
+//! 这里曾经把 `timeout_recv_body` 设成 25 秒，注释还写着它约束的是
+//! 「两次读到数据之间最长隔多久」（那是 ureq 2 的语义）。后果是**每条 SSE
+//! 连接活满 25 秒就被掐断**：心跳每 15 秒来一次，说明连接明明是活的，可预算
+//! 只管总时长 —— 于是 `connect` 返回 `Established`、退避重置、2 秒后重连，
+//! 约 27 秒一轮。25 秒窗口内的推送照常生效，窗口之间的推送等 45 秒轮询兜底，
+//! 所以从外面看「同步是好的」，只是慢。
+//!
+//! 所以这里**只给响应头设超时**（`timeout_recv_response`）：等头是有限的一步，
+//! 该掐就掐；正文**一个超时都不设** —— 掐断的判据交给底层 socket
+//! （反代/NAT 掐连接会让 read 返回错误）和 45 秒轮询兜底。
 
 use std::io::{BufRead, BufReader};
 use std::time::Duration;
@@ -28,11 +42,12 @@ use crate::sync_worker::SyncWorker;
 /// 连接超时。和同步那边保持一致。
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
 
-/// 两次读到数据之间最多等多久。
+/// **等响应头**最多等多久。
 ///
-/// 服务端每 15 秒一次心跳，所以正常情况下永远不触发。触发就意味着这条连接
-/// 已经死了 —— 反代把它掐了，或者机器睡了一觉之后 socket 成了半开的。
-const READ_TIMEOUT: Duration = Duration::from_secs(25);
+/// 命名刻意写死成「等响应头」：它只约束「服务端多久开始应答」，一拿到头就失效。
+/// 正文那边不设任何超时 —— 见文件头，这里的语义换成「空闲超时」过一次，
+/// 那次 SSE 每 25 秒准时重连，而两端都不报错。
+const HEADER_TIMEOUT: Duration = Duration::from_secs(4);
 
 const RETRY_BASE: Duration = Duration::from_secs(2);
 const RETRY_MAX: Duration = Duration::from_secs(60);
@@ -112,10 +127,14 @@ fn connect(
     let agent = ureq::Agent::new_with_config(
         ureq::Agent::config_builder()
             .timeout_connect(Some(CONNECT_TIMEOUT))
-            // **整体超时必须关掉。** 见文件头：SSE 是故意不结束的响应，
-            // 整体超时会把好好的连接定时掐断。
+            // **两个整体预算都必须关掉。** 见文件头：SSE 是故意不结束的响应，
+            // 整体预算会把好好的连接定时掐断。
             .timeout_global(None)
-            .timeout_recv_body(Some(READ_TIMEOUT))
+            // **正文的预算也不能设。** 它不是空闲超时，是「响应头收完之后
+            // 还能读多久」的总预算 —— 设成 25 秒会让每条连接准点活 25 秒就被掐。
+            .timeout_recv_body(None)
+            // 只约束「等响应头」：这是有限的一步，该掐就掐。拿到头之后它自动失效。
+            .timeout_recv_response(Some(HEADER_TIMEOUT))
             .build(),
     );
 
@@ -306,6 +325,62 @@ mod tests {
             hits.load(Ordering::SeqCst) > 0,
             "真实服务端推过来的事件没有到达回调 —— 连接建好了却收不到东西，\
              正是流被缓冲住、或者超时配置写错时的表现"
+        );
+    }
+    /// **一条活着的 SSE 连接必须能活过 25 秒。**
+    ///
+    /// 这条测试守的是一个已经发生过、而**两端都不报错**的 bug：
+    /// `timeout_recv_body` 曾被当成「空闲超时」，可它在 ureq 3 里是
+    /// 「响应头收完之后还能读多久」的**总预算**。于是每条连接准点活 25 秒
+    /// 就被掐断重连（约 27 秒一轮），25 秒窗口内的推送照常生效，窗口之间的
+    /// 推送等 45 秒轮询兜底 —— 表现只是「同步有点慢」，不崩、不报错。
+    ///
+    /// 上面的 `an_event_from_a_real_server_reaches_the_callback` 抓不到它：
+    /// 那条连接只活了几百毫秒。**所以这里必须真的等过那个窗口。**
+    /// 代价是这条测试要跑 30 多秒，换的是"静默退化"不再静默。
+    #[test]
+    fn a_live_stream_survives_past_the_old_read_timeout() {
+        let addr = start_server();
+        // 收到心跳 = 连接还活着。断了之后 should_stop 会返回 true，
+        // pump 随即返回，连接结束 —— 那时 ends 就变成 1。
+        let beats = Arc::new(AtomicUsize::new(0));
+        let ends = Arc::new(AtomicUsize::new(0));
+
+        let b = Arc::clone(&beats);
+        let e = Arc::clone(&ends);
+        std::thread::spawn(move || {
+            let _ = connect(
+                &format!("http://{addr}"),
+                TOKEN,
+                || {},
+                // **必须永远返回 false。** 返回 true 会让 pump 在第一个心跳上
+                // 就收手 —— 那测的是"我们自己主动断开"，不是"服务端还连着"。
+                || {
+                    b.fetch_add(1, Ordering::SeqCst);
+                    false
+                },
+            );
+            // pump 已经返回 → 连接结束（正常、异常、超时，都走这里）
+            e.store(1, Ordering::SeqCst);
+        });
+
+        // 服务端每 15 秒一次心跳，所以这段时间里连接必须一直活着。
+        // 旧实现会在第 25 秒被掐掉 —— 那时 ends 就会变成 1。
+        std::thread::sleep(Duration::from_secs(34));
+
+        // 顺带确认心跳真的在来（否则上面那条"连接没断"可能是压根没连上）
+        assert!(
+            beats.load(Ordering::SeqCst) >= 2,
+            "34 秒内至少该来两次心跳（服务端每 15 秒一次），实际 {} 次 —— \
+             连接可能压根没建立起来，那样这条测试就是空跑",
+            beats.load(Ordering::SeqCst)
+        );
+
+        assert_eq!(
+            ends.load(Ordering::SeqCst),
+            0,
+            "连接在 34 秒内就结束了 —— 正文预算又被当成了整体掐断（每次心跳本来都该续上）。\
+             表现是每 25 秒重连一次、窗口之间的推送靠轮询兜底，两端都不报错"
         );
     }
 
