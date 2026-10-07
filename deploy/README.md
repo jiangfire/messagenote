@@ -222,6 +222,13 @@ git tag -a v1.3.0 -m "..." && git push origin v1.3.0
 **给人看的样子**（这一版新增了什么、修了什么、为什么是 minor），而不是
 "bump version"。顺带一提：这个仓库直接往 main 提交、没有 PR，所以
 `--generate-notes` 那种按 PR 归纳的做法在这里只能产出一行空链接。
+
+**打 tag 的那个提交必须就是最后那个提交。** 上面那句 `git log -1` 取的是
+**tag 指向的提交**的信息（不是 tag 自己的注解）—— 所以 tag 之后哪怕再补一个
+"修 CI"的小提交，发出去的发行说明就变成那个小提交的内容。踩过一次：v1.8.0
+在打 tag 之后又补了 fmt/clippy 修复，发行说明发出去变成了「补上漏掉的 CI 闸门」，
+而用户看到的却是整个 1.8.0 的变化。**要么先补完再打 tag，要么事后用
+`gh release edit --notes-file` 改正。**
 Release workflow 会构建并发布：Windows 安装包 + 免安装版 + 更新签名 +
 `latest.json` + 三个平台的服务端二进制 + `SHA256SUMS.txt` + 许可证，
 同时把两个容器镜像推到 GHCR。
