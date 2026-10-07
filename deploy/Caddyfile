@@ -14,10 +14,15 @@
 # 部署：
 #   cargo build --release -p messagenote-server
 #   pnpm build
-#   # 只拷网页端需要的那两样。**不要**把 dist/index.html 拷过来 ——
+#   # 只拷网页端需要的那三样。**不要**把 dist/index.html 拷过来 ——
 #   # 那是 Tauri 主窗口的壳，依赖 window.__TAURI__，在浏览器里只会白屏。
+#   #
+#   # sw.js **必须**一起拷：Service Worker 只能从根路径 /sw.js 加载，
+#   # 而下面 handle 的兜底会把 /sw.js 重写成 web.html（200 + text/html），
+#   # 浏览器以 MIME 不符为由拒绝注册 —— 离线壳在所有按文档部署的环境里
+#   # **静默失效**，不报任何错。
 #   install -d /var/lib/messagenote/web
-#   cp -r dist/assets dist/web.html /var/lib/messagenote/web/
+#   cp -r dist/assets dist/web.html dist/sw.js /var/lib/messagenote/web/
 #
 # 把 notes.example.com 换成你自己的域名，然后：
 #   caddy reload --config /etc/caddy/Caddyfile
@@ -47,6 +52,20 @@ notes.example.com {
 
 	# 打包产物
 	handle /assets/* {
+		file_server
+	}
+
+	# Service Worker 自己。
+	#
+	# **必须放在兜底 rewrite 之前**，而且要用 `file_server` 真的把它发出去。
+	# 少了这一段，`GET /sw.js` 会掉进下面的 `rewrite * /web.html` ——
+	# 返回 200 + text/html，浏览器以 MIME 不符为由拒绝注册，报的是
+	# "unsupported MIME type ('text/html')"，看起来和 SW 八竿子打不着。
+	#
+	# 结果是**离线壳在所有按这份文档部署的环境里静默失效**：地铁里点开网页端
+	# 直接是浏览器的错误页。这个坑在端到端测试的同源代理里先踩到过一次
+	# （scripts/web-e2e/serve.mjs 有同样的处理和说明），生产配置当时漏了。
+	handle /sw.js {
 		file_server
 	}
 

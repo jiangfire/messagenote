@@ -40,6 +40,9 @@ class Session {
     /** 页面弹过的 confirm/prompt/alert 文本。测试可以据此断言"对话框说的是不是真话" */
     this.dialogs = [];
 
+    /** CDP 事件订阅（见 `on`）。 */
+    this.listeners = new Map();
+
     ws.addEventListener("message", (e) => {
       const msg = JSON.parse(e.data);
       if (msg.id && this.pending.has(msg.id)) {
@@ -48,6 +51,18 @@ class Session {
         if (msg.error) reject(new Error(`CDP 报错：${JSON.stringify(msg.error)}`));
         else resolve(msg.result);
         return;
+      }
+      // **先给订阅者**（如 Network.* 的监听），再走下面那几类内置收集 ——
+      // 顺序反了的话，"刷新时到底有没有网络请求"这类诊断就永远拿不到数据。
+      const subs = this.listeners.get(msg.method);
+      if (subs) {
+        for (const fn of [...subs]) {
+          try {
+            fn(msg.params);
+          } catch {
+            // 监听器自己的异常不该让整轮测试崩掉
+          }
+        }
       }
       // 页面里的报错必须收集起来 —— "看起来渲染了"不等于"没出错"
       if (msg.method === "Runtime.exceptionThrown") {
@@ -76,6 +91,26 @@ class Session {
       this.pending.set(id, { resolve, reject });
       this.ws.send(JSON.stringify({ id, method, params }));
     });
+  }
+
+  /**
+   * 订阅某个 CDP 事件。返回取消订阅的函数。
+   *
+   * 什么时候需要它：**断言失败但看不出原因**的时候。比如「离线刷新拿不到壳」
+   * 这类问题，从界面上看只有一句 ERR_INTERNET_DISCONNECTED ——
+   * 到底是 SW 没接管导航、还是接管了但缓存是空的、还是导航根本没发出去，
+   * 只有把 Network.* 的原始事件打出来才分得清。
+   *
+   * 猜是猜不出来的，这类问题已经猜错过好几轮了。
+   */
+  on(method, fn) {
+    if (!this.listeners.has(method)) this.listeners.set(method, new Set());
+    this.listeners.get(method).add(fn);
+    return () => this.off(method, fn);
+  }
+
+  off(method, fn) {
+    this.listeners.get(method)?.delete(fn);
   }
 }
 

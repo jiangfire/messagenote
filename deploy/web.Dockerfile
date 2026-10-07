@@ -27,5 +27,9 @@ FROM caddy:2-alpine
 COPY deploy/Caddyfile.container /etc/caddy/Caddyfile
 COPY --from=build /src/dist/web.html /srv/web.html
 COPY --from=build /src/dist/assets /srv/assets
+# sw.js **必须**一起拷。Service Worker 只能从根路径 /sw.js 加载，而
+# Caddyfile.container 里的兜底 rewrite 会把 /sw.js 变成 web.html ——
+# 浏览器以 MIME 不符为由拒绝注册，离线壳静默失效。
+COPY --from=build /src/dist/sw.js /srv/sw.js
 
 EXPOSE 80

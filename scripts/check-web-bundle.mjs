@@ -105,7 +105,70 @@ async function main() {
     process.exit(1);
   }
   console.log(`桌面端仍然带着 Tauri（${tauriChunk.join(", ")}），检查有效。`);
+
+  await checkServiceWorker();
   console.log("网页端 bundle 干净。");
+}
+
+/**
+ * Service Worker 必须真的被打进产物、并且带着**这次构建**的版本号。
+ *
+ * 两个坑都在这里出现过：
+ *
+ * - **没被打进去。** `public/` 是原样拷的，但两条文档化的部署路径
+ *   （deploy/Caddyfile 的安装指引、deploy/web.Dockerfile 的 COPY）曾经
+ *   只拷 `assets` 和 `web.html`。于是生产 `GET /sw.js` 掉进 SPA 兜底，
+ *   返回 200 + text/html，浏览器以 MIME 不符拒绝注册 —— **离线壳在所有
+ *   按文档部署的环境里静默失效**，报的还是 "unsupported MIME type"。
+ *   scripts/web-e2e/serve.mjs 早就修过一模一样的坑（那边有注释），生产配置漏了。
+ *
+ * - **版本号是死的。** `VERSION` 曾经硬编码，于是 install 永不重跑、
+ *   activate 的旧缓存清理永不生效 —— 「版本更新后清缓存」是个不存在的功能。
+ *
+ * 所以这里检查产物里的 sw.js：**存在**、**真的换了版本**、且这个版本
+ * 和 package.json 对得上。
+ */
+async function checkServiceWorker() {
+  const swPath = join(DIST, "sw.js");
+  if (!existsSync(swPath)) {
+    console.error(
+      "\n产物里没有 sw.js —— Service Worker 只从根路径 /sw.js 加载，" +
+        "少了它离线打开就是浏览器的错误页。"
+    );
+    process.exit(1);
+  }
+
+  const { version } = JSON.parse(await readFile("package.json", "utf8"));
+  const sw = await readFile(swPath, "utf8");
+
+  if (sw.includes("__MESSAGENOTE_BUILD__")) {
+    console.error(
+      "\nsw.js 里的版本占位符没被替换 —— pnpm build 是不是漏了 stamp-sw-version.mjs？"
+    );
+    process.exit(1);
+  }
+
+  const m = sw.match(/const VERSION\s*=\s*(".*?"|null)/);
+  if (!m || !m[1].includes(version)) {
+    console.error(
+      `\nsw.js 的版本串（${m ? m[1] : "没找到"}）里没有当前的 ${version} —— ` +
+        "版本不变的话 install 不会重跑、activate 也不会清旧缓存。"
+    );
+    process.exit(1);
+  }
+
+  // 顺带确认源码里是占位符：否则有人把版本又写死了，构建照样"通过"，
+  // 而 VERSION 从此不再随发版变化。
+  const source = await readFile("public/sw.js", "utf8");
+  if (!source.includes("__MESSAGENOTE_BUILD__")) {
+    console.error(
+      "\npublic/sw.js 里没有版本占位符 —— 版本号又被写死了，" +
+        "那样每次发版的缓存清理都不会发生。"
+    );
+    process.exit(1);
+  }
+
+  console.log(`sw.js 存在，版本已随构建更新（v${version}）。`);
 }
 
 await main();

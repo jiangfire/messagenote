@@ -24,6 +24,13 @@
 		file_server
 	}
 
+	# Service Worker 自己。必须在兜底 rewrite 之前，否则 /sw.js 会变成
+	# web.html（200 + text/html），浏览器以 MIME 不符为由拒绝注册 ——
+	# 离线壳就静默失效了。详见 deploy/Caddyfile 里的同一段。
+	handle /sw.js {
+		file_server
+	}
+
 	# 其余一律回网页端入口。它是单页应用，路由在客户端。
 	# **注意是 web.html 不是 index.html** —— 后者是 Tauri 主窗口的壳，
 	# 依赖 window.__TAURI__，在浏览器里打开只会白屏。

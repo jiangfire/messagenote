@@ -19,9 +19,24 @@
  * 这个文件刻意是**不经过打包的普通 JS**，放在 `public/` 里原样拷进 `dist/`。
  * Service Worker 必须从一个**稳定的 URL** 加载（`/sw.js`），
  * 而 Vite 给入口文件的名字是带哈希的。它也不需要任何依赖。
+ *
+ * ## VERSION 为什么是构建时注入的
+ *
+ * 下面这行里的 `__MESSAGENOTE_BUILD__` 由 `scripts/stamp-sw-version.mjs`
+ * 在构建后替换成发版号（替换后是字符串字面量，不是 `self` 上的属性 ——
+ * `self` 是 Window/WorkerGlobalScope，不是变量容器，写成 `self.版本` 一定错）。
+ *
+ * 它必须**每次构建都变**：VERSION 同时是缓存的名字和「这个缓存是不是当前的」
+ * 判据。写死的话 install 永远不重跑（浏览器只在新文件出现时才装新的
+ * SW —— 文件名和内容都不变就等于什么都没变），activate 里的旧缓存清理
+ * 也永远不生效，「版本更新后的清理」就成了一个不存在的功能。
+ *
+ * 用版本号而不是内容哈希：内容哈希更精确，但版本号已经随每次发版变，
+ * 而两次发版之间同一个版本的产物是等价的 —— 少一次不必要的重装。
  */
 
-const VERSION = "messagenote-shell-1";
+/* 由 scripts/stamp-sw-version.mjs 替换成字符串字面量。开发期没有构建步骤时用 dev 这个固定值。 */
+const VERSION = __MESSAGENOTE_BUILD__ ?? "messagenote-shell-dev";
 const SHELL = "/web.html";
 
 self.addEventListener("install", (event) => {

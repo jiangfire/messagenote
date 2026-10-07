@@ -214,7 +214,11 @@ jobs:
 
   release:
     name: 发 Release
-    needs: [desktop, server]
+    # **必须带上 images。** 少了它，镜像构建失败照样会发版 ——
+    # 于是"发布成功而 ghcr 上没有对应标签"成为一个静默失败面：
+    # Release 页面看着一切正常，用户 `docker pull` 才发现拉到的要么是旧镜像、
+    # 要么根本拉不到，而 CI 全绿。
+    needs: [desktop, server, images]
     runs-on: ubuntu-latest
     steps:
       # 这个 job 本来不需要仓库内容，但 Apache-2.0 第 4 条要求**分发二进制时

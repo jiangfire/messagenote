@@ -3,17 +3,12 @@
   "identifier": "default",
   "description": "MessageNote 桌面端默认权限集",
   "windows": ["main", "capture"],
+  "//": "刻意**不授** global-shortcut 和 core:window:allow-close / allow-start-dragging。前端依赖只有 @tauri-apps/api、plugin-dialog、plugin-updater，src/ 下没有任何 globalShortcut 调用 —— 快捷键注册全在 Rust 侧（lib.rs），不走 ACL。留着等于允许一个被攻破的渲染进程经 IPC 抢注系统级全局热键、或者关掉自己的窗口。dialog.json / updater.json 里的「按窗口给最小权限」是自家原则，这里也得守住。",
   "permissions": [
     "core:default",
     "core:window:allow-hide",
     "core:window:allow-show",
     "core:window:allow-set-focus",
-    "core:window:allow-set-size",
-    "core:window:allow-close",
-    "core:window:allow-start-dragging",
-    "global-shortcut:default",
-    "global-shortcut:allow-register",
-    "global-shortcut:allow-unregister",
-    "global-shortcut:allow-is-registered"
+    "core:window:allow-set-size"
   ]
 }

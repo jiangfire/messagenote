@@ -1014,6 +1014,143 @@ ok(
   s.consoleErrors.join(" | ")
 );
 
+// ------------------------------------------------------- 过期响应不能覆盖新视图
+console.log("== 乱序响应守卫：先发的请求后回来，不能盖掉新视图 ==");
+
+// 这是**乱序**响应造成的渲染错误：快速连点两个频道时，第一个请求可能比
+// 第二个更晚回来，于是界面上出现的是**上一个频道**的内容 —— 而且它不自愈，
+// 直到用户再点一次。
+//
+// 造法：在页面里包一层 fetch，给**第一次** /api/timeline 加 2.5 秒延迟、
+// 后面的照常放行 —— 于是第二个请求必然先回。精确地制造乱序，
+// 而不是靠「多点几次试试」的运气。
+//
+// 视图用**新建频道**来区分：两个频道各写一条内容互不相同的记录，
+// 于是「界面上是谁的内容」就是确凿的判据。
+await evaluate(
+  s,
+  `(() => {
+    const real = window.fetch;
+    window.__origFetch = real;
+    let hits = 0;
+    window.__restoreFetch = () => { window.fetch = real; };
+    window.fetch = (input, init) => {
+      const url = typeof input === "string" ? input : input.url;
+      if (url.includes("/api/timeline") && hits++ === 0) {
+        return new Promise((r) => setTimeout(() => r(real(input, init)), 2500));
+      }
+      return real(input, init);
+    };
+    return true;
+  })()`
+);
+
+/** 新建一个频道并等它出现在侧边栏。 */
+const makeChannel = async (name) => {
+  await evaluate(
+    s,
+    `(() => {
+      // 频道区是**第一个** .section（第二个是标签）。注意那个按钮的 onClick
+      // 是 setAdding(v => !v)：输入框开着时再点会把它关掉，所以先查。
+      if (!document.querySelector('.inline-input')) {
+        const btn = document.querySelectorAll('.section')[0]
+          .querySelector('.icon-btn');
+        if (!btn) throw new Error('找不到新建频道的按钮');
+        btn.click();
+      }
+      return true;
+    })()`
+  );
+  await waitFor(s, `!!document.querySelector('.inline-input')`, `「${name}」输入框`);
+  await fill(s, ".inline-input", name);
+  await pressEnter(s, ".inline-input");
+  const channelExists = (name) =>
+  evaluate(
+    s,
+    `(() => {
+       const items = [...document.querySelectorAll('.nav-main')].map(x => x.textContent);
+       const open = !!document.querySelector('.inline-input');
+       const draft = document.querySelector('.inline-input')?.value ?? '';
+       return { found: items.some(x => x.includes(${JSON.stringify(name)})),
+                items, open, draft };
+     })()`
+  );
+
+const until = Date.now() + 10000;
+let seen = null;
+while (Date.now() < until) {
+  seen = await channelExists(name);
+  if (seen.found && !seen.open) break;
+  await sleep(200);
+}
+ok(
+  `「${name}」建好并出现在侧边栏`,
+  Boolean(seen?.found) && !seen?.open,
+  JSON.stringify(seen)
+);
+};
+
+/** 按名字点侧边栏里的频道。 */
+const clickChannel = (name) =>
+  evaluate(
+    s,
+    `(() => {
+      const b = [...document.querySelectorAll('.nav-main')]
+        .find(x => x.textContent.includes(${JSON.stringify(name)}));
+      if (!b) throw new Error('侧边栏里没有这个频道：' + ${JSON.stringify(name)});
+      b.click();
+      return true;
+    })()`
+  );
+
+for (const [chan, marker] of [
+  ["慢频道", "SLOWMARKER"],
+  ["快频道", "FASTMARKER"],
+]) {
+  await makeChannel(chan);
+  await sleep(300);
+  await clickChannel(chan);
+  await sleep(500);
+  await fill(s, ".composer-input", marker);
+  await pressEnter(s, ".composer-input");
+  await sleep(1500);
+}
+
+// ---- 制造乱序 ----
+// 先点「慢频道」（它的 timeline 响应被延迟 2.5 秒），再立刻点「快频道」。
+await clickChannel("慢频道");
+await sleep(150); // 让第一个请求确实发出去了
+await clickChannel("快频道");
+
+// 等那个慢请求真的回来 —— 错误正是那一刻发生的
+await sleep(4500);
+
+// **立刻把 fetch 原样还回去，而且要确认真的还了。**
+//
+// 这一步比看起来重要：Service Worker 的 install 会 `cache.add(SHELL)`，
+// 那也是一次 fetch。如果此刻 fetch 还是被包着的版本，它会走我们那段
+// 「只延迟第一次」的逻辑，壳就**没能被缓存下来** —— 后面「离线打开」
+// 那一段于是失败，症状出现在好几段之后，指向一个完全无辜的地方
+//（看起来像是 sw.js 坏了，而其实只是我们自己的 mock 漏了刀）。
+await evaluate(s, `window.__restoreFetch(); true`);
+await sleep(300);
+ok(
+  "fetch 已经还原（后面 Service Worker 的预缓存要靠它）",
+  await evaluate(s, `window.fetch === window.__origFetch`)
+);
+
+const shown = await text();
+ok(
+  "慢响应没有覆盖新视图（界面停在最后点的那个频道上）",
+  !shown.includes("SLOWMARKER"),
+  shown.includes("SLOWMARKER") ? "界面上出现了慢频道的内容" : ""
+);
+ok(
+  "新视图的内容正常显示",
+  shown.includes("FASTMARKER"),
+  await evaluate(s, `document.body.innerText.slice(0, 200)`)
+);
+
 // ---------------------------------------------------------------- 离线捕获
 console.log("== 离线捕获：断网能记，联网自动补发 ==");
 
@@ -1102,17 +1239,65 @@ await setOffline(true);
 // navigator.onLine 还是 true，笔记会被直接发出去而不是入队。
 await waitFor(s, `navigator.onLine === false`, "浏览器报告已离线", 10000);
 
+// **回到时间线视图**。上一段结束时停在某个频道里，而在频道里发出的记录
+// 同样会入队，但断言里"这两条没到服务端"会变得含糊（时间线上的其它记录
+// 也在页面上）。回到时间线让这一段的判据干净。
+await evaluate(
+  s,
+  `(() => {
+    // 时间线那个按钮的类名是 nav-item，频道/标签才是 nav-main。
+    // 用错选择器的话这个点击是空操作 —— 而症状要到几条之后才显现。
+    const b = [...document.querySelectorAll('.nav-item')]
+      .find(x => x.textContent.includes('时间线'));
+    if (b) b.click();
+    return true;
+  })()`
+);
+await sleep(1000);
+
 for (const m of flakeMarker) {
   await fill(s, ".composer-input", m);
   await pressEnter(s, ".composer-input");
+  // 每条发完等一下：连续两次 fill+Enter 之间输入框可能还没回到可写状态，
+  // 第二条就会丢（表现是队列里只有 1 条，而断言查的是 2）。
+  await sleep(600);
 }
-// 两条都要在队列里，别只等到一条就开始下一步
-await waitFor(
-  s,
-  `!!document.querySelector('.offline-pill') &&
-     document.querySelector('.offline-pill').innerText.includes('${flakeMarker.length}')`,
-  `两条离线记录入队（${flakeMarker.length}）`,
-  15000
+/**
+ * 直接读 IndexedDB 里的队列长度。
+ *
+ * **刻意不读界面上那个 pill。** pill 的数字来自 React state，而入队是异步的
+ *（`enqueue` 完才 `setQueued`）—— 用它当判据就是把一条数据层的断言绑在一次
+ * UI 更新的时机上，偶发假红，而假红比没有断言更糟。
+ *
+ * 这里要验的是「这两条**确实躺在队列里**」，那就直接问队列本身。
+ * 用户有没有被告知是另一件事，「离线捕获」那一段已经在验了。
+ */
+const outboxCount = () =>
+  evaluate(
+    s,
+    `new Promise((res) => {
+       const r = indexedDB.open('messagenote', 1);
+       r.onerror = () => res(-1);
+       r.onsuccess = () => {
+         const db = r.result;
+         if (!db.objectStoreNames.contains('outbox')) { db.close(); return res(0); }
+         const tx = db.transaction('outbox', 'readonly');
+         const c = tx.objectStore('outbox').count();
+         c.onsuccess = () => { db.close(); res(c.result); };
+         c.onerror = () => { db.close(); res(-1); };
+       };
+     })`
+  );
+
+const deadline = Date.now() + 15000;
+while (Date.now() < deadline && (await outboxCount()) < flakeMarker.length) {
+  await sleep(200);
+}
+const queuedCount = await outboxCount();
+ok(
+  `${flakeMarker.length} 条离线记录都进了队列`,
+  queuedCount === flakeMarker.length,
+  `队列里只有 ${queuedCount} 条`
 );
 
 // 在线，但接口打不通
@@ -1126,12 +1311,8 @@ await sleep(4000);
 // 修复前这里会是 0 —— 包装层重新入队、重放层紧接着删掉，净效果是消失。
 ok(
   "重放途中请求失败，两条记录仍然留在队列里（没有被假回执吞掉）",
-  (await evaluate(s, `document.querySelector('.offline-pill')?.innerText ?? ''`)).includes(
-    `${flakeMarker.length}`
-  ),
-  `队列提示：${JSON.stringify(
-    await evaluate(s, `document.querySelector('.offline-pill')?.innerText ?? '（没有提示）'`)
-  )}`
+  (await outboxCount()) === flakeMarker.length,
+  `队列里只剩 ${await outboxCount()} 条`
 );
 ok(
   "它们也确实没到服务端（所以队列留着是对的，不是重复）",
@@ -1142,6 +1323,31 @@ ok(
 await s.send("Network.setBlockedURLs", { urls: [] });
 await evaluate(s, `window.dispatchEvent(new Event('online')); true`);
 
+// **等两条都离开队列**。判据看队列而不是界面：补发成功了但当前视图
+// 看不到它们（比如还在某个频道里），那是视图的事，不是"没发出去"。
+const untilDrained = Date.now() + 15000;
+let left = -1;
+while (Date.now() < untilDrained) {
+  left = await outboxCount();
+  if (left === 0) break;
+  await sleep(200);
+}
+ok(
+  "通了之后队列自己排空了（重放成功）",
+  left === 0,
+  `队列里还剩 ${left} 条`
+);
+
+// 回到时间线确认它们真的落在库里了
+await evaluate(
+  s,
+  `(() => {
+    const b = [...document.querySelectorAll('.nav-item')]
+      .find(x => x.textContent.includes('时间线'));
+    if (b) b.click();
+    return true;
+  })()`
+);
 await waitFor(
   s,
   `${JSON.stringify(flakeMarker[0])} &&
@@ -1174,9 +1380,79 @@ await waitFor(
 );
 ok("Service Worker 已经接管页面", await evaluate(s, `!!navigator.serviceWorker.controller`));
 
+// **缓存里到底有什么。** 上面那条断言（离线刷新能拉起来）在壳没被缓存住时
+// 只会报「ERR_INTERNET_DISCONNECTED」—— 而原因可能是预缓存整个失败了、
+// 也可能只是少了某个资源。把缓存内容打出来，才能一眼看出是哪一种。
+{
+  const cached = await evaluate(
+    s,
+    `caches.keys().then(async (keys) => {
+       const out = {};
+       for (const k of keys) {
+         const c = await caches.open(k);
+         out[k] = (await c.keys()).map(r => new URL(r.url).pathname);
+       }
+       const regs = await navigator.serviceWorker.getRegistrations();
+       return { caches: out, sw: regs.map(r => ({
+         scope: r.scope,
+         active: r.active && r.active.scriptURL,
+         state: r.active && r.active.state,
+       })) };
+     })`
+  );
+  console.log("（诊断）" + JSON.stringify(cached, null, 1));
+  ok(
+    "Service Worker 预缓存里有网页端的壳和资源",
+    Object.values(cached.caches).some(
+      (paths) => paths.includes("/web.html") && paths.some((p) => p.startsWith("/assets/"))
+    ),
+    `缓存内容：${JSON.stringify(cached)}`
+  );
+}
+
 await setOffline(true);
-await s.send("Page.reload", { ignoreCache: true });
+// **等浏览器真的报离线再刷新。** CDP 的 emulateNetworkConditions 是异步
+// 生效的，抢跑的话这一刷还是在线的，于是「离线刷新」其实测的是在线刷新。
+await waitFor(s, `navigator.onLine === false`, "浏览器报告已离线", 10000);
+
+// 记下这一刷里的网络事件：SW 有没有接管导航、导航拿到的是什么。
+const navEvents = [];
+const onRequest = (e) =>
+  navEvents.push({ kind: "request", url: e.request.url, fromSW: !!e.request.fromServiceWorker });
+const onResponse = (e) =>
+  navEvents.push({
+    kind: "response",
+    url: e.response.url,
+    status: e.response.status,
+    fromSW: e.response.fromServiceWorker,
+  });
+const onFailed = (e) =>
+  navEvents.push({ kind: "failed", url: e.request.url, error: e.errorText });
+const onLoadingFailed = (e) =>
+  navEvents.push({ kind: "loadingFailed", url: e.request?.url ?? "?", error: e.errorText });
+
+await s.send("Network.enable");
+await s.on("Network.requestWillBeSent", onRequest);
+await s.on("Network.responseReceived", onResponse);
+await s.on("Network.loadingFailed", onFailed);
+await s.on("Network.requestServedFromCache", onLoadingFailed);
+
+// **不要用 `ignoreCache: true`。** 那是浏览器的硬刷新，而硬刷新**按设计
+// 绕过 Service Worker** —— 所以这一刷里 SW 一次都没接管（诊断能看到导航请求
+// `fromServiceWorker: false`），页面当然拿不到缓存，然后报 ERR_INTERNET_DISCONNECTED。
+//
+// 这个坑值得写在这里：症状是「离线壳不工作」，指向 sw.js，而真实原因是
+// 测试自己用了一个绕过 SW 的刷新方式。用户真实的断网打开走的是普通导航，
+// 那是 SW 接管的路径 —— 所以这里也用普通导航。
+await s.send("Page.reload", { ignoreCache: false });
 await sleep(2500);
+
+await s.off("Network.requestWillBeSent", onRequest);
+await s.off("Network.responseReceived", onResponse);
+await s.off("Network.loadingFailed", onFailed);
+await s.off("Network.requestServedFromCache", onLoadingFailed);
+
+
 
 // **这是关键**：没有 Service Worker 的话，离线刷新会得到浏览器的网络错误页，
 // 里面不可能有 .app。所以这一条真真切切在验"壳被缓存下来了"。
