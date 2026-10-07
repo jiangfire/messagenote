@@ -186,7 +186,9 @@ fn call(cfg: &LlmConfig, body: &str) -> AppResult<String> {
         // **401/403 要说人话。** "模型地址不对"和"key 不对"是两件完全不同的事，
         // 而裸状态码分不出"没填 key"和"key 填错了"。
         return Err(AppError::Msg(match code {
-            401 | 403 => "模型拒绝了这个请求 —— 多半是 API key 不对，或没填（本地模型可以不填）".into(),
+            401 | 403 => {
+                "模型拒绝了这个请求 —— 多半是 API key 不对，或没填（本地模型可以不填）".into()
+            }
             404 => "这个地址下没有 /chat/completions —— 检查地址末尾是不是已经带了 /v1".into(),
             429 => "模型端点限流了，过一会儿再试".into(),
             _ if text.trim().is_empty() => format!("模型返回 HTTP {code}"),
@@ -194,8 +196,12 @@ fn call(cfg: &LlmConfig, body: &str) -> AppResult<String> {
         }));
     }
 
-    let v: serde_json::Value = serde_json::from_str(&text)
-        .map_err(|e| AppError::Msg(format!("模型的回答不是 JSON：{e}（原文开头：{}）", head(&text))))?;
+    let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
+        AppError::Msg(format!(
+            "模型的回答不是 JSON：{e}（原文开头：{}）",
+            head(&text)
+        ))
+    })?;
 
     Ok(v["choices"][0]["message"]["content"]
         .as_str()

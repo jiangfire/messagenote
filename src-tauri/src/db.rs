@@ -429,7 +429,11 @@ pub fn get_llm_config(conn: &Connection) -> AppResult<crate::llm::LlmConfig> {
 /// 它**不进变更日志**（`clock::set` 走的是 `meta` 表，不是 `change`），
 /// 所以另一台设备不会突然冒出一个指向本机 key 的配置。
 pub fn set_llm_config(conn: &Connection, cfg: &crate::llm::LlmConfig) -> AppResult<()> {
-    clock::set(conn, LLM_BASE_KEY, cfg.base_url.trim().trim_end_matches('/'))?;
+    clock::set(
+        conn,
+        LLM_BASE_KEY,
+        cfg.base_url.trim().trim_end_matches('/'),
+    )?;
     clock::set(conn, LLM_KEY_KEY, cfg.api_key.trim())?;
     clock::set(conn, LLM_MODEL_KEY, cfg.model.trim())?;
     Ok(())
@@ -929,7 +933,7 @@ mod tests {
         .expect("读取 HLC")
     }
 
-/// **迁移中途失败必须整个回滚，不能留下半迁移的库。**
+    /// **迁移中途失败必须整个回滚，不能留下半迁移的库。**
     ///
     /// 这是"应用变砖"那条路径的根因。原来 `execute_batch` 逐语句自动提交：
     /// V1/V3 是 `CREATE ... IF NOT EXISTS`（幂等）所以看不出问题，但 **V2 里的
@@ -964,15 +968,17 @@ mod tests {
         {
             let conn = Connection::open(&path).unwrap();
             conn.execute_batch(SCHEMA_V1).unwrap();
-            conn.execute_batch(&format!("PRAGMA user_version = 1;")).unwrap();
+            conn.execute_batch("PRAGMA user_version = 1;").unwrap();
         }
 
         // ---- 让 V2 必然失败：在 message 表上先占一个同名列 ----
         // （V2 就是给 message 加列，所以预先加上它，那句 ADD COLUMN 会撞名）
         {
             let conn = Connection::open(&path).unwrap();
-            conn.execute_batch("ALTER TABLE message ADD COLUMN hlc_wall INTEGER NOT NULL DEFAULT 0;")
-                .unwrap();
+            conn.execute_batch(
+                "ALTER TABLE message ADD COLUMN hlc_wall INTEGER NOT NULL DEFAULT 0;",
+            )
+            .unwrap();
         }
 
         let conn = Connection::open(&path).unwrap();
@@ -1046,7 +1052,7 @@ mod tests {
         {
             let conn = Connection::open(&path).unwrap();
             conn.execute_batch(SCHEMA_V1).unwrap();
-            conn.execute_batch(&format!("PRAGMA user_version = 1;")).unwrap();
+            conn.execute_batch("PRAGMA user_version = 1;").unwrap();
         }
 
         {

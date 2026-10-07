@@ -34,8 +34,8 @@
 use std::io::{Cursor, Write};
 use std::sync::Mutex;
 
-use messagenote_core::export::{self, ExportItem};
 use messagenote_core::attachment;
+use messagenote_core::export::{self, ExportItem};
 use zip::write::SimpleFileOptions;
 
 use crate::error::{ServerError, ServerResult};

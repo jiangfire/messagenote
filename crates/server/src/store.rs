@@ -1820,11 +1820,7 @@ fn decode<T: serde::de::DeserializeOwned>(c: &Change) -> ServerResult<T> {
         // 删掉的行不必带内容（见 `wire::Change`）。所以只有**非墓碑**
         // 缺 data 才是对方发错了。
         if c.deleted {
-            ServerError::bad_request(format!(
-                "墓碑变更不该带 data：{} {}",
-                c.kind.as_str(),
-                c.id
-            ))
+            ServerError::bad_request(format!("墓碑变更不该带 data：{} {}", c.kind.as_str(), c.id))
         } else {
             ServerError::bad_request(format!("变更缺少 data：{} {}", c.kind.as_str(), c.id))
         }

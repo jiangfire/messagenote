@@ -210,7 +210,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 ///
 /// 网页端把它写进 localStorage —— 见 `store::session_is_valid` 的说明：
 /// 服务端在滑动续期，但客户端只看自己存的那个值，于是**活跃用户每 7 天
-/// 仍��被踢回登录页**，而且很可能正在写到一半。
+/// 仍会被踢回登录页**，而且很可能正在写到一半。
 const HEADER_SESSION_EXPIRES: &str = "X-Session-Expires";
 
 /// 鉴权：**长期令牌**（桌面端的同步客户端）或**短期会话**（网页端）都放行。
@@ -405,8 +405,7 @@ fn cursor_of(q: &TimelineQuery) -> ServerResult<Option<Cursor>> {
         })),
         (None, None) => Ok(None),
         _ => Err(ServerError::BadRequest(
-            "beforeCreatedAt 和 beforeId 必须成对给出：只给一个会让往前翻漏掉记录"
-                .into(),
+            "beforeCreatedAt 和 beforeId 必须成对给出：只给一个会让往前翻漏掉记录".into(),
         )),
     }
 }

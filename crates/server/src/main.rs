@@ -76,8 +76,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             #[cfg(unix)]
             let terminate = async {
-                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                {
+                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
                     Ok(mut s) => {
                         s.recv().await;
                     }

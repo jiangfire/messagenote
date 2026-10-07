@@ -15,15 +15,15 @@ use std::sync::Arc;
 
 use rusqlite::Connection;
 
+use messagenote_core::attachment;
 use messagenote_core::hlc::Hlc;
 use messagenote_core::models::SearchHit;
-use messagenote_core::attachment;
 use messagenote_core::wire::{Change, EntityKind};
-use messagenote_store::blob as store_blob;
 use messagenote_lib::db::{self, Db};
 use messagenote_lib::http::HttpServerApi;
 use messagenote_lib::sync::{sync_once, ServerApi};
 use messagenote_server::{AppState, Store};
+use messagenote_store::blob as store_blob;
 
 const TOKEN: &str = "e2e-test-token-0123456789abcdefghijklmnop";
 
@@ -733,7 +733,12 @@ fn fetch_export(
 fn the_web_export_returns_a_zip_that_contains_the_notes_and_their_images() {
     let addr = start_server();
 
-    let ch = write_req(addr, "POST", "/api/channel", Some(&serde_json::json!({ "name": "项目A" })));
+    let ch = write_req(
+        addr,
+        "POST",
+        "/api/channel",
+        Some(&serde_json::json!({ "name": "项目A" })),
+    );
     let ch_id = ch["id"].as_str().unwrap().to_string();
 
     let sha = export_upload_blob(addr, &export_png());
@@ -767,17 +772,35 @@ fn the_web_export_returns_a_zip_that_contains_the_notes_and_their_images() {
         "必须告诉浏览器这是下载：{:?}",
         headers.get("content-disposition")
     );
-    assert_eq!(headers.get("x-export-messages").map(String::as_str), Some("2"));
-    assert_eq!(headers.get("x-export-attachments").map(String::as_str), Some("1"));
-    assert_eq!(headers.get("x-export-missing-attachments").map(String::as_str), Some("0"));
+    assert_eq!(
+        headers.get("x-export-messages").map(String::as_str),
+        Some("2")
+    );
+    assert_eq!(
+        headers.get("x-export-attachments").map(String::as_str),
+        Some("1")
+    );
+    assert_eq!(
+        headers
+            .get("x-export-missing-attachments")
+            .map(String::as_str),
+        Some("0")
+    );
 
     let files = unzip(&body);
 
     // 两条记录：一个频道目录 + 一个收件箱目录
-    let mut md_paths: Vec<String> = files.keys().filter(|k| k.ends_with(".md")).cloned().collect();
+    let mut md_paths: Vec<String> = files
+        .keys()
+        .filter(|k| k.ends_with(".md"))
+        .cloned()
+        .collect();
     md_paths.sort();
     assert_eq!(md_paths.len(), 2, "应当正好两条：{md_paths:?}");
-    assert!(md_paths.iter().any(|p| p.starts_with("项目A/")), "{md_paths:?}");
+    assert!(
+        md_paths.iter().any(|p| p.starts_with("项目A/")),
+        "{md_paths:?}"
+    );
 
     // 附件条目的路径，**就是正文里引用的那个相对路径去掉 `../`**
     let att_path = format!("attachments/{sha}.png");
@@ -814,13 +837,33 @@ fn the_web_export_refuses_an_unauthenticated_caller() {
 fn the_web_export_honours_the_channel_filter() {
     let addr = start_server();
 
-    let keep = write_req(addr, "POST", "/api/channel", Some(&serde_json::json!({ "name": "要导的" })));
+    let keep = write_req(
+        addr,
+        "POST",
+        "/api/channel",
+        Some(&serde_json::json!({ "name": "要导的" })),
+    );
     let keep_id = keep["id"].as_str().unwrap().to_string();
-    let drop = write_req(addr, "POST", "/api/channel", Some(&serde_json::json!({ "name": "不要导的" })));
+    let drop = write_req(
+        addr,
+        "POST",
+        "/api/channel",
+        Some(&serde_json::json!({ "name": "不要导的" })),
+    );
     let drop_id = drop["id"].as_str().unwrap().to_string();
 
-    write_req(addr, "POST", "/api/message", Some(&serde_json::json!({ "body": "该在里面", "channelId": keep_id })));
-    write_req(addr, "POST", "/api/message", Some(&serde_json::json!({ "body": "不该在里面", "channelId": drop_id })));
+    write_req(
+        addr,
+        "POST",
+        "/api/message",
+        Some(&serde_json::json!({ "body": "该在里面", "channelId": keep_id })),
+    );
+    write_req(
+        addr,
+        "POST",
+        "/api/message",
+        Some(&serde_json::json!({ "body": "不该在里面", "channelId": drop_id })),
+    );
 
     let (code, headers, body) = fetch_export(
         addr,
@@ -828,12 +871,22 @@ fn the_web_export_honours_the_channel_filter() {
         Some(TOKEN),
     );
     assert_eq!(code, 200);
-    assert_eq!(headers.get("x-export-messages").map(String::as_str), Some("1"));
+    assert_eq!(
+        headers.get("x-export-messages").map(String::as_str),
+        Some("1")
+    );
 
     let files = unzip(&body);
-    let md_paths: Vec<String> = files.keys().filter(|k| k.ends_with(".md")).cloned().collect();
+    let md_paths: Vec<String> = files
+        .keys()
+        .filter(|k| k.ends_with(".md"))
+        .cloned()
+        .collect();
     assert_eq!(md_paths.len(), 1, "只该导一条：{md_paths:?}");
-    assert!(md_paths[0].starts_with("要导的/"), "实际导出了：{md_paths:?}");
+    assert!(
+        md_paths[0].starts_with("要导的/"),
+        "实际导出了：{md_paths:?}"
+    );
 }
 
 /// 空库也要给出一个**合法的空 zip**，而不是 404 或一句错误。
@@ -845,7 +898,10 @@ fn an_empty_export_is_a_valid_empty_zip() {
     let addr = start_server();
     let (code, headers, body) = fetch_export(addr, "?utcOffsetMinutes=0", Some(TOKEN));
     assert_eq!(code, 200);
-    assert_eq!(headers.get("x-export-messages").map(String::as_str), Some("0"));
+    assert_eq!(
+        headers.get("x-export-messages").map(String::as_str),
+        Some("0")
+    );
     assert!(unzip(&body).is_empty(), "应当是一个没有条目的 zip");
 }
 
@@ -1114,99 +1170,99 @@ fn logging_out_revokes_the_session_immediately() {
 /// 这条测试是为了防止"加了会话之后顺手把长期令牌那条路删掉"。
 #[test]
 /// **滑动续期必须让客户端看见。**
-    ///
-    /// 服务端把 `expires_at` 往前推这件事，原来**只写库、不回传**，
-    /// 而网页端把它存在 localStorage 里当唯一的过期判据。于是：
-    ///
-    ///   服务端还在续期，会话还活着
-    ///     → 客户端 localStorage 里的值停在登录那一刻
-    ///     → 每次重新打开页面都拿那个旧值判一次
-    ///     → 第 7 天被踢回登录页，很可能正在写到一半
-    ///
-    /// 服务端注释写的目标（"一个每天都在用的人不该被踢"）因此压根没实现，
-    /// 而且失败是**静默**的：用户只是莫名其妙又登录了一次，没有任何报错。
-    ///
-    /// 所以要钉住两件事：续期**发生了**（库里的值被推满），
-    /// 以及客户端**看得见**（响应里有新时刻）。
-    fn a_renewed_session_reports_its_new_expiry_to_the_client() {
-        let (addr, state) = start_server_with_state();
+///
+/// 服务端把 `expires_at` 往前推这件事，原来**只写库、不回传**，
+/// 而网页端把它存在 localStorage 里当唯一的过期判据。于是：
+///
+///   服务端还在续期，会话还活着
+///     → 客户端 localStorage 里的值停在登录那一刻
+///     → 每次重新打开页面都拿那个旧值判一次
+///     → 第 7 天被踢回登录页，很可能正在写到一半
+///
+/// 服务端注释写的目标（"一个每天都在用的人不该被踢"）因此压根没实现，
+/// 而且失败是**静默**的：用户只是莫名其妙又登录了一次，没有任何报错。
+///
+/// 所以要钉住两件事：续期**发生了**（库里的值被推满），
+/// 以及客户端**看得见**（响应里有新时刻）。
+fn a_renewed_session_reports_its_new_expiry_to_the_client() {
+    let (addr, state) = start_server_with_state();
 
-        let (_, body) = login(addr, TOKEN);
-        let session = body["session"].as_str().unwrap().to_string();
-        let original = body["expiresAt"].as_i64().expect("登录响应带 expiresAt");
+    let (_, body) = login(addr, TOKEN);
+    let session = body["session"].as_str().unwrap().to_string();
+    let original = body["expiresAt"].as_i64().expect("登录响应带 expiresAt");
 
-        // ---- 刚登录：带回来的就是登录时的那个时刻（客户端已经知道它） ----
-        // 这个头**每次会话请求都带**，而不只是续期时：它是「你现在这个会话
-        // 什么时候过期」的权威答案。客户端只在值真的变了才写 localStorage，
-        // 所以多这一个头不产生多余的存储写入。
-        let fresh = session_header(addr, &session).expect("会话请求必须带 X-Session-Expires");
-        assert_eq!(
-            fresh, original,
-            "刚登录时带回来的应当就是登录响应里那个时刻"
-        );
+    // ---- 刚登录：带回来的就是登录时的那个时刻（客户端已经知道它） ----
+    // 这个头**每次会话请求都带**，而不只是续期时：它是「你现在这个会话
+    // 什么时候过期」的权威答案。客户端只在值真的变了才写 localStorage，
+    // 所以多这一个头不产生多余的存储写入。
+    let fresh = session_header(addr, &session).expect("会话请求必须带 X-Session-Expires");
+    assert_eq!(
+        fresh, original,
+        "刚登录时带回来的应当就是登录响应里那个时刻"
+    );
 
-        // ---- 把到期时间改成"只剩一点点"，逼出续期 ----
-        let nearly_expired = messagenote_core::now_ms() + 60_000;
-        state
-            .store
-            .set_session_expiry(&session, nearly_expired)
-            .expect("改到期时间");
+    // ---- 把到期时间改成"只剩一点点"，逼出续期 ----
+    let nearly_expired = messagenote_core::now_ms() + 60_000;
+    state
+        .store
+        .set_session_expiry(&session, nearly_expired)
+        .expect("改到期时间");
 
-        // ---- 下一个请求就该触发续期，并把它带回来 ----
-        let renewed = session_header(addr, &session).expect(
-            "寿命不足一半时服务端会续期，而客户端**必须**看得见 —— \
+    // ---- 下一个请求就该触发续期，并把它带回来 ----
+    let renewed = session_header(addr, &session).expect(
+        "寿命不足一半时服务端会续期，而客户端**必须**看得见 —— \
              否则 localStorage 停在登录那一刻，用户第 7 天照样被踢回登录页",
-        );
+    );
 
-        assert!(
-            renewed > original,
-            "带回来的时刻应当晚于登录时的那个（真的续期了），实际 {renewed} vs {original}"
-        );
+    assert!(
+        renewed > original,
+        "带回来的时刻应当晚于登录时的那个（真的续期了），实际 {renewed} vs {original}"
+    );
 
-        // ---- 库里也确实被推满了（不是只在响应里编了一个数） ----
-        let after = state
-            .store
-            .session_is_valid(&session)
-            .expect("查会话")
-            .expect("续期之后当然还有效");
-        assert_eq!(
-            after, renewed,
-            "响应头里的时刻必须就是库里那个 —— 客户端照着它算剩下的寿命"
-        );
-    }
+    // ---- 库里也确实被推满了（不是只在响应里编了一个数） ----
+    let after = state
+        .store
+        .session_is_valid(&session)
+        .expect("查会话")
+        .expect("续期之后当然还有效");
+    assert_eq!(
+        after, renewed,
+        "响应头里的时刻必须就是库里那个 —— 客户端照着它算剩下的寿命"
+    );
+}
 
-    /// 长期令牌**不该**收到这个头。
-    ///
-    /// 它没有过期时间（桌面端自己管令牌），给它一个"过期时刻"只会在客户端
-    /// 那边造成误解 —— 而且桌面端每轮同步都打这些端点，白白多一个头。
-    #[test]
-    fn the_long_lived_token_never_gets_a_session_expiry() {
-        let addr = start_server();
-        assert!(
-            session_header(addr, TOKEN).is_none(),
-            "长期令牌没有会话，不该带 X-Session-Expires"
-        );
-    }
+/// 长期令牌**不该**收到这个头。
+///
+/// 它没有过期时间（桌面端自己管令牌），给它一个"过期时刻"只会在客户端
+/// 那边造成误解 —— 而且桌面端每轮同步都打这些端点，白白多一个头。
+#[test]
+fn the_long_lived_token_never_gets_a_session_expiry() {
+    let addr = start_server();
+    assert!(
+        session_header(addr, TOKEN).is_none(),
+        "长期令牌没有会话，不该带 X-Session-Expires"
+    );
+}
 
-    /// 用给定会话发一个 GET，返回 `X-Session-Expires` 的值（缺席则 None）。
-    fn session_header(addr: SocketAddr, session: &str) -> Option<i64> {
-        ureq::get(&format!("http://{addr}/api/channels"))
-            .header("Authorization", &format!("Bearer {session}"))
-            .call()
-            .expect("请求应当成功")
-            .headers()
-            .get("X-Session-Expires")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse().ok())
-    }
+/// 用给定会话发一个 GET，返回 `X-Session-Expires` 的值（缺席则 None）。
+fn session_header(addr: SocketAddr, session: &str) -> Option<i64> {
+    ureq::get(&format!("http://{addr}/api/channels"))
+        .header("Authorization", &format!("Bearer {session}"))
+        .call()
+        .expect("请求应当成功")
+        .headers()
+        .get("X-Session-Expires")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse().ok())
+}
 
-    /// 长期令牌那条路必须还在。
-    ///
-    /// 引入会话机制之后中间件有两条路，而桌面端同步客户端一直走的是长期令牌
-    /// —— 它不需要登录，把自己的令牌存在自己机器的数据库里。哪天这条路被
-    /// "顺手收掉"，所有桌面端的同步会一起失效。
-    #[test]
-    fn the_long_lived_token_still_works_directly() {
+/// 长期令牌那条路必须还在。
+///
+/// 引入会话机制之后中间件有两条路，而桌面端同步客户端一直走的是长期令牌
+/// —— 它不需要登录，把自己的令牌存在自己机器的数据库里。哪天这条路被
+/// "顺手收掉"，所有桌面端的同步会一起失效。
+#[test]
+fn the_long_lived_token_still_works_directly() {
     let addr = start_server();
 
     for path in ["/api/channels", "/api/timeline/stats", "/api/tags"] {
@@ -1269,97 +1325,97 @@ fn a_rejected_push_surfaces_the_servers_explanation() {
     );
 }
 /// **一批大变更推得上去** —— axum 的默认请求体上限是 2 MB。
-    ///
-    /// 不改的话，一次大批量变更（桌面端 `BATCH` = 400 条）的 JSON 越过 2 MB
-    /// 就 413，而客户端会**原批重试** —— 那台设备的同步从此永久循环在
-    /// 「推 → 413 → 再推」里，再也出不去。
-    ///
-    /// 这条走真实的 `sync_once` 推路径，不手工构造请求 —— 客户端那边看到的
-    /// 就是「服务端一直 413，我永远同步不出去」。
-    #[test]
-    fn a_large_batch_of_changes_survives_the_default_body_limit() {
-        let addr = start_server();
-        let a = db::open_memory("e2e-bigpush-a").expect("建 A 库");
+///
+/// 不改的话，一次大批量变更（桌面端 `BATCH` = 400 条）的 JSON 越过 2 MB
+/// 就 413，而客户端会**原批重试** —— 那台设备的同步从此永久循环在
+/// 「推 → 413 → 再推」里，再也出不去。
+///
+/// 这条走真实的 `sync_once` 推路径，不手工构造请求 —— 客户端那边看到的
+/// 就是「服务端一直 413，我永远同步不出去」。
+#[test]
+fn a_large_batch_of_changes_survives_the_default_body_limit() {
+    let addr = start_server();
+    let a = db::open_memory("e2e-bigpush-a").expect("建 A 库");
 
-        // 本地写满一批长笔记（每条都在正文字符上限之内，合法）
-        // 每条都带「笔记」两个字，好让下面能用检索数出条数
-        {
-            let conn = a.conn().expect("连接");
-            let long = "长".repeat(4 * 1024); // 4K 字符：400 条合计约 5 MB，仍远超 2 MB
-            for i in 0..300 {
-                db::append_message(&conn, &format!("笔记 {i} {long}"), None).unwrap();
-            }
+    // 本地写满一批长笔记（每条都在正文字符上限之内，合法）
+    // 每条都带「笔记」两个字，好让下面能用检索数出条数
+    {
+        let conn = a.conn().expect("连接");
+        let long = "长".repeat(4 * 1024); // 4K 字符：400 条合计约 5 MB，仍远超 2 MB
+        for i in 0..300 {
+            db::append_message(&conn, &format!("笔记 {i} {long}"), None).unwrap();
         }
-
-        // 同步到静止。改动前第一轮就会 413 —— 客户端原批重试，永远出不去。
-        sync_until_quiet(&a, &api(addr));
-
-        // 另一台设备能完整拉到（证明不是「服务端收了但没存」）
-        let b = db::open_memory("e2e-bigpush-b").expect("建 B 库");
-        sync_until_quiet(&b, &api(addr));
-
-        // 数记录条数，不走检索：检索有分词和分页的语义（"长" 这种单字
-        // 命中的是 bigram 那一路），而这里要证明的只是"整批过去了"。
-        let count_messages = |d: &db::Db| -> usize {
-            db::search_page(&d.conn().expect("连接"), "笔记", 500, 0)
-                .expect("检索")
-                .items
-                .len()
-        };
-        let a_n = count_messages(&a);
-        let b_n = count_messages(&b);
-        assert!(
-            a_n > 100,
-            "本机这一批应当有几百条（否则下面全是空跑），实际 {a_n}"
-        );
-        assert_eq!(
-            b_n, a_n,
-            "大批变更没有完整过去：请求体上限把合法的同步挡在门外了"
-        );
     }
 
-    /// **超大正文给的是一句人话，不是含糊的 413。**
-    ///
-    /// 用户看到的必须指向真正的原因（内容太长了），否则他只会觉得
-    /// "服务端坏了"。
-    #[test]
-    fn an_over_long_body_is_refused_with_a_readable_message() {
-        let addr = start_server();
+    // 同步到静止。改动前第一轮就会 413 —— 客户端原批重试，永远出不去。
+    sync_until_quiet(&a, &api(addr));
 
-        // 超过正文字符上限（64K 字符）。用汉字而不是 ASCII 字节 ——
-        // 上限按字符算，所以 100K 个汉字确实越界。
-        let huge = "字".repeat(100 * 1024);
+    // 另一台设备能完整拉到（证明不是「服务端收了但没存」）
+    let b = db::open_memory("e2e-bigpush-b").expect("建 B 库");
+    sync_until_quiet(&b, &api(addr));
 
-        // 超长正文要拿到**状态码和那句解释**：ureq 把 4xx 变成
-        // `Error::StatusCode`，而"为什么被拒"只在响应体里。
-        let huge_body = serde_json::json!({ "body": huge });
-        // **直接拿到响应**，不经过 `Error::StatusCode` 那个丢 body 的通道：
-        // ureq 默认把 4xx 变成一个只带状态码的错误，"为什么被拒"就永远
-        // 看不见了 —— 而这里要断言的恰恰是那句人话。
-        let agent = ureq::Agent::config_builder()
-            .http_status_as_error(false)
-            .build()
-            .new_agent();
+    // 数记录条数，不走检索：检索有分词和分页的语义（"长" 这种单字
+    // 命中的是 bigram 那一路），而这里要证明的只是"整批过去了"。
+    let count_messages = |d: &db::Db| -> usize {
+        db::search_page(&d.conn().expect("连接"), "笔记", 500, 0)
+            .expect("检索")
+            .items
+            .len()
+    };
+    let a_n = count_messages(&a);
+    let b_n = count_messages(&b);
+    assert!(
+        a_n > 100,
+        "本机这一批应当有几百条（否则下面全是空跑），实际 {a_n}"
+    );
+    assert_eq!(
+        b_n, a_n,
+        "大批变更没有完整过去：请求体上限把合法的同步挡在门外了"
+    );
+}
 
-        let resp = agent
-            .post(&format!("http://{addr}/api/message"))
-            .header("Authorization", &format!("Bearer {TOKEN}"))
-            .send_json(&huge_body)
-            .expect("请求本身不该失败（4xx 在这里不是错误）");
+/// **超大正文给的是一句人话，不是含糊的 413。**
+///
+/// 用户看到的必须指向真正的原因（内容太长了），否则他只会觉得
+/// "服务端坏了"。
+#[test]
+fn an_over_long_body_is_refused_with_a_readable_message() {
+    let addr = start_server();
 
-        let code = resp.status().as_u16();
-        assert_eq!(
-            code, 400,
-            "超长正文是「你这条内容不行」，不是「请求太大」—— \
+    // 超过正文字符上限（64K 字符）。用汉字而不是 ASCII 字节 ——
+    // 上限按字符算，所以 100K 个汉字确实越界。
+    let huge = "字".repeat(100 * 1024);
+
+    // 超长正文要拿到**状态码和那句解释**：ureq 把 4xx 变成
+    // `Error::StatusCode`，而"为什么被拒"只在响应体里。
+    let huge_body = serde_json::json!({ "body": huge });
+    // **直接拿到响应**，不经过 `Error::StatusCode` 那个丢 body 的通道：
+    // ureq 默认把 4xx 变成一个只带状态码的错误，"为什么被拒"就永远
+    // 看不见了 —— 而这里要断言的恰恰是那句人话。
+    let agent = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .build()
+        .new_agent();
+
+    let resp = agent
+        .post(&format!("http://{addr}/api/message"))
+        .header("Authorization", &format!("Bearer {TOKEN}"))
+        .send_json(&huge_body)
+        .expect("请求本身不该失败（4xx 在这里不是错误）");
+
+    let code = resp.status().as_u16();
+    assert_eq!(
+        code, 400,
+        "超长正文是「你这条内容不行」，不是「请求太大」—— \
              后者会让用户去查代理配置，而正文超长跟代理毫无关系"
-        );
+    );
 
-        let detail = resp.into_body().read_to_string().unwrap_or_default();
-        assert!(
-            detail.contains("太长"),
-            "错误文案要指向真正的原因（内容太长），实际是：{detail}"
-        );
-    }
+    let detail = resp.into_body().read_to_string().unwrap_or_default();
+    assert!(
+        detail.contains("太长"),
+        "错误文案要指向真正的原因（内容太长），实际是：{detail}"
+    );
+}
 
 // ---------------------------------------------------------------- 附件
 
@@ -1553,9 +1609,7 @@ fn putting_bytes_onto_a_placeholder_fills_it_instead_of_dropping_them() {
 
     // 占位状态下确实没有字节
     assert!(
-        store_blob::get_blob(&conn, &sha)
-            .expect("读附件")
-            .is_none(),
+        store_blob::get_blob(&conn, &sha).expect("读附件").is_none(),
         "登记完就该是空的 —— 它只是个占位"
     );
 

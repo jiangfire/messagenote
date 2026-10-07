@@ -81,7 +81,9 @@ pub fn note_warning(message: &str) {
 fn append_capped(path: &std::path::Path, line: String) -> std::io::Result<()> {
     use std::io::Write;
 
-    let too_big = std::fs::metadata(path).map(|m| m.len() > WARNING_LOG_CAP).unwrap_or(false);
+    let too_big = std::fs::metadata(path)
+        .map(|m| m.len() > WARNING_LOG_CAP)
+        .unwrap_or(false);
     if too_big {
         // 只保留最后 200 行：真跑到 64 KB 说明有东西在疯狂刷屏，
         // 再多对排查也没有帮助，而把整个文件留在那儿只会越来越难翻。
@@ -95,7 +97,10 @@ fn append_capped(path: &std::path::Path, line: String) -> std::io::Result<()> {
         }
     }
 
-    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
     f.write_all(line.as_bytes())
 }
 

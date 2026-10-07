@@ -264,10 +264,7 @@ pub fn list_tag_suggestions(
 /// - `truncated` —— 正文太长被截过。**必须让用户知道**，否则他会以为 AI 读的是
 ///   他写的全部。
 #[tauri::command(async)]
-pub fn suggest_tags(
-    db: State<'_, Db>,
-    message_id: String,
-) -> AppResult<SuggestResult> {
+pub fn suggest_tags(db: State<'_, Db>, message_id: String) -> AppResult<SuggestResult> {
     let (cfg, body) = {
         let conn = db.conn()?;
         let cfg = db::get_llm_config(&conn)?;
@@ -277,10 +274,7 @@ pub fn suggest_tags(
 
     let (tags, truncated) = crate::llm::suggest_tags(&cfg, &body)?;
     if tags.is_empty() {
-        return Ok(SuggestResult {
-            tags,
-            truncated,
-        });
+        return Ok(SuggestResult { tags, truncated });
     }
 
     let conn = db.conn()?;
@@ -309,11 +303,7 @@ pub fn suggest_tags(
 /// 两件事在**同一个事务**里做完，是因为中间断掉会留下一条"已采纳但没标签"
 /// 的建议 —— 用户再点一次只会得到"已经用过了"，而标签并没有加上。
 #[tauri::command(async)]
-pub fn accept_tag_suggestion(
-    db: State<'_, Db>,
-    message_id: String,
-    name: String,
-) -> AppResult<()> {
+pub fn accept_tag_suggestion(db: State<'_, Db>, message_id: String, name: String) -> AppResult<()> {
     let conn = db.conn()?;
     let now = messagenote_core::hlc::now_ms();
 

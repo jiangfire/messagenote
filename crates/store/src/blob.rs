@@ -107,7 +107,8 @@ pub fn register_placeholder(
              bytes = excluded.bytes,
              size  = excluded.size,
              mime  = excluded.mime
-         WHERE attachment.bytes IS NULL",        params![sha256, created_at],
+         WHERE attachment.bytes IS NULL",
+        params![sha256, created_at],
     )?;
     Ok(())
 }

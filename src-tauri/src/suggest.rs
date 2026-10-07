@@ -161,7 +161,10 @@ pub fn parse_tags(answer: &str) -> Vec<String> {
         let trimmed = line.trim();
         let is_item = trimmed.starts_with(['-', '*', '\u{2022}']) || trimmed.starts_with('#');
         let line = trimmed.trim_start_matches(['-', '*', '\u{2022}']);
-        let line = line.trim().trim_start_matches('`').trim_start_matches("json");
+        let line = line
+            .trim()
+            .trim_start_matches('`')
+            .trim_start_matches("json");
         let line = line.trim();
         // 行首的键：`{"tags": [...]} / {"tags": [...]}` → `[...]`
         let body = match line.find(':') {
@@ -196,7 +199,7 @@ mod tests {
     // 一条记录 + 它的连接守卫。
     fn fresh() -> (crate::db::Db, String) {
         let d = db::open_memory("suggest-test").unwrap();
-        let m = db::append_message(&*d.conn().unwrap(), "今天开了个项目会", None).unwrap();
+        let m = db::append_message(&d.conn().unwrap(), "今天开了个项目会", None).unwrap();
         (d, m.id)
     }
 
@@ -204,11 +207,11 @@ mod tests {
     fn a_suggestion_is_stored_and_shown_as_pending() {
         let (d, id) = fresh();
         let c = d.conn().unwrap();
-        let added = put_suggestions(&*c, &id, &["项目".into(), "会议".into()], "gpt-x", 100)
-            .unwrap();
+        let added =
+            put_suggestions(&c, &id, &["项目".into(), "会议".into()], "gpt-x", 100).unwrap();
         assert_eq!(added, 2);
 
-        let open = open_suggestions(&*c, &id).unwrap();
+        let open = open_suggestions(&c, &id).unwrap();
         assert_eq!(open.len(), 2);
         assert_eq!(open[0].model, "gpt-x");
     }
@@ -219,7 +222,7 @@ mod tests {
         let (d, id) = fresh();
         {
             let c = d.conn().unwrap();
-            put_suggestions(&*c, &id, &["项目".into()], "m", 1).unwrap();
+            put_suggestions(&c, &id, &["项目".into()], "m", 1).unwrap();
         }
         let c = d.conn().unwrap();
         let n: i64 = c
@@ -237,24 +240,23 @@ mod tests {
     fn running_the_suggestion_twice_does_not_duplicate_it() {
         let (d, id) = fresh();
         let c = d.conn().unwrap();
-        let first = put_suggestions(&*c, &id, &["项目".into(), "会议".into()], "m", 100).unwrap();
-        let second = put_suggestions(&*c, &id, &["项目".into(), "会议".into()], "m", 200)
-            .unwrap();
+        let first = put_suggestions(&c, &id, &["项目".into(), "会议".into()], "m", 100).unwrap();
+        let second = put_suggestions(&c, &id, &["项目".into(), "会议".into()], "m", 200).unwrap();
         assert_eq!(first, 2);
         assert_eq!(second, 0, "第二次不该新增任何一条");
-        assert_eq!(open_suggestions(&*c, &id).unwrap().len(), 2);
+        assert_eq!(open_suggestions(&c, &id).unwrap().len(), 2);
         // 时间戳也不该被刷新：用户看到的那条建议必须是原来那条
-        assert_eq!(open_suggestions(&*c, &id).unwrap()[0].created_at, 100);
+        assert_eq!(open_suggestions(&c, &id).unwrap()[0].created_at, 100);
     }
 
     #[test]
     fn an_accepted_suggestion_stops_showing_as_pending() {
         let (d, id) = fresh();
         let c = d.conn().unwrap();
-        put_suggestions(&*c, &id, &["项目".into()], "m", 1).unwrap();
+        put_suggestions(&c, &id, &["项目".into()], "m", 1).unwrap();
 
-        assert!(accept_suggestion(&*c, &id, "项目", 2).unwrap());
-        assert!(open_suggestions(&*c, &id).unwrap().is_empty());
+        assert!(accept_suggestion(&c, &id, "项目", 2).unwrap());
+        assert!(open_suggestions(&c, &id).unwrap().is_empty());
         let total: i64 = c
             .query_row(
                 "SELECT COUNT(*) FROM tag_suggestion WHERE message_id = ?1",
@@ -266,7 +268,7 @@ mod tests {
 
         // 再点一次要说"已经用过了"，而不是静默成功
         assert!(
-            !accept_suggestion(&*c, &id, "项目", 3).unwrap(),
+            !accept_suggestion(&c, &id, "项目", 3).unwrap(),
             "重复采纳必须返回 false，界面据此说'已经用过了'"
         );
     }
@@ -275,18 +277,20 @@ mod tests {
     fn accepting_something_that_was_never_suggested_fails_loudly() {
         let (d, id) = fresh();
         let c = d.conn().unwrap();
-        assert!(!accept_suggestion(&*c, &id, "凭空来的", 1).unwrap());
+        assert!(!accept_suggestion(&c, &id, "凭空来的", 1).unwrap());
     }
 
     #[test]
     fn suggestions_are_scoped_to_one_message() {
         let (d, a) = fresh();
-        let b = db::append_message(&*d.conn().unwrap(), "另一条", None).unwrap().id;
+        let b = db::append_message(&d.conn().unwrap(), "另一条", None)
+            .unwrap()
+            .id;
         let c = d.conn().unwrap();
-        put_suggestions(&*c, &a, &["甲".into()], "m", 1).unwrap();
-        put_suggestions(&*c, &b, &["乙".into()], "m", 1).unwrap();
-        assert_eq!(open_suggestions(&*c, &a).unwrap()[0].name, "甲");
-        assert_eq!(open_suggestions(&*c, &b).unwrap()[0].name, "乙");
+        put_suggestions(&c, &a, &["甲".into()], "m", 1).unwrap();
+        put_suggestions(&c, &b, &["乙".into()], "m", 1).unwrap();
+        assert_eq!(open_suggestions(&c, &a).unwrap()[0].name, "甲");
+        assert_eq!(open_suggestions(&c, &b).unwrap()[0].name, "乙");
     }
 
     // ------------------------------------------------------------ 解析
@@ -319,7 +323,10 @@ mod tests {
 
     #[test]
     fn duplicates_are_collapsed() {
-        assert_eq!(parse_tags(r#"["项目", "项目", "会议"]"#), vec!["项目", "会议"]);
+        assert_eq!(
+            parse_tags(r#"["项目", "项目", "会议"]"#),
+            vec!["项目", "会议"]
+        );
     }
 
     #[test]
@@ -359,7 +366,7 @@ mod tests {
         //  · 控制字符要放在**中间**。`piece.trim()` 会剥掉首尾的控制字符
         //    （前导 ESC 会被削成 "31mred"），那是既有行为、且削出来的串
         //    本身无害 —— 有害的是**嵌在标签内部**的那种。
-        let answer = format!("[\"a\0b\", \"red\u{1b}esc\", \"正常标签\"]");
+        let answer = "[\"a\0b\", \"red\u{1b}esc\", \"正常标签\"]".to_string();
         assert_eq!(parse_tags(&answer), vec!["正常标签"]);
     }
 }

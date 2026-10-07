@@ -410,7 +410,7 @@ pub fn build_tree(
     let mut referenced: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     for item in items {
-        for sha in attachment::referenced_shas(&item.body) {
+        for sha in attachment::referenced_shas(item.body) {
             if seen.insert(sha.clone()) {
                 referenced.push(sha);
             }
@@ -450,9 +450,7 @@ pub fn build_tree(
         let name = unique_name(&mut used, &dir_name, &base);
         messages.push(ExportedMessage {
             path: format!("{dir_name}/{name}"),
-            markdown: render_markdown(item, utc_offset_minutes, |sha| {
-                paths.get(sha).cloned()
-            }),
+            markdown: render_markdown(item, utc_offset_minutes, |sha| paths.get(sha).cloned()),
         });
     }
 
@@ -713,8 +711,7 @@ mod tests {
         assert_eq!(tree.messages.len(), 3);
         assert_eq!(tree.channels, 2);
         assert_eq!(
-            tree.messages[0].path,
-            "项目A/1970-01-01-0000 开会.md",
+            tree.messages[0].path, "项目A/1970-01-01-0000 开会.md",
             "实际：{}",
             tree.messages[0].path
         );
@@ -735,8 +732,16 @@ mod tests {
         paths.sort_unstable();
         paths.dedup();
         assert_eq!(paths.len(), 3, "路径不能撞：{paths:?}");
-        assert!(tree.messages[1].path.ends_with("开会-2.md"), "实际：{}", tree.messages[1].path);
-        assert!(tree.messages[2].path.ends_with("开会-3.md"), "实际：{}", tree.messages[2].path);
+        assert!(
+            tree.messages[1].path.ends_with("开会-2.md"),
+            "实际：{}",
+            tree.messages[1].path
+        );
+        assert!(
+            tree.messages[2].path.ends_with("开会-3.md"),
+            "实际：{}",
+            tree.messages[2].path
+        );
     }
 
     #[test]
@@ -781,7 +786,9 @@ mod tests {
 
         assert!(tree.attachments.is_empty(), "没字节就不该占一个附件位");
         assert_eq!(tree.missing_attachments, 1, "要能告诉用户有几张图没导出");
-        assert!(tree.messages[0].markdown.contains(&format!("attachment:{sha}")));
+        assert!(tree.messages[0]
+            .markdown
+            .contains(&format!("attachment:{sha}")));
     }
 
     #[test]
@@ -802,7 +809,11 @@ mod tests {
         // 频道名是用户随便起的：`a/b` 不写点的话在 zip 里就是另一个目录。
         let items = [owned("项目/A", "开会", 0)];
         let tree = build_tree(&items, 0, &HashMap::new());
-        assert!(tree.messages[0].path.starts_with("项目_A/"), "实际：{}", tree.messages[0].path);
+        assert!(
+            tree.messages[0].path.starts_with("项目_A/"),
+            "实际：{}",
+            tree.messages[0].path
+        );
     }
 
     #[test]

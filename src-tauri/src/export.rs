@@ -40,7 +40,6 @@ use crate::db;
 use crate::error::AppResult;
 
 /// 枚举时一页取多少条。`list_messages` 自己会把上限收到 500。
-
 pub use messagenote_core::export::ExportFilter;
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -194,8 +193,6 @@ fn channel_names(conn: &Connection) -> AppResult<HashMap<String, String>> {
         .map(|c| (c.id, c.name))
         .collect())
 }
-
-/// 按 `(created_at, id)` 顺序把筛选命中的记录翻完。
 
 #[cfg(test)]
 mod tests {
