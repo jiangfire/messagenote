@@ -35,6 +35,7 @@
 pub mod blob;
 pub mod browse;
 pub mod clock;
+pub mod export;
 pub mod normalize;
 
 // `blob` 刻意**不**扁平转出：它有十来个函数，`blob::get_blob(..)` 比一长串

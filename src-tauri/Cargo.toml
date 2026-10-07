@@ -60,3 +60,6 @@ tauri-build = { version = "2", features = [] }
 # 让两个真实的客户端库通过真实 HTTP 同步。
 messagenote-server = { path = "../crates/server" }
 tokio = { version = "1", features = ["rt-multi-thread", "net"] }
+# 只为了在测试里把服务端返回的 zip **解开看内容**。服务端用 Stored 写，
+# 所以这里同样不需要任何压缩特性。
+zip = { version = "4", default-features = false }

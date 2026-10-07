@@ -39,3 +39,6 @@ tokio = { version = "1.53.1", features = [
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 uuid = { workspace = true }
+# 网页端导出。**关掉全部默认特性**：我们只写 Stored（不压缩）的条目，
+# 所以连 deflate 都不需要 —— 附件字节早就压过了，再 deflate 一遍是白烧 CPU。
+zip = { version = "4", default-features = false }

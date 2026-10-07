@@ -17,6 +17,7 @@ import { Composer } from "./components/Composer";
 import { SyncBadge } from "./components/SyncBadge";
 import { SyncSettings } from "./components/SyncSettings";
 import { ExportDialog } from "./components/ExportDialog";
+import { AiSettings } from "./components/AiSettings";
 import { OverflowMenu } from "./components/OverflowMenu";
 import { UpdateNotice } from "./components/UpdateNotice";
 
@@ -155,7 +156,7 @@ function SyncRow({
 export default function App() {
   // `desktop` 在网页端是 null —— 同步配置、同步状态、捕获浮层在浏览器里
   // 都没有对应物（网页端的同步是服务端自己在做）。
-  const { api, desktop } = useApi();
+  const { api, desktop, exportZip } = useApi();
 
   const [stats, setStats] = useState<TimelineStats>({ total: 0, unfiled: 0 });
   const [channels, setChannels] = useState<Channel[]>([]);
@@ -181,6 +182,8 @@ export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   /** 导出面板。筛选条件就定在里面，见 ExportDialog。 */
   const [exportOpen, setExportOpen] = useState(false);
+  /** AI 标签建议的配置面板。见 AiSettings。 */
+  const [aiSettingsOpen, setAiSettingsOpen] = useState(false);
   /** 本次启动的非致命警告（快捷键被占用之类）。见下面的 effect。 */
   const [notices, setNotices] = useState<string[]>([]);
 
@@ -612,11 +615,13 @@ export default function App() {
    * 一个菜单项直接弹目录选择器：筛选是"导什么"的一部分，得能在同一个地方定下来，
    * 否则用户只能在导出之后自己去目录里挑。
    *
-   * 仍然**只有桌面端有**：导出要往磁盘上写一棵目录树（按频道分目录 +
-   * `attachments/`），浏览器里做不到。
+   * **两端都有，但形态不同**：桌面端写一棵目录树，网页端由服务端打成一个 zip。
+   * 那边拿不到导出能力时不渲染这一行 —— 而不是给一个点下去没反应的按钮。
    */
   function openExport() {
-    if (!desktop) return;
+    // 两端都有导出（形态不同，见 `exportZip` 的注释）。哪一端都没有能力时
+    // 菜单里不会出现这一行，所以这里再判一次只是兜底。
+    if (!desktop && !exportZip) return;
     setExportOpen(true);
   }
 
@@ -703,10 +708,9 @@ export default function App() {
                   </div>
                 )}
 
-                {/* 导出**只有桌面端有**（浏览器里写不出一棵目录树），
-                    所以网页端的菜单里不出现这一行 —— 而不是渲染一个点下去
-                    没反应的按钮。 */}
-                {desktop && (
+                {/* 导出。桌面端挑目录写目录树，网页端让服务端打成 zip（形态不同，但
+                    筛选 UI 是同一份）。哪一端都没有导出能力时不渲染这一行。 */}
+                {(desktop || exportZip) && (
                   <button
                     className="overflow-item"
                     onClick={() => {
@@ -715,6 +719,20 @@ export default function App() {
                     }}
                   >
                     导出记录…
+                  </button>
+                )}
+
+                {/* AI 标签建议。没配模型时点进去能填 —— 而不��排一个
+                    "点一下必然失败"的入口。 */}
+                {desktop && (
+                  <button
+                    className="overflow-item"
+                    onClick={() => {
+                      close();
+                      setAiSettingsOpen(true);
+                    }}
+                  >
+                    AI 标签建议…
                   </button>
                 )}
 
@@ -875,12 +893,16 @@ export default function App() {
         />
       )}
 
-      {desktop && exportOpen && (
+      {(desktop || exportZip) && exportOpen && (
         <ExportDialog
           channels={channels}
           tags={tags}
           onClose={() => setExportOpen(false)}
         />
+      )}
+
+      {desktop && aiSettingsOpen && (
+        <AiSettings onClose={() => setAiSettingsOpen(false)} />
       )}
     </div>
   );

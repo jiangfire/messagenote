@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useApi } from "../lib/apiContext";
 import { errorText } from "../lib/errors";
-import type { Channel, ExportFilter, TagCount } from "../lib/types";
+import type { Channel, ExportFilter, ExportSummary, TagCount } from "../lib/types";
 
 interface Props {
   channels: Channel[];
@@ -30,17 +30,23 @@ function dayEdgeMs(day: string, edge: "start" | "end"): number {
 }
 
 /**
- * 导出：先定范围，再挑目录。
+ * 导出：先定范围，再挑目录 / 下一个 zip。
  *
- * **只有桌面端有**（浏览器里写不出一棵目录树），所以这个组件由 App 在
- * `desktop` 存在时才挂载。
+ * **两端形态不同，但筛选 UI 是同一份** —— 两套筛选控件会漂移，而漂移的后果
+ * 是"我以为导的是 3 月，用户在另一个界面上导的是 4 月"。
+ *
+ * - 桌面端：挑一个目录，写出一棵 Markdown 目录树（`desktop.exportMarkdown`）
+ * - 网页端：服务端打成一个 zip，浏览器下载（`exportZip`）
+ *
+ * 后者是前者的降级形态，**不是等价替代**：浏览器里写不出一棵目录树，只能
+ * 给一个文件。界面上要说清这一点，别让用户以为两种做法产出一样的东西。
  *
  * 导出结果就地说在这儿，不用 `window.alert`：一是它能和用户刚填的筛选条件
  * 待在一起（"筛了这些 → 出了这些"），二是 alert 会挡住目录选择器的收尾，
  * 在 Windows 上偶尔得点两次才消失。
  */
 export function ExportDialog({ channels, tags, onClose }: Props) {
-  const { desktop } = useApi();
+  const { desktop, exportZip } = useApi();
 
   const [channelId, setChannelId] = useState(ANY);
   const [tag, setTag] = useState(ANY);
@@ -55,48 +61,61 @@ export function ExportDialog({ channels, tags, onClose }: Props) {
    */
   const [note, setNote] = useState<{ kind: "ok" | "info" | "err"; text: string } | null>(null);
 
-  if (!desktop) return null;
+  // 两种形态都不支持 = 这个环境没有导出能力。**不要渲染一个点下去没反应的
+  // 按钮**：调用方按这个条件决定要不要挂这个面板。
+  const webReady = !desktop && !!exportZip;
+  if (!desktop && !exportZip) return null;
 
   // 起止都填了才比较。先后颠倒就**先拦住**，而不是导出一棵空目录树 ——
   // 空结果会被当成"这个筛选下没有记录"，而真相是条件写反了。
   const reversed = from !== "" && to !== "" && dayEdgeMs(from, "start") > dayEdgeMs(to, "end");
 
   async function run() {
-    if (!desktop) return;
     setBusy(true);
     setNote(null);
     try {
-      // 挑目录也放在 try 里：它自己会失败（权限、被策略拦），而抛在 try 外面
-      // 就是一个没人接的 rejection —— 面板上什么都不显示。
-      const dir = await desktop.pickDirectory();
-      if (!dir) return; // 用户取消 —— 不该弹一句"导出失败"
-
       const filter: ExportFilter = {
         channelId: channelId || null,
         tag: tag || null,
         fromMs: from ? dayEdgeMs(from, "start") : null,
         toMs: to ? dayEdgeMs(to, "end") : null,
       };
-
       // 偏移传 `-getTimezoneOffset()`：它返回"本地转 UTC 要加多少分钟"，
       // 取负才是"东为正"的口径，也正是 Rust 那边要的。
-      const s = await desktop.exportMarkdown(dir, -new Date().getTimezoneOffset(), filter);
+      const offset = -new Date().getTimezoneOffset();
+
+      let where: string;
+      let s: ExportSummary;
+      if (desktop) {
+        // 挑目录也放在 try 里：它自己会失败（权限、被策略拦），而抛在 try 外面
+        // 就是一个没人接的 rejection —— 面板上什么都不显示。
+        const dir = await desktop.pickDirectory();
+        if (!dir) return; // 用户取消 —— 不该弹一句"导出失败"
+        s = await desktop.exportMarkdown(dir, offset, filter);
+        where = dir;
+      } else if (webReady) {
+        s = await exportZip!(filter, offset);
+        where = "浏览器下载目录";
+      } else {
+        return;
+      }
 
       if (s.messages === 0) {
-        setNote({ kind: "info", text: "这个筛选下没有记录，没有写出任何文件。" });
+        setNote({ kind: "info", text: "这个筛选下没有记录，没有导出任何东西。" });
         return;
       }
       // **取不到的附件必须说出来。** 不说的话用户只会以为导出漏了东西 ——
       // 而导出物里那条 `attachment:<sha>` 他看不懂是什么意思。
       const missed = s.missingAttachments
-        ? `\n有 ${s.missingAttachments} 个附件本地还没有字节，没有带出来（正文里仍是 attachment: 引用）。` +
+        ? `\n有 ${s.missingAttachments} 个附件还没有字节，没有带出来（正文里仍是 attachment: 引用）。` +
           `等同步把它们拿下来再导一次即可。`
         : "";
       setNote({
         kind: "ok",
         text:
-          `已导出 ${s.messages} 条记录、${s.attachments} 个附件到 ${s.channels} 个频道目录。\n` +
-          `位置：${dir}${missed}`,
+          `已导出 ${s.messages} 条记录、${s.attachments} 个附件` +
+          `${desktop ? `到 ${s.channels} 个频道目录` : ""}。\n` +
+          `位置：${where}${missed}`,
       });
     } catch (e) {
       setNote({ kind: "err", text: `导出失败：${errorText(e)}` });
@@ -112,6 +131,7 @@ export function ExportDialog({ channels, tags, onClose }: Props) {
         <p className="muted small">
           按频道、标签、时间范围挑出一部分导出（都是可选的，全不选就是导出全部）。
           产物是一棵 Markdown 目录树：按频道分目录，图片进 attachments/。
+          {webReady && " 网页端下载的是一个 zip 文件，解开后是同一棵目录树。"}
         </p>
 
         <label className="field">
@@ -173,7 +193,7 @@ export function ExportDialog({ channels, tags, onClose }: Props) {
 
         <div className="modal-actions">
           <button className="btn primary" onClick={() => void run()} disabled={busy || reversed}>
-            {busy ? "正在导出…" : "选择目录并导出"}
+            {busy ? "正在导出…" : webReady ? "导出为 zip" : "选择目录并导出"}
           </button>
           <button className="btn ghost" onClick={onClose}>
             关闭

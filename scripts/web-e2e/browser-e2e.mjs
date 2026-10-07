@@ -969,6 +969,117 @@ ok(
   )
 );
 await sleep(300);
+// ---------------------------------------------------------------- 网页端导出
+
+// 放在附件那一节之后：到这儿库里已经有记录**和图片**了，于是这个 zip 里
+// 应当同时装得下正文和附件 —— 那才是网页端导出真正要验的东西。
+//
+// （不能放在 ⋯ 菜单那一节：那里后面还跟着一串硬编码的条数断言，
+// 多记一条会把后面全部顶掉。）
+console.log("== 网页端导出：服务端打成 zip，浏览器下载 ==");
+
+// **把 createObjectURL 和 a.click 都拦下来**，理由不是省事：
+// 一是 headless 里真下载会在磁盘上留文件、还要配下载目录；二是那样验不到
+// "文件名取自 Content-Disposition" 和"摘要是从响应头读的" —— 而这两处正是
+// 只在真实浏览器里才会露馅的地方。
+await evaluate(
+  s,
+  `(() => {
+     window.__capBlob = null;
+     window.__capName = "";
+     const origCreate = URL.createObjectURL;
+     URL.createObjectURL = (b) => { window.__capBlob = b; return origCreate(b); };
+     const origClick = HTMLAnchorElement.prototype.click;
+     HTMLAnchorElement.prototype.click = function () {
+       if (this.download) {
+         window.__capName = this.download;
+         return; // 不真的触发下载
+       }
+       return origClick.call(this);
+     };
+     return true;
+   })()`
+);
+
+await click(s, ".overflow-btn");
+await waitFor(s, "!!document.querySelector('.overflow-menu')", "菜单展开（找导出）");
+ok(
+  "网页端的 ⋯ 菜单里也有「导出记录…」（之前只有桌面端有）",
+  await evaluate(
+    s,
+    `[...document.querySelectorAll('.overflow-menu .overflow-item')].some(b => b.textContent.includes('导出'))`
+  )
+);
+
+// 用 CDP 派发的点击，**不是 `element.click()`**：React 的合成事件挂在容器上，
+// 脚本直接调 DOM 的 click 在这里不触发（实测过），点了等于没点。
+await click(s, ".overflow-menu .overflow-item");
+await waitFor(s, "!!document.querySelector('.modal')", "导出面板打开");
+ok("导出面板打开了", true);
+ok(
+  "网页端的按钮说的是「导出为 zip」而不是「选择目录并导出」",
+  await evaluate(
+    s,
+    `[...document.querySelectorAll('.modal .btn')].some(b => b.textContent.includes('zip'))`
+  )
+);
+await screenshot(s, `${SHOTS}/web-10-export-web.png`);
+
+await click(s, ".modal .btn.primary");
+await waitFor(s, "!!window.__capBlob", "导出完成", 30000);
+
+const cap = await evaluate(
+  s,
+  `(async () => {
+     const b = window.__capBlob;
+     if (!b) return null;
+     const head = new Uint8Array(await b.slice(0, 4).arrayBuffer());
+     return {
+       type: b.type,
+       size: b.size,
+       name: window.__capName,
+       // 有条目的 zip 头四个字节是 PK\\x03\\x04；空 zip 是 PK\\x05\\x06
+       magic: Array.from(head).join(","),
+     };
+   })()`
+);
+ok("网页端导出真的拿到了一个 blob", !!cap && cap.size > 0, JSON.stringify(cap));
+ok(
+  "它是一个**非空的真 zip**（魔数 PK\\x03\\x04，不是空包、更不是一段报错文本）",
+  !!cap && cap.magic === "80,75,3,4",
+  cap ? `magic=${cap.magic} size=${cap.size}` : "没拿到 blob"
+);
+ok("zip 的 MIME 是 application/zip", !!cap && cap.type === "application/zip");
+ok(
+  "文件名带日期（messagenote-<日期>.zip），下载列表里才分得清是哪一次",
+  !!cap && /^messagenote-\d{4}-\d{2}-\d{2}-\d{4}\.zip$/.test(cap.name),
+  cap ? cap.name : ""
+);
+
+await waitFor(s, `!!document.querySelector('.modal .note.ok')`, "导出结果提示", 15000);
+const noteText = await evaluate(
+  s,
+  `document.querySelector('.modal .note.ok')?.textContent ?? ""`
+);
+ok(
+  "面板上给出了条数（摘要是从响应头读的，不是前端编的）",
+  /已导出 \d+ 条记录/.test(noteText),
+  noteText
+);
+ok(
+  "附件也进去了（库里这一节之前贴过图，摘要是从响应头读的）",
+  /已导出 \d+ 条记录、[1-9]\d* 个附件/.test(noteText),
+  noteText
+);
+await screenshot(s, `${SHOTS}/web-10b-export-done.png`);
+
+await click(s, ".modal .btn.ghost");
+await waitFor(s, "!document.querySelector('.modal')", "导出面板关闭");
+ok("面板能关掉", true);
+
+// 还原钩子，别让后面几节被影响
+await evaluate(s, `(() => { window.__capBlob = null; return true; })()`);
+
 await screenshot(s, `${SHOTS}/web-09d-avatar-cleared.png`);
 
 // ---------------------------------------------------------------- 实时推送

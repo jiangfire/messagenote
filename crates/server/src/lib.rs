@@ -8,6 +8,7 @@
 pub mod api;
 pub mod blobs;
 pub mod error;
+pub mod export;
 pub mod store;
 
 use std::sync::Arc;

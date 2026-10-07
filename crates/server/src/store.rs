@@ -453,6 +453,23 @@ impl Store {
         Ok(messagenote_store::search_page(&conn, query, limit, offset)?)
     }
 
+    /// 导出时挑出要导的那些记录。
+    ///
+    /// **刻意不返回 `Connection`**：连接锁是这个结构里最容易被误用的东西
+    /// （拿在手里过夜 = 整库写不进去）。所以取数、筛选、释放锁全在这一句里，
+    /// 调用方只拿到 `Vec<Message>`。
+    ///
+    /// 筛选语义在 [`messagenote_store::export`] 里，与桌面端**共用** ——
+    /// 两端各写一份的话，"这个筛选包含哪几条"会有两个答案，
+    /// 而用户看到的只是"少了一条"。
+    pub fn export_selection(
+        &self,
+        filter: &messagenote_core::export::ExportFilter,
+    ) -> ServerResult<Vec<Message>> {
+        let conn = self.conn()?;
+        Ok(messagenote_store::export::selected_messages(&conn, filter)?)
+    }
+
     // ---------------------------------------------------------------- 附件
     //
     // 这四个是 Store 里**唯一**的 async 方法：S3 那边的调用是网络往返，

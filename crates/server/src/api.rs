@@ -42,7 +42,7 @@ use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post, put};
 use axum::{Json, Router};
 use futures_util::stream::{self, Stream};
@@ -162,6 +162,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/api/blob/missing", post(missing_blobs))
         .route("/api/blob/{sha256}", get(download_blob))
+        // 网页端导出。**挂在鉴权后面**：它能读走整个库，是这个服务上最重的
+        // 一个只读动作，绝不能匿名。
+        .route("/api/export.zip", get(export_zip))
         // 实时推送。挂在鉴权后面，所以客户端必须能带 Authorization 头 ——
         // 浏览器的 EventSource **不能**自定义请求头，这就是网页端改用
         // fetch + 手动解析 SSE 的原因（见 web 端的 sse.ts）。
@@ -275,6 +278,76 @@ async fn health() -> Json<HealthResponse> {
         protocol: PROTOCOL_VERSION,
         server_time_ms: now_ms(),
     })
+}
+
+/// 导出用的查询参数。
+///
+/// 全是 `Option`：全空就是全量导出，和桌面端「四个都不填」的含义逐字一致。
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExportParams {
+    channel_id: Option<String>,
+    tag: Option<String>,
+    from_ms: Option<i64>,
+    to_ms: Option<i64>,
+    /// 前端时区相对 UTC 的偏移（**东为正**）。
+    ///
+    /// 服务端**不猜**用户在哪：猜错的话文件名里的本地时间就是错的，而那恰恰是
+    /// 用户扫文件名时最依赖的一列。不给就按 UTC 算，并在摘要里说明。
+    #[serde(default)]
+    utc_offset_minutes: Option<i32>,
+}
+
+/// 导出整个库（或筛选后的一部分）为一个 zip。
+///
+/// **走 GET 而不是 POST**：它是幂等的只读动作，浏览器可以直接把它当成下载链接
+/// （`a[download]` + `Authorization` 头走不了，所以实际由前端 fetch 下来再存）。
+/// 返回的是文件不是 JSON，所以**摘要走响应头**（`X-Export-Messages` 等）——
+/// 正好也是桌面端 `ExportSummary` 那几个字段，两端对得上。
+///
+/// 超大导出回 413 且带一句可操作的建议，见 [`export::MAX_EXPORT_BYTES`]。
+async fn export_zip(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<ExportParams>,
+) -> ServerResult<Response> {
+    let query = crate::export::ExportQuery {
+        channel_id: q.channel_id,
+        tag: q.tag,
+        from_ms: q.from_ms,
+        to_ms: q.to_ms,
+        utc_offset_minutes: q.utc_offset_minutes.unwrap_or(0),
+    };
+    let out = crate::export::build_zip(&state.store, &query).await?;
+
+    let file_name = crate::export::zip_file_name(&query);
+    Ok((
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "application/zip".to_string(),
+            ),
+            (
+                axum::http::header::CONTENT_DISPOSITION,
+                // 文件名是 ASCII（`messagenote-2026-10-07-0912.zip`），所以
+                // 不需要 RFC 5987 那套 `filename*` 转义。
+                format!("attachment; filename=\"{file_name}\""),
+            ),
+            (
+                axum::http::header::HeaderName::from_static("x-export-messages"),
+                out.messages.to_string(),
+            ),
+            (
+                axum::http::header::HeaderName::from_static("x-export-attachments"),
+                out.attachments.to_string(),
+            ),
+            (
+                axum::http::header::HeaderName::from_static("x-export-missing-attachments"),
+                out.missing_attachments.to_string(),
+            ),
+        ],
+        out.bytes,
+    )
+        .into_response())
 }
 
 /// 鉴权过的握手：确认地址、令牌、协议版本三样都对，且不落任何数据。

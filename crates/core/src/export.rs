@@ -26,6 +26,7 @@
 //! 路径由调用方给 —— 只有它知道文件落在哪儿、以及那份字节本地到底有没有。
 
 use crate::attachment;
+use std::collections::{HashMap, HashSet};
 
 /// 导出时一条记录需要提供的全部内容。
 ///
@@ -282,6 +283,197 @@ pub fn render_markdown(
     )
 }
 
+/// 导出筛选。四个字段全空 = 全量导出。
+///
+/// 是个**结构体**而不是四个各自可为空的参数：这四个字段是一件事（"导哪一部分"），
+/// 不是四个签名。漏传一个的默认含义（全量）也因此只有一个地方能改。
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportFilter {
+    /// 只导这个频道。收件箱也是一个频道（id 固定为 `inbox`），不用特判。
+    pub channel_id: Option<String>,
+    /// 只导打了这个标签的记录。标签是横切的，与频道正交 —— 两个都给时取交集。
+    pub tag: Option<String>,
+    /// 时间范围下界（epoch 毫秒，**含端点**）。
+    pub from_ms: Option<i64>,
+    /// 时间范围上界（epoch 毫秒，**含端点**）。
+    pub to_ms: Option<i64>,
+}
+
+impl ExportFilter {
+    /// 这条记录算不算"在筛选里"。
+    ///
+    /// **时间范围只在这一层筛，不下推到 `list_messages`。** 因为 `list_messages`
+    /// 只认下界 `since`，而下推上界就得在那一侧另写一份闭区间比较 ——
+    /// "这个区间到底含不含端点"于是会有两个答案，而用户看到的只是"少了一条"。
+    ///
+    /// 时间范围在界面上可能就是同一个日期（起 = 止），这里不特判：
+    /// `from == to` 自然就是"那一毫秒"，而调用方给的是当天的 0 点和 23:59:59.999。
+    ///
+    /// 频道**只在"标签也给了"的时候**才在这里补一刀：那时取数走的是标签
+    /// （见 `store::export::selected_messages`），频道条件就落到了这一层。
+    pub fn matches(&self, m: &crate::models::Message) -> bool {
+        if let Some(from) = self.from_ms {
+            if m.created_at < from {
+                return false;
+            }
+        }
+        if let Some(to) = self.to_ms {
+            if m.created_at > to {
+                return false;
+            }
+        }
+        if self.tag.is_some() {
+            if let Some(id) = self.channel_id.as_deref() {
+                // `channel_id` 是非空列，所以这就是 SQL 里那句 `m.channel_id = ?`
+                return m.channel_id == id;
+            }
+        }
+        true
+    }
+}
+
+// ---------------------------------------------------------------- 导出树
+//
+// 上面那些函数只解决"一条记录长什么样"。**这些**解决"一批记录摆成一棵
+// 目录树是什么样"，而它必须也只有一份实现：
+//
+// - 桌面端把它写成磁盘上的目录树；
+// - 服务端把它写进一个 zip（浏览器里下载的那份）。
+//
+// 两边各拼一次的话，重名去重和附件相对路径总有一天会对不上，而那种不一致
+// 只有在用户打开导出物、发现图裂了的时候才暴露 —— 那时已经发出去了。
+
+/// 附件在导出树里的目录名。桌面端和服务端必须一致。
+pub const ATTACHMENTS_DIR: &str = "attachments";
+
+/// 频道被删掉之后，记录回落到的目录名。
+///
+/// 正常路径下走不到（服务端拒绝删频道、客户端把记录移回收件箱），但库是可能
+/// 被外部改过的 —— 这时给一个能看懂的名字，比让记录凭空消失强。
+pub const ORPHAN_CHANNEL: &str = "未归档";
+
+/// 导出树里的一条记录文件。**Markdown 已经渲染好了**，直接写出去就行。
+pub struct ExportedMessage {
+    /// 相对导出根的路径，`/` 分隔：`项目A/2026-09-29-1146 开会.md`。
+    pub path: String,
+    pub markdown: String,
+}
+
+/// 导出树里被引用到、且**有字节**的附件。
+///
+/// 不含字节本身：那份字节在桌面端是文件 I/O、在服务端可能是对象存储，
+/// 由调用方按 `sha` 去取。这里只固定住**路径**，好让正文里写进去的相对链接
+/// 和实际写出去的文件名一定是同一个。
+pub struct ExportedAttachment {
+    /// 相对导出根的路径：`attachments/<sha>.<ext>`。
+    pub path: String,
+    pub sha: String,
+}
+
+/// 一棵算好、可以直接写出去的导出树。
+pub struct ExportTree {
+    pub messages: Vec<ExportedMessage>,
+    pub attachments: Vec<ExportedAttachment>,
+    /// 正文引用了、但**没有字节**的附件数。
+    ///
+    /// 单独报出来是因为它对应一件用户要决定的事：这些图是"还没下载下来"
+    /// （下轮同步会补），还是"真的没了"。导出会如实保留 `attachment:<sha>`
+    /// 而不是编一个指不到东西的路径，让读者看得出这里本来有张图。
+    pub missing_attachments: usize,
+    /// 这棵树用到了几个频道目录。
+    pub channels: usize,
+}
+
+/// 把一批记录算成一棵导出树。
+///
+/// `available` 是 `sha → 文件扩展名`，**只有手上有字节的才放进来**。缺的那些
+/// 不在这里，于是正文里原样留着 `attachment:<sha>`。
+///
+/// 调用方负责两件事，因为只有它知道：那份字节到底在不在（数据库还是对象存储），
+/// 以及最后把它写到哪儿去（磁盘还是 zip 流）。
+pub fn build_tree(
+    items: &[ExportItem<'_>],
+    utc_offset_minutes: i32,
+    available: &HashMap<String, String>,
+) -> ExportTree {
+    // 正文里引用的 sha，按首次出现顺序（后面要写进正文，得稳定）。
+    let mut referenced: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for item in items {
+        for sha in attachment::referenced_shas(&item.body) {
+            if seen.insert(sha.clone()) {
+                referenced.push(sha);
+            }
+        }
+    }
+
+    let attachments: Vec<ExportedAttachment> = referenced
+        .iter()
+        .filter(|sha| available.contains_key(*sha))
+        .map(|sha| {
+            let ext = &available[sha];
+            ExportedAttachment {
+                path: format!("{ATTACHMENTS_DIR}/{sha}.{ext}"),
+                sha: sha.clone(),
+            }
+        })
+        .collect();
+
+    // 记录落在 `<频道>/`，附件在 `attachments/`，所以从记录回到附件要往上一级。
+    let paths: HashMap<String, String> = attachments
+        .iter()
+        .map(|a| (a.sha.clone(), format!("../{}", a.path)))
+        .collect();
+
+    let missing_attachments = referenced.len() - attachments.len();
+
+    // 同名去重是**必须的**：两条记录完全可能算出同一个文件名（同一分钟、
+    // 开头那句又一样），覆盖就等于**静默丢掉一条笔记**。
+    let mut used: HashSet<String> = HashSet::new();
+    let mut channels: HashSet<String> = HashSet::new();
+    let mut messages = Vec::with_capacity(items.len());
+
+    for item in items {
+        let dir_name = sanitize_segment(item.channel);
+        channels.insert(dir_name.clone());
+        let base = file_name(item, utc_offset_minutes);
+        let name = unique_name(&mut used, &dir_name, &base);
+        messages.push(ExportedMessage {
+            path: format!("{dir_name}/{name}"),
+            markdown: render_markdown(item, utc_offset_minutes, |sha| {
+                paths.get(sha).cloned()
+            }),
+        });
+    }
+
+    ExportTree {
+        messages,
+        attachments,
+        missing_attachments,
+        channels: channels.len(),
+    }
+}
+
+/// 在同一个目录里挑一个没被用过的文件名：重名就依次加 `-2`、`-3`。
+///
+/// `dir_name` 参与判重，因为**判重是按目录来的** —— 不同频道下的同名文件
+/// 本来就该各自保留。
+fn unique_name(used: &mut HashSet<String>, dir_name: &str, base: &str) -> String {
+    if used.insert(format!("{dir_name}/{base}")) {
+        return base.to_string();
+    }
+    let stem = base.strip_suffix(".md").unwrap_or(base);
+    let mut n = 2;
+    loop {
+        let cand = format!("{stem}-{n}.md");
+        if used.insert(format!("{dir_name}/{cand}")) {
+            return cand;
+        }
+        n += 1;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -467,5 +659,129 @@ mod tests {
         let body = format!("![x](attachment:{})", "A".repeat(64));
         let md = render_markdown(&item(&body, &[]), 0, |_| panic!("大写 sha 不该被解析"));
         assert!(md.contains(&"A".repeat(64)));
+    }
+
+    // ---------------------------------------------------------- 导出树
+
+    fn owned<'a>(channel: &'a str, body: &'a str, at: i64) -> ExportItem<'a> {
+        ExportItem {
+            channel,
+            tags: &[],
+            created_at: at,
+            updated_at: at,
+            body,
+        }
+    }
+
+    #[test]
+    fn the_tree_lays_messages_out_by_channel() {
+        let items = [
+            owned("项目A", "开会", 0),
+            owned("项目A", "写周报", 60_000),
+            owned("杂事", "买菜", 120_000),
+        ];
+        let tree = build_tree(&items, 0, &HashMap::new());
+
+        assert_eq!(tree.messages.len(), 3);
+        assert_eq!(tree.channels, 2);
+        assert_eq!(
+            tree.messages[0].path,
+            "项目A/1970-01-01-0000 开会.md",
+            "实际：{}",
+            tree.messages[0].path
+        );
+        assert!(tree.messages[2].path.starts_with("杂事/"));
+    }
+
+    #[test]
+    fn two_records_that_render_the_same_filename_both_survive() {
+        // 同一分钟、开头那句又一样 —— 覆盖就等于**静默丢掉一条笔记**。
+        let items = [
+            owned("项目A", "开会", 0),
+            owned("项目A", "开会", 30_000),
+            owned("项目A", "开会", 30_000),
+        ];
+        let tree = build_tree(&items, 0, &HashMap::new());
+
+        let mut paths: Vec<&str> = tree.messages.iter().map(|m| m.path.as_str()).collect();
+        paths.sort_unstable();
+        paths.dedup();
+        assert_eq!(paths.len(), 3, "路径不能撞：{paths:?}");
+        assert!(tree.messages[1].path.ends_with("开会-2.md"), "实际：{}", tree.messages[1].path);
+        assert!(tree.messages[2].path.ends_with("开会-3.md"), "实际：{}", tree.messages[2].path);
+    }
+
+    #[test]
+    fn the_same_filename_in_two_channels_is_not_a_collision() {
+        // 判重**是按目录来的** —— 不同频道下的同名文件本来就该各自保留。
+        let items = [owned("项目A", "开会", 0), owned("杂事", "开会", 0)];
+        let tree = build_tree(&items, 0, &HashMap::new());
+        assert!(tree.messages[0].path.ends_with("开会.md"));
+        assert!(tree.messages[1].path.ends_with("开会.md"));
+        assert_eq!(tree.channels, 2);
+    }
+
+    #[test]
+    fn an_attachment_path_in_the_body_is_the_one_that_actually_gets_written() {
+        // 这是两端最容易分叉的地方：正文里写的是相对路径，而真正写出去的是
+        // 另一条记录 —— 两者对不上时，只有用户打开导出物才发现图裂了。
+        let sha = "d".repeat(64);
+        let body = format!("看图 attachment:{sha}");
+        let items = [owned("项目A", &body, 0)];
+        let mut available = HashMap::new();
+        available.insert(sha.clone(), "png".to_string());
+
+        let tree = build_tree(&items, 0, &available);
+
+        assert_eq!(tree.attachments.len(), 1);
+        let written = &tree.attachments[0].path;
+        assert_eq!(written, &format!("attachments/{sha}.png"));
+        assert!(
+            tree.messages[0].markdown.contains(&format!("../{written}")),
+            "正文里应当是 ../{written}，实际：{}",
+            tree.messages[0].markdown
+        );
+        assert_eq!(tree.missing_attachments, 0);
+    }
+
+    #[test]
+    fn an_attachment_without_bytes_is_counted_and_its_reference_survives() {
+        let sha = "e".repeat(64);
+        let body = format!("![图](attachment:{sha})");
+        let items = [owned("项目A", &body, 0)];
+        let tree = build_tree(&items, 0, &HashMap::new());
+
+        assert!(tree.attachments.is_empty(), "没字节就不该占一个附件位");
+        assert_eq!(tree.missing_attachments, 1, "要能告诉用户有几张图没导出");
+        assert!(tree.messages[0].markdown.contains(&format!("attachment:{sha}")));
+    }
+
+    #[test]
+    fn one_attachment_referenced_twice_is_written_once() {
+        let sha = "f".repeat(64);
+        let body = format!("上面那张 attachment:{sha}\n\n再看一次 attachment:{sha}");
+        let items = [owned("项目A", &body, 0)];
+        let mut available = HashMap::new();
+        available.insert(sha.clone(), "png".to_string());
+
+        let tree = build_tree(&items, 0, &available);
+        assert_eq!(tree.attachments.len(), 1, "内容寻址，同一份字节只写一次");
+        assert_eq!(tree.missing_attachments, 0);
+    }
+
+    #[test]
+    fn an_illegal_character_in_a_channel_name_does_not_leak_into_the_path() {
+        // 频道名是用户随便起的：`a/b` 不写点的话在 zip 里就是另一个目录。
+        let items = [owned("项目/A", "开会", 0)];
+        let tree = build_tree(&items, 0, &HashMap::new());
+        assert!(tree.messages[0].path.starts_with("项目_A/"), "实际：{}", tree.messages[0].path);
+    }
+
+    #[test]
+    fn an_empty_export_is_an_empty_tree_not_a_failure() {
+        let tree = build_tree(&[], 0, &HashMap::new());
+        assert!(tree.messages.is_empty());
+        assert_eq!(tree.channels, 0);
+        assert_eq!(tree.missing_attachments, 0);
     }
 }

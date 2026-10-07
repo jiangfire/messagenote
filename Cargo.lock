@@ -2437,6 +2437,7 @@ dependencies = [
  "tokio",
  "ureq",
  "uuid",
+ "zip",
 ]
 
 [[package]]
@@ -2466,6 +2467,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "zip",
 ]
 
 [[package]]

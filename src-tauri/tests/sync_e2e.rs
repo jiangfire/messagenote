@@ -645,6 +645,210 @@ fn write_req_with(
     resp.into_body().read_json().expect("响应不是合法 JSON")
 }
 
+// ---------------------------------------------------------------- 网页端导出
+
+/// 一张**真的会被嗅探成 png** 的最小字节（`sniff_mime` 认开头那 8 个字节）。
+fn export_png() -> Vec<u8> {
+    let mut v = b"\x89PNG\r\n\x1a\n".to_vec();
+    v.extend_from_slice(&[0u8; 24]);
+    v
+}
+
+/// 上传一份附件，返回 sha。走真实的 `POST /api/blob`。
+fn export_upload_blob(addr: SocketAddr, bytes: &[u8]) -> String {
+    let url = format!("http://{addr}/api/blob");
+    let resp = ureq::post(&url)
+        .header("Authorization", &format!("Bearer {TOKEN}"))
+        .send(bytes)
+        .unwrap_or_else(|e| panic!("上传附件失败：{e}"));
+    let v: serde_json::Value = resp.into_body().read_json().expect("响应不是 JSON");
+    v["sha256"].as_str().expect("响应里要有 sha256").to_string()
+}
+
+/// 把 zip 解开，返回 `路径 → 内容`。
+fn unzip(bytes: &[u8]) -> std::collections::HashMap<String, Vec<u8>> {
+    use std::io::Read as _;
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("这不该是一个 zip");
+    let mut out = std::collections::HashMap::new();
+    for i in 0..zip.len() {
+        let mut f = zip.by_index(i).expect("读 zip 条目");
+        let mut buf = Vec::new();
+        f.read_to_end(&mut buf).expect("读 zip 条目内容");
+        out.insert(f.name().to_string(), buf);
+    }
+    out
+}
+
+/// 抓一次导出，返回 `(状态码, 响应头, zip 字节)`。
+fn fetch_export(
+    addr: SocketAddr,
+    query: &str,
+    bearer_val: Option<&str>,
+) -> (u16, std::collections::HashMap<String, String>, Vec<u8>) {
+    let url = format!("http://{addr}/api/export.zip{query}");
+    let mut req = ureq::get(&url);
+    if let Some(b) = bearer_val {
+        req = req.header("Authorization", &format!("Bearer {b}"));
+    }
+    let resp = req.call();
+    let (code, headers, buf) = match resp {
+        Ok(r) => {
+            let code = r.status().as_u16();
+            let headers: std::collections::HashMap<String, String> = r
+                .headers()
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        k.as_str().to_ascii_lowercase(),
+                        v.to_str().unwrap_or_default().to_string(),
+                    )
+                })
+                .collect();
+            // **必须显式放宽上限。** ureq 默认只读 10 MB（MAX_BODY_SIZE），
+            // 用默认值的话一份稍大的导出 zip 会被**静默截断** —— 而截断出来的
+            // zip 要到解压时才报错，那时已经没法说清是哪里出的问题了。
+            let buf = r
+                .into_body()
+                .into_with_config()
+                .limit(64 * 1024 * 1024)
+                .read_to_vec()
+                .unwrap_or_default();
+            (code, headers, buf)
+        }
+        // 4xx/5xx 在 ureq 里是 `Err`，不是 `Ok`。只关心状态码时（401、413）
+        // 照样要把它交出去 —— 客户端正是靠状态码区分"要重新登录"和
+        // "换个做法再来"。
+        Err(ureq::Error::StatusCode(c)) => (c, std::collections::HashMap::new(), Vec::new()),
+        Err(e) => panic!("导出请求失败：{e}"),
+    };
+    (code, headers, buf)
+}
+
+/// 网页端导出的 zip 必须**真的**装得下笔记和它的图。
+///
+/// 这条守的是"两端共用同一份组装逻辑"这个前提：正文里写的是
+/// `../attachments/<sha>.png`，而 zip 里那个路径必须真的存在 ——
+/// 对不上时，导出物在用户手里就是**一堆裂图**，而且不报任何错。
+#[test]
+fn the_web_export_returns_a_zip_that_contains_the_notes_and_their_images() {
+    let addr = start_server();
+
+    let ch = write_req(addr, "POST", "/api/channel", Some(&serde_json::json!({ "name": "项目A" })));
+    let ch_id = ch["id"].as_str().unwrap().to_string();
+
+    let sha = export_upload_blob(addr, &export_png());
+    write_req(
+        addr,
+        "POST",
+        "/api/message",
+        Some(&serde_json::json!({
+            "body": format!("会议记录\n![截图](attachment:{sha})"),
+            "channelId": ch_id,
+        })),
+    );
+    write_req(
+        addr,
+        "POST",
+        "/api/message",
+        Some(&serde_json::json!({ "body": "随手记的一条" })),
+    );
+
+    // `utcOffsetMinutes=0`：服务端不猜用户在哪（见 ExportParams 的注释）
+    let (code, headers, body) = fetch_export(addr, "?utcOffsetMinutes=0", Some(TOKEN));
+    assert_eq!(code, 200, "带凭据应当能导出");
+    assert_eq!(
+        headers.get("content-type").map(String::as_str),
+        Some("application/zip")
+    );
+    assert!(
+        headers
+            .get("content-disposition")
+            .is_some_and(|d| d.starts_with("attachment; filename=\"messagenote-")),
+        "必须告诉浏览器这是下载：{:?}",
+        headers.get("content-disposition")
+    );
+    assert_eq!(headers.get("x-export-messages").map(String::as_str), Some("2"));
+    assert_eq!(headers.get("x-export-attachments").map(String::as_str), Some("1"));
+    assert_eq!(headers.get("x-export-missing-attachments").map(String::as_str), Some("0"));
+
+    let files = unzip(&body);
+
+    // 两条记录：一个频道目录 + 一个收件箱目录
+    let mut md_paths: Vec<String> = files.keys().filter(|k| k.ends_with(".md")).cloned().collect();
+    md_paths.sort();
+    assert_eq!(md_paths.len(), 2, "应当正好两条：{md_paths:?}");
+    assert!(md_paths.iter().any(|p| p.starts_with("项目A/")), "{md_paths:?}");
+
+    // 附件条目的路径，**就是正文里引用的那个相对路径去掉 `../`**
+    let att_path = format!("attachments/{sha}.png");
+    let att = files
+        .get(&att_path)
+        .unwrap_or_else(|| panic!("zip 里应当有 {att_path}，实际条目：{:?}", files.keys()));
+    assert_eq!(att, &export_png(), "附件字节必须原样");
+
+    let md = files
+        .iter()
+        .find(|(k, _)| k.starts_with("项目A/"))
+        .map(|(_, v)| String::from_utf8_lossy(v).to_string())
+        .unwrap_or_default();
+    assert!(
+        md.contains(&format!("../{att_path}")),
+        "正文里应当是 ../{att_path}，实际：{md}"
+    );
+    assert!(
+        !md.contains("attachment:"),
+        "有字节的附件不该在正文里还留着原引用：{md}"
+    );
+}
+
+/// 没凭据不许导出 —— 这个端点能读走**整个库**。
+#[test]
+fn the_web_export_refuses_an_unauthenticated_caller() {
+    let addr = start_server();
+    let (code, _, _) = fetch_export(addr, "", None);
+    assert_eq!(code, 401, "匿名导出等于把整个库公开");
+}
+
+/// 筛选必须真的生效：只导一个频道时，另一个频道的记录不能出现在 zip 里。
+#[test]
+fn the_web_export_honours_the_channel_filter() {
+    let addr = start_server();
+
+    let keep = write_req(addr, "POST", "/api/channel", Some(&serde_json::json!({ "name": "要导的" })));
+    let keep_id = keep["id"].as_str().unwrap().to_string();
+    let drop = write_req(addr, "POST", "/api/channel", Some(&serde_json::json!({ "name": "不要导的" })));
+    let drop_id = drop["id"].as_str().unwrap().to_string();
+
+    write_req(addr, "POST", "/api/message", Some(&serde_json::json!({ "body": "该在里面", "channelId": keep_id })));
+    write_req(addr, "POST", "/api/message", Some(&serde_json::json!({ "body": "不该在里面", "channelId": drop_id })));
+
+    let (code, headers, body) = fetch_export(
+        addr,
+        &format!("?channelId={keep_id}&utcOffsetMinutes=0"),
+        Some(TOKEN),
+    );
+    assert_eq!(code, 200);
+    assert_eq!(headers.get("x-export-messages").map(String::as_str), Some("1"));
+
+    let files = unzip(&body);
+    let md_paths: Vec<String> = files.keys().filter(|k| k.ends_with(".md")).cloned().collect();
+    assert_eq!(md_paths.len(), 1, "只该导一条：{md_paths:?}");
+    assert!(md_paths[0].starts_with("要导的/"), "实际导出了：{md_paths:?}");
+}
+
+/// 空库也要给出一个**合法的空 zip**，而不是 404 或一句错误。
+///
+/// 界面上"这个筛选下没有记录"是一句正常的回答，不是失败 —— 换个说法，
+/// 用户会以为导出坏了。
+#[test]
+fn an_empty_export_is_a_valid_empty_zip() {
+    let addr = start_server();
+    let (code, headers, body) = fetch_export(addr, "?utcOffsetMinutes=0", Some(TOKEN));
+    assert_eq!(code, 200);
+    assert_eq!(headers.get("x-export-messages").map(String::as_str), Some("0"));
+    assert!(unzip(&body).is_empty(), "应当是一个没有条目的 zip");
+}
+
 /// **网页端写的东西，桌面端必须能通过同步正常拿到。**
 ///
 /// 这就是"服务端代笔"的全部意义：服务端把自己当一台设备，生成 HLC、写进
@@ -924,7 +1128,6 @@ fn logging_out_revokes_the_session_immediately() {
     ///
     /// 所以要钉住两件事：续期**发生了**（库里的值被推满），
     /// 以及客户端**看得见**（响应里有新时刻）。
-    #[test]
     fn a_renewed_session_reports_its_new_expiry_to_the_client() {
         let (addr, state) = start_server_with_state();
 
@@ -996,7 +1199,14 @@ fn logging_out_revokes_the_session_immediately() {
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse().ok())
     }
-fn the_long_lived_token_still_works_directly() {
+
+    /// 长期令牌那条路必须还在。
+    ///
+    /// 引入会话机制之后中间件有两条路，而桌面端同步客户端一直走的是长期令牌
+    /// —— 它不需要登录，把自己的令牌存在自己机器的数据库里。哪天这条路被
+    /// "顺手收掉"，所有桌面端的同步会一起失效。
+    #[test]
+    fn the_long_lived_token_still_works_directly() {
     let addr = start_server();
 
     for path in ["/api/channels", "/api/timeline/stats", "/api/tags"] {

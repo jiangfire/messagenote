@@ -2,10 +2,25 @@ import { useCallback, useEffect, useMemo, useState, type FormEvent } from "react
 import App from "../App";
 import { ApiProvider } from "../lib/apiContext";
 import { errorText } from "../lib/errors";
-import { httpApi, login, type Session } from "../lib/httpApi";
+import { httpApi, login, UnauthorizedError, type Session } from "../lib/httpApi";
 import { uuidV4 } from "../lib/ids";
+import type { ExportFilter, ExportSummary } from "../lib/types";
 import { count, enqueue, replay } from "./outbox";
 import { subscribeChanges as subscribeEvents } from "./sse";
+
+/**
+ * 从 `Content-Disposition` 里取出下载文件名。
+ *
+ * 服务端写的是 `attachment; filename="messagenote-2026-10-07-0912.zip"`
+ * 这种 ASCII 形式（见 api.rs 的 `export_zip`），所以正则够用。
+ *
+ * 取不到就退回一个固定名：没有文件名的下载在部分浏览器上会直接**不下载**，
+ * 那比名字难看糟糕得多。
+ */
+function fileNameOf(header: string | null): string {
+  const m = header?.match(/filename="([^"]+)"/);
+  return m?.[1] ?? "messagenote-export.zip";
+}
 
 /**
  * 网页端入口：登录 → 复用同一套界面。
@@ -224,6 +239,70 @@ const onSessionRenewed = useCallback((expiresAt: number) => {
     [stored, onUnauthorized]
   );
 
+  /**
+   * 网页端导出：让服务端把筛选结果打成一个 zip，然后交给浏览器下载。
+   *
+   * **走 `fetch` + blob 而不是直接给 `<a href>`**：这个端点要鉴权，
+   * 而 `<a download>` 发不出 `Authorization` 头。绕开的办法是把令牌放进
+   * 查询串是**不行**的 —— 那等于把凭据放进浏览历史和服务器访问日志。
+   *
+   * 摘要在**响应头**里（服务端不回 JSON，因为它回的是文件）：文件名取自
+   * `Content-Disposition`，条数取自 `X-Export-*`。
+   */
+  const exportZip = useMemo(
+    () =>
+      stored
+        ? async (filter: ExportFilter, utcOffsetMinutes: number): Promise<ExportSummary> => {
+            const q = new URLSearchParams();
+            if (filter.channelId) q.set("channelId", filter.channelId);
+            if (filter.tag) q.set("tag", filter.tag);
+            if (filter.fromMs != null) q.set("fromMs", String(filter.fromMs));
+            if (filter.toMs != null) q.set("toMs", String(filter.toMs));
+            q.set("utcOffsetMinutes", String(utcOffsetMinutes));
+
+            const url = new URL("/api/export.zip", stored.baseUrl);
+            url.search = q.toString();
+            const resp = await fetch(url.toString(), {
+              headers: { Authorization: `Bearer ${stored.session}` },
+            });
+
+            if (resp.status === 401) {
+              onUnauthorized();
+              throw new UnauthorizedError();
+            }
+            // 失败时服务端回的是**一句中文说明**（比如"这次导出超过 256 MB…"），
+            // 直接把它当错误消息用 —— 藏起来的话用户只剩一个没头没尾的失败。
+            if (!resp.ok) throw new Error(await resp.text());
+
+            const blob = await resp.blob();
+            const href = URL.createObjectURL(blob);
+            try {
+              const a = document.createElement("a");
+              a.href = href;
+              a.download = fileNameOf(resp.headers.get("Content-Disposition"));
+              document.body.appendChild(a);
+              a.click();
+              a.remove();
+            } finally {
+              // 必须在 click 之后 revoke：立刻 revoke 的话下载还没开始就断了。
+              URL.revokeObjectURL(href);
+            }
+
+            return {
+              messages: Number(resp.headers.get("X-Export-Messages") ?? 0),
+              attachments: Number(resp.headers.get("X-Export-Attachments") ?? 0),
+              missingAttachments: Number(
+                resp.headers.get("X-Export-Missing-Attachments") ?? 0
+              ),
+              // 网页端只有一个 zip 文件，没有"分到几个频道目录"这个概念。
+              // 填 0 而不是让类型可选：界面上这一栏本来就只在桌面端出现。
+              channels: 0,
+            };
+          }
+        : undefined,
+    [stored, onUnauthorized]
+  );
+
   // 首次使用：连服务端地址都还没有，只能整屏登录
   if (!stored || !api) {
     return <LoginScreen onSuccess={accept} />;
@@ -240,7 +319,7 @@ const onSessionRenewed = useCallback((expiresAt: number) => {
         另外：重登录会让 `stored` 变化 → `api` 换新 → App 的 effect 依赖它，
         所以数据会自动重取一遍，不需要额外通知。
       */}
-      <ApiProvider api={api} subscribeChanges={subscribeChanges}>
+      <ApiProvider api={api} subscribeChanges={subscribeChanges} exportZip={exportZip}>
         <App />
       </ApiProvider>
 

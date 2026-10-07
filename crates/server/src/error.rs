@@ -47,6 +47,14 @@ pub enum ServerError {
     #[error("{0}")]
     NotFound(String),
 
+    /// 服务端**不肯接**：要的东西太大（目前只有网页端导出用得上）。
+    ///
+    /// 单独一类是因为它和 `BadRequest` 在客户端那里的处置完全相反：
+    /// 400 是"你改一下请求"，413 是"**换个做法**" —— 重发同一个请求永远不会
+    /// 成功。混进 400 的话客户端会无脑重试，而重试只是再要一次大的。
+    #[error("{0}")]
+    PayloadTooLarge(String),
+
     #[error("{0}")]
     Msg(String),
 }
@@ -63,6 +71,11 @@ impl IntoResponse for ServerError {
             ServerError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, msg).into_response(),
             ServerError::Conflict(msg) => (StatusCode::CONFLICT, msg).into_response(),
             ServerError::NotFound(msg) => (StatusCode::NOT_FOUND, msg).into_response(),
+            // 这一条**可以**回细节：它是服务端主动拒绝并给出的建议，
+            // 不是内部结构。藏起来的话用户只剩一个没头没尾的 413。
+            ServerError::PayloadTooLarge(msg) => {
+                (StatusCode::PAYLOAD_TOO_LARGE, msg).into_response()
+            }
             other => {
                 tracing::error!(error = %other, "请求处理失败");
                 (StatusCode::INTERNAL_SERVER_ERROR, "服务端内部错误").into_response()
@@ -96,5 +109,10 @@ impl ServerError {
     /// 状态冲突（代笔撞上了更新版本）。会回 409，细节原样带给客户端。
     pub fn conflict(text: impl Into<String>) -> Self {
         ServerError::Conflict(text.into())
+    }
+
+    /// 服务端不肯接（太大）。会回 413。
+    pub fn payload_too_large(text: impl Into<String>) -> Self {
+        ServerError::PayloadTooLarge(text.into())
     }
 }

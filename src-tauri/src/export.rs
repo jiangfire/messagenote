@@ -35,67 +35,13 @@ use rusqlite::{Connection, OptionalExtension};
 use base64::Engine as _;
 use messagenote_core::attachment;
 use messagenote_core::export::{self, ExportItem};
-use messagenote_core::models::Message;
 
 use crate::db;
 use crate::error::AppResult;
 
-/// 附件目录名（导出根下）。
-const ATTACHMENTS_DIR: &str = "attachments";
-
 /// 枚举时一页取多少条。`list_messages` 自己会把上限收到 500。
-const PAGE: i64 = 500;
 
-/// 导出筛选。四个字段全空 = 全量导出。
-///
-/// `Deserialize` 是给 IPC 用的：前端直接传一个对象（或 `null`），而不是四个
-/// 各自可为空的参数 —— 这四个字段是一件事（"导哪一部分"），不是一个签名。
-#[derive(Debug, Clone, Default, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ExportFilter {
-    /// 只导这个频道。收件箱也是一个频道（id 固定为 `inbox`），不用特判。
-    pub channel_id: Option<String>,
-    /// 只导打了这个标签的记录。标签是横切的，与频道正交 —— 两个都给时取交集。
-    pub tag: Option<String>,
-    /// 时间范围下界（epoch 毫秒，**含端点**）。
-    pub from_ms: Option<i64>,
-    /// 时间范围上界（epoch 毫秒，**含端点**）。
-    pub to_ms: Option<i64>,
-}
-
-impl ExportFilter {
-    /// 时间范围在界面上可能就是同一个日期（起 = 止），这里不特判：
-    /// `from == to` 自然就是"那一毫秒"，而调用方给的是当天的 0 点和 23:59:59.999。
-    ///
-    /// 频道**只在"标签也给了"的时候**才在这里补一刀：那时 SQL 走的是标签
-    /// （见 `selected_messages`），频道条件就落到了这一层。
-    fn matches(&self, m: &Message) -> bool {
-        if let Some(from) = self.from_ms {
-            if m.created_at < from {
-                return false;
-            }
-        }
-        if let Some(to) = self.to_ms {
-            if m.created_at > to {
-                return false;
-            }
-        }
-        if self.tag.is_some() {
-            if let Some(id) = self.channel_id.as_deref() {
-                // `channel_id` 是非空列，所以这就是 SQL 里那句 `m.channel_id = ?`
-                return m.channel_id == id;
-            }
-        }
-        true
-    }
-}
-
-/// 频道名查不到时的落点。
-///
-/// 会走到这儿意味着记录指向了一个本地没有的频道（比如频道还没从对端同步过来）。
-/// 用一句话说明，而不是丢掉这条记录 —— 导出里**少一条笔记**比多一个这样的目录
-/// 严重得多。
-const ORPHAN_CHANNEL: &str = "未归档";
+pub use messagenote_core::export::ExportFilter;
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -141,7 +87,7 @@ pub fn render_one(
     let channel = channels
         .get(&m.channel_id)
         .map(String::as_str)
-        .unwrap_or(ORPHAN_CHANNEL);
+        .unwrap_or(export::ORPHAN_CHANNEL);
 
     let item = ExportItem {
         channel,
@@ -178,103 +124,68 @@ pub fn export_to(
     filter: &ExportFilter,
 ) -> AppResult<ExportSummary> {
     let channels = channel_names(conn)?;
-    let messages = selected_messages(conn, filter)?;
+    let messages = messagenote_store::export::selected_messages(conn, filter)?;
 
-    // 第一遍：只碰元数据，决定每个被引用附件的相对路径。
-    let mut paths: HashMap<String, String> = HashMap::new();
-    let mut missing: HashSet<String> = HashSet::new();
+    // 先只看元数据（不含字节），决定每个被引用附件的扩展名 ——
+    // 合成一步就得把所有附件同时捏在内存里，一份图多的库能到几百 MB。
+    //
+    // **没有字节的 sha 不进 `available`**：于是 `build_tree` 会在正文里原样
+    // 保留 `attachment:<sha>`，而不是编一个指不到东西的路径。
+    let mut available: HashMap<String, String> = HashMap::new();
+    let mut counted: HashSet<String> = HashSet::new();
     for m in &messages {
         for sha in attachment::referenced_shas(&m.body) {
-            if paths.contains_key(&sha) || missing.contains(&sha) {
+            // 同一张图被多条记录引用时只查一次元数据。
+            if !counted.insert(sha.clone()) {
                 continue;
             }
-            match db::blob::blob_meta(conn, &sha)? {
-                Some(meta) if meta.present => {
-                    let name = format!("{sha}.{}", attachment::extension_for(&meta.mime));
-                    // 记录落在 `<根>/<频道>/`，附件在 `<根>/attachments/`，
-                    // 所以从记录回到附件是往上一级。
-                    paths.insert(sha, format!("../{ATTACHMENTS_DIR}/{name}"));
-                }
-                // 只有占位行（bytes 为 NULL，等着下载）。
-                _ => {
-                    missing.insert(sha);
+            if let Some(meta) = db::blob::blob_meta(conn, &sha)? {
+                if meta.present {
+                    available.insert(sha, attachment::extension_for(&meta.mime).to_string());
                 }
             }
         }
     }
 
-    // 第二遍：写记录。
-    //
-    // 同名去重是**必须的**：两条记录完全可能算出同一个文件名（同一分钟、
-    // 开头那句又一样），覆盖就等于**静默丢掉一条笔记**。
-    let mut used: HashSet<String> = HashSet::new();
-    let mut written = 0usize;
-    for m in &messages {
-        let channel = channels
-            .get(&m.channel_id)
-            .map(String::as_str)
-            .unwrap_or(ORPHAN_CHANNEL);
-        let dir_name = export::sanitize_segment(channel);
-        let sub = dir.join(&dir_name);
-        fs::create_dir_all(&sub)?;
-
-        let item = ExportItem {
-            channel,
+    // 组装（频道目录、重名去重、附件相对路径）只有一份实现，桌面端和网页端共用。
+    let items: Vec<ExportItem<'_>> = messages
+        .iter()
+        .map(|m| ExportItem {
+            channel: channels
+                .get(&m.channel_id)
+                .map(String::as_str)
+                .unwrap_or(export::ORPHAN_CHANNEL),
             tags: &m.tags,
             created_at: m.created_at,
             updated_at: m.updated_at,
             body: &m.body,
-        };
-        let base = export::file_name(&item, utc_offset_minutes);
-        let name = unique_name(&mut used, &dir_name, &base);
-        let md = export::render_markdown(&item, utc_offset_minutes, |sha| paths.get(sha).cloned());
-        fs::write(sub.join(name), md)?;
-        written += 1;
+        })
+        .collect();
+    let tree = export::build_tree(&items, utc_offset_minutes, &available);
+
+    for f in &tree.messages {
+        let path = dir.join(&f.path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(path, &f.markdown)?;
     }
 
-    // 第三遍：拷字节。名字用第一遍算出来的那一份，**不在这里重算** ——
-    // 重算就有可能和正文里写的路径对不上，而那种不一致只有打开文件才发现。
-    let mut copied = 0usize;
-    if !paths.is_empty() {
-        let att_dir = dir.join(ATTACHMENTS_DIR);
-        fs::create_dir_all(&att_dir)?;
-        for (sha, rel) in &paths {
-            let name = rel.rsplit('/').next().unwrap_or(sha.as_str());
-            let (_mime, bytes) = db::read_attachment(conn, sha)?;
-            fs::write(att_dir.join(name), bytes)?;
-            copied += 1;
+    for a in &tree.attachments {
+        let path = dir.join(&a.path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
         }
+        let (_mime, bytes) = db::read_attachment(conn, &a.sha)?;
+        fs::write(path, bytes)?;
     }
 
     Ok(ExportSummary {
-        messages: written,
-        attachments: copied,
-        missing_attachments: missing.len(),
-        channels: used
-            .iter()
-            .filter_map(|k| k.split('/').next())
-            .collect::<HashSet<_>>()
-            .len(),
+        messages: tree.messages.len(),
+        attachments: tree.attachments.len(),
+        missing_attachments: tree.missing_attachments,
+        channels: tree.channels,
     })
-}
-
-/// 在同一个目录里挑一个没被用过的文件名：重名就依次加 `-2`、`-3`。
-///
-/// `dir_name` 参与判重，因为**判重是按目录来的** —— 不同频道下的同名文件
-/// 本来就该各自保留。
-fn unique_name(used: &mut HashSet<String>, dir_name: &str, base: &str) -> String {
-    if used.insert(format!("{dir_name}/{base}")) {
-        return base.to_string();
-    }
-    let stem = base.strip_suffix(".md").unwrap_or(base);
-    let mut n = 2;
-    loop {
-        let cand = format!("{stem}-{n}.md");
-        if used.insert(format!("{dir_name}/{cand}")) {
-            return cand;
-        }
-        n += 1;
-    }
 }
 
 fn channel_names(conn: &Connection) -> AppResult<HashMap<String, String>> {
@@ -285,45 +196,6 @@ fn channel_names(conn: &Connection) -> AppResult<HashMap<String, String>> {
 }
 
 /// 按 `(created_at, id)` 顺序把筛选命中的记录翻完。
-///
-/// 用游标翻页而不是一次性 `SELECT *`：`list_messages` 的上限是 500，
-/// 而且它维护的是和界面同一个查询 —— 这里就不该再写一份取数的 SQL。
-///
-/// 翻页拿到的每一页都可能是"被筛掉一部分"的，所以游标取的是**原始页的最后一条**，
-/// 而不是筛完之后的 —— 否则筛空的那些页会让翻页提前停住，后面还有记录也不翻了。
-fn selected_messages(conn: &Connection, filter: &ExportFilter) -> AppResult<Vec<Message>> {
-    // **标签优先。** 两个筛选都给的时候 SQL 走标签、频道在 `matches` 里补 ——
-    // 这样"什么算有这个标签"只有 `Scope::Tag` 一份定义。反过来（SQL 走频道、
-    // 标签在 Rust 里比 `m.tags`）就成了两个谓词：`Scope::Tag` 只看
-    // `message_tag.deleted_at`，而 `m.tags` 还要求 `tag.deleted_at IS NULL`，
-    // 于是一条"标签行被软删、消息上的关联还在"的记录会在两种筛法下得到
-    // **两个答案** —— 而用户看到的只是"少了一条"。
-    let scope = if let Some(tag) = filter.tag.as_deref() {
-        db::Scope::Tag(tag)
-    } else if let Some(id) = filter.channel_id.as_deref() {
-        db::Scope::Channel(id)
-    } else {
-        db::Scope::All
-    };
-
-    let mut out: Vec<Message> = Vec::new();
-    let mut before: Option<db::Cursor> = None;
-    loop {
-        let page = db::list_messages(conn, scope, PAGE, before.as_ref(), None)?;
-        if page.items.is_empty() {
-            break;
-        }
-        before = page.items.last().map(db::Cursor::before);
-        let more = page.has_more;
-        out.extend(page.items);
-        if !more {
-            break;
-        }
-    }
-    db::attach_tags(conn, &mut out)?;
-    out.retain(|m| filter.matches(m));
-    Ok(out)
-}
 
 #[cfg(test)]
 mod tests {
@@ -424,28 +296,11 @@ mod tests {
             "取不到字节时应当保留原引用，而不是编一个死链：{md}"
         );
         assert!(
-            !dir.join(ATTACHMENTS_DIR).exists(),
+            !dir.join(export::ATTACHMENTS_DIR).exists(),
             "没有字节就不该建附件目录"
         );
 
         fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn colliding_file_names_get_a_suffix_instead_of_overwriting_a_note() {
-        let mut used = HashSet::new();
-        let base = "2026-01-01-0000 会议.md";
-        assert_eq!(unique_name(&mut used, "项目A", base), base);
-        assert_eq!(
-            unique_name(&mut used, "项目A", base),
-            "2026-01-01-0000 会议-2.md"
-        );
-        assert_eq!(
-            unique_name(&mut used, "项目A", base),
-            "2026-01-01-0000 会议-3.md"
-        );
-        // 判重按目录来：另一个频道下的同名文件本来就该各自保留
-        assert_eq!(unique_name(&mut used, "项目B", base), base);
     }
 
     /// 直接改一条记录的 `created_at`。

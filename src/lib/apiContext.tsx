@@ -5,12 +5,15 @@ import type {
   ExportFilter,
   ExportSummary,
   HealthResponse,
+  LlmConfig,
   Message,
   MessagePage,
   SearchPage,
+  SuggestResult,
   SyncConfig,
   SyncStatus,
   TagCount,
+  TagSuggestion,
   TimelineStats,
   UpdateInfo,
 } from "./types";
@@ -183,6 +186,38 @@ export interface DesktopApi {
    * 于是永远打不开。清完之后同步一次即可补齐。
    */
   resetUploadFlags(): Promise<number>;
+
+  // ------------------------------------------------------------ AI 标签建议
+  //
+  // **整组都是桌面端专有**：它要调用户自己配的模型端点，而模型端点不存在
+  // 于服务端 —— 网页端没有地方放 API key，也不该有。
+
+  /** 读模型配置。没配过就是三个空串。 */
+  getLlmConfig(): Promise<LlmConfig>;
+
+  /**
+   * 写模型配置。
+   *
+   * **key 存在本机库里，跟着备份走，但不同步**（不进变更日志）——
+   * 另一台设备不该突然冒出一个指向本机 key 的配置。
+   */
+  setLlmConfig(config: LlmConfig): Promise<void>;
+
+  /** 这条记录上**还没采纳**的建议。 */
+  listTagSuggestions(messageId: string): Promise<TagSuggestion[]>;
+
+  /**
+   * 让模型给这条记录提标签，并把结果记成**建议**。
+   *
+   * **它不会改标签。** 结果只落在建议表里，用户点一下才变成真标签 ——
+   * 这是"AI 绝不能静默改数据"那条约束在界面上的形状。
+   *
+   * 最长 60 秒的阻塞往返（Rust 侧已标 `async`，不会冻住窗口）。
+   */
+  suggestTags(messageId: string): Promise<SuggestResult>;
+
+  /** 采纳一条建议：把它变成真标签，并标记这条建议已采纳。 */
+  acceptTagSuggestion(messageId: string, name: string): Promise<void>;
 }
 
 export interface ApiBundle {
@@ -198,6 +233,22 @@ export interface ApiBundle {
    * 没有推送能力的实现传 `undefined`，界面就退回原来的行为（靠操作后自己刷新）。
    */
   subscribeChanges?: (handler: () => void) => () => void;
+
+  /**
+   * 把筛选后的一部分下载成一个 zip。**只有网页端提供。**
+   *
+   * 为什么不是 `NoteApi` 的方法：桌面端导出走的是"挑一个目录、写一棵
+   * Markdown 目录树"（`desktop.exportMarkdown`），那是更好的形态 ——
+   * 不占内存、文件管理器里直接能翻。浏览器里写不出目录树，只能退化成
+   * 一个 zip 文件，于是两边是**两种做法**，而不是同一套接口的两个实现。
+   *
+   * 做成可选而不是让桌面端抛"不可用"：界面靠 `if (!exportZip)` 走另一条路，
+   * 不会给用户渲染出一个点下去没反应的按钮。
+   */
+  exportZip?: (
+    filter: ExportFilter,
+    utcOffsetMinutes: number
+  ) => Promise<ExportSummary>;
 }
 
 const Ctx = createContext<ApiBundle | null>(null);
@@ -206,18 +257,23 @@ export function ApiProvider({
   api,
   desktop = null,
   subscribeChanges,
+  exportZip,
   children,
 }: {
   api: NoteApi;
   desktop?: DesktopApi | null;
   subscribeChanges?: (handler: () => void) => () => void;
+  exportZip?: (
+    filter: ExportFilter,
+    utcOffsetMinutes: number
+  ) => Promise<ExportSummary>;
   children: ReactNode;
 }) {
   // 记住这个 bundle：不然每次渲染都换一个新对象，
   // 所有把 `api` 放进依赖数组的 effect 都会反复重跑。
   const value = useMemo(
-    () => ({ api, desktop, subscribeChanges }),
-    [api, desktop, subscribeChanges]
+    () => ({ api, desktop, subscribeChanges, exportZip }),
+    [api, desktop, subscribeChanges, exportZip]
   );
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }
