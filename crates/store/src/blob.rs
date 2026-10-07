@@ -40,6 +40,10 @@ pub struct BlobMeta {
 ///
 /// 幂等是内容寻址白送的性质：名字就是内容的哈希，所以"这个名字已经在了"
 /// 必然意味着"同样的字节已经在了"，不需要比较、也不需要覆盖。
+///
+/// **例外只有一种**：那行存在但字节是空的（占位行）。这时候本地握着的
+/// 这份字节要补进去 —— 原来 `DO NOTHING` 把这种也丢了，于是本地明明有、
+/// 却永远不会被上传。见下面冲突子句上的说明。
 pub fn put_blob(
     conn: &Connection,
     sha256: &str,
@@ -55,10 +59,30 @@ pub fn put_blob(
     );
 
     let mime = attachment::resolve_mime(bytes);
+    // **冲突时只补空的那一半。**
+    //
+    // 原来这里是 `DO NOTHING`，为的是"迟到的、不带字节的登记别把已下好的图擦掉"
+    // —— `register_placeholder` 那边确实是 `DO UPDATE ... WHERE bytes IS NULL`。
+    // 但 `DO NOTHING` 在这里同样把**反过来的**一种情况也一并丢掉了：
+    //
+    //   别的设备先同步过来一条引用了这张图的消息 → 本地建了一行 `bytes IS NULL`
+    //   的占位 → 用户在本机粘上**同一张图** → put_blob 撞上占位行，直接放弃。
+    //
+    // 本地明明握有逐字节相同的副本，却被丢弃，行永远空着。而 `pending_uploads`
+    // 只选有字节的行，所以这份数据**永远不会被上传** —— 只能等源设备上传后
+    // 由下载队列自愈；源设备要是没了，这张图在所有设备上永久损坏。
+    //
+    // `WHERE attachment.bytes IS NULL` 同时守住两半：占位行补上字节，
+    // 而已经有字节的行不被后来者覆盖（内容寻址下两者必然相同，覆盖也无害，
+    // 但守住"不覆盖"让意图写在代码里）。
     let changed = conn.execute(
         "INSERT INTO attachment (sha256, size, mime, created_at, bytes)
          VALUES (?1, ?2, ?3, ?4, ?5)
-         ON CONFLICT(sha256) DO NOTHING",
+         ON CONFLICT(sha256) DO UPDATE SET
+             bytes = excluded.bytes,
+             size  = excluded.size,
+             mime  = excluded.mime
+         WHERE attachment.bytes IS NULL",
         params![sha256, bytes.len() as i64, mime, created_at, bytes],
     )?;
     Ok(changed > 0)
@@ -79,8 +103,11 @@ pub fn register_placeholder(
     conn.execute(
         "INSERT INTO attachment (sha256, size, mime, created_at, bytes)
          VALUES (?1, 0, '', ?2, NULL)
-         ON CONFLICT(sha256) DO NOTHING",
-        params![sha256, created_at],
+         ON CONFLICT(sha256) DO UPDATE SET
+             bytes = excluded.bytes,
+             size  = excluded.size,
+             mime  = excluded.mime
+         WHERE attachment.bytes IS NULL",        params![sha256, created_at],
     )?;
     Ok(())
 }

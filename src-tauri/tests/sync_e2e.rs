@@ -17,7 +17,9 @@ use rusqlite::Connection;
 
 use messagenote_core::hlc::Hlc;
 use messagenote_core::models::SearchHit;
+use messagenote_core::attachment;
 use messagenote_core::wire::{Change, EntityKind};
+use messagenote_store::blob as store_blob;
 use messagenote_lib::db::{self, Db};
 use messagenote_lib::http::HttpServerApi;
 use messagenote_lib::sync::{sync_once, ServerApi};
@@ -1093,6 +1095,66 @@ fn uploading_the_same_bytes_twice_is_a_no_op() {
     // 内容不同则名字必须不同 —— 否则后一份会覆盖前一份
     let (_, other) = upload_blob(addr, &fake_png(1025), TOKEN);
     assert_ne!(first["sha256"], other["sha256"]);
+}
+/// **本机已经有字节时，占位行不该把这份字节丢掉。**
+///
+/// 还原的是这个顺序：
+///   1. 别的设备同步过来一条引用了这张图的消息 → 本地 `register_referenced`
+///      建了一行 `bytes IS NULL` 的占位；
+///   2. 用户在本机**粘上同一张图** → `put_blob`。
+///
+/// `put_blob` 原来用 `ON CONFLICT DO NOTHING`，撞上占位行就直接放弃 ——
+/// 本地明明握有逐字节相同的副本，却被丢弃。那一行永远空着，而
+/// `pending_uploads` 只选 `bytes IS NOT NULL` 的行，所以这份数据**永远不会被
+/// 上传**：只能等源设备上传后由下载队列自愈。源设备要是没了，这张图在所有
+/// 设备上永久损坏，而且没有任何一处报错。
+///
+/// 所以断言要落在两处：字节真的落库了（读得出来），以及这行进了待上传队列
+/// （否则数据只是本地看着对，压根出不去）。
+#[test]
+fn putting_bytes_onto_a_placeholder_fills_it_instead_of_dropping_them() {
+    let a = db::open_memory("e2e-placeholder-a").expect("建 A 库");
+    let conn = a.conn().expect("连接");
+    let payload = fake_png(2048);
+    let sha = attachment::sha256_hex(&payload);
+
+    // 1. 别的设备的消息先到，它的正文引用了这张图 → 本地只登记一个空壳
+    let n = store_blob::register_referenced(&conn, &format!("看这个 attachment:{sha}"), 1_000)
+        .expect("登记占位");
+    assert_eq!(n, 1, "这一行是新登记的（否则下面测的不是占位那一支）");
+
+    // 占位状态下确实没有字节
+    assert!(
+        store_blob::get_blob(&conn, &sha)
+            .expect("读附件")
+            .is_none(),
+        "登记完就该是空的 —— 它只是个占位"
+    );
+
+    // 2. 用户在本机粘上了同一张图
+    let changed = store_blob::put_blob(&conn, &sha, &payload, 2_000).expect("存字节");
+    assert!(
+        changed,
+        "撞上占位行时也该算一次写入 —— 不然调用方会以为这份字节被收下了"
+    );
+
+    // **核心断言**：字节真的落库了
+    assert_eq!(
+        store_blob::get_blob(&conn, &sha)
+            .expect("读附件")
+            .expect("占位行被填上了字节")
+            .1,
+        payload,
+        "本地明明有这份字节，占位行不该把它吃掉"
+    );
+
+    // 而且它进了待上传队列 —— 数据要能出去
+    let up = db::pending_uploads(&conn, 10).expect("看待上传");
+    assert_eq!(
+        up.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>(),
+        vec![sha.as_str()],
+        "有字节的行必须能被选中上传"
+    );
 }
 
 /// 取一份服务端没有的附件要回 **404**，不是 500。
