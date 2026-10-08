@@ -155,7 +155,24 @@ export function Composer({
             title="选一个文件（也可以直接粘贴或拖进来）"
             aria-label="选择文件"
           >
-            📎
+            {/* 回形针用 SVG 而不是 📎 emoji：emoji 在 Windows 上由彩色字体渲染，
+                15px 下又小又糊、和旁边的发送键对不齐；SVG 描边图标跟随
+                currentColor，hover 变色那套样式原样生效。
+                path 取自 lucide 的 paperclip（ISC 许可）—— 将来对上游 diff
+                有基准。 */}
+            <svg
+              viewBox="0 0 24 24"
+              width="18"
+              height="18"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              aria-hidden="true"
+            >
+              <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48" />
+            </svg>
           </button>
           <input
             ref={filePicker}

@@ -835,25 +835,30 @@ kbd {
   opacity: 0.8;
 }
 
-/* 发送键和上传键并排。给 6px 间隙：贴在一起会读成一个双段按钮，
+/* 发送键和上传键并排。给 8px 间隙：贴在一起会读成一个双段按钮，
    用户的眼睛会把它们当成同一个东西。 */
 .composer-actions {
   position: relative;
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
 }
 
-/* 上传图片。刻意做成不抢戏的样子 —— 粘贴和拖拽仍是主路径，
-   这个按钮只负责兜住那两条够不着的情形。 */
+/* 上传附件。刻意做成不抢戏的样子 —— 粘贴和拖拽仍是主路径，
+   这个按钮只负责兜住那两条够不着的情形。
+   固定 30×28 的命中区、图标居中：emoji 时代那个按钮实际可点面积
+   只有字身那么一点，还和发送键挤在一起。 */
 .attach-btn {
-  padding: 4px 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 28px;
+  padding: 0;
   border: 0;
   border-radius: 8px;
   background: transparent;
   color: var(--muted);
-  font-size: 0.9375rem;
-  line-height: 1;
   cursor: pointer;
   transition: background 0.12s ease, color 0.12s ease;
 }
