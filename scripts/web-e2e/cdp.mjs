@@ -176,7 +176,7 @@ export async function fill(s, selector, value) {
     s,
     `(() => {
        const el = document.querySelector(${JSON.stringify(selector)});
-       if (!el) throw new Error("找不到元素：${selector}");
+       if (!el) throw new Error("找不到元素：" + ${JSON.stringify(selector)});
        const proto = el.tagName === "TEXTAREA"
          ? HTMLTextAreaElement.prototype
          : HTMLInputElement.prototype;
@@ -192,7 +192,7 @@ export async function click(s, selector) {
     s,
     `(() => {
        const el = document.querySelector(${JSON.stringify(selector)});
-       if (!el) throw new Error("找不到元素：${selector}");
+       if (!el) throw new Error("找不到元素：" + ${JSON.stringify(selector)});
        el.click();
        return true;
      })()`
@@ -211,7 +211,10 @@ export async function realClick(s, selector) {
     s,
     `(() => {
        const el = document.querySelector(${JSON.stringify(selector)});
-       if (!el) throw new Error("找不到元素：${selector}");
+       // 错误消息里也必须 stringify：selector 带引号（属性选择器都会）时，
+       // 裸内插会把这行变成非法 JS —— 报出来的是 SyntaxError，
+       // 把真正想说的「找不到元素」吞掉了。
+       if (!el) throw new Error("找不到元素：" + ${JSON.stringify(selector)});
        for (const type of ["mousedown", "mouseup", "click"]) {
          el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true }));
        }
@@ -226,7 +229,7 @@ export async function pressEnter(s, selector) {
     s,
     `(() => {
        const el = document.querySelector(${JSON.stringify(selector)});
-       if (!el) throw new Error("找不到元素：${selector}");
+       if (!el) throw new Error("找不到元素：" + ${JSON.stringify(selector)});
        el.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
        return true;
      })()`
@@ -244,7 +247,7 @@ export async function selectOption(s, selector, value) {
     s,
     `(() => {
        const el = document.querySelector(${JSON.stringify(selector)});
-       if (!el) throw new Error("找不到元素：${selector}");
+       if (!el) throw new Error("找不到元素：" + ${JSON.stringify(selector)});
        Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value").set.call(
          el, ${JSON.stringify(value)}
        );
