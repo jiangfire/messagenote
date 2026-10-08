@@ -290,6 +290,11 @@ mod tests {
     ///
     /// 少了这道闸门，两个并发导出就是 2×256 MB —— 而那是**服务端被杀**，
     /// 用户看到的是一个没有头绪的 502 / 连接重置。
+    ///
+    /// 失败路径也在**同一个测试**里验：两条断言序列共享全局的
+    /// `EXPORT_INFLIGHT` 计数，拆成两个 `#[test]` 的话，cargo 的并行执行
+    /// 会让两边同时持闸互撞 —— 2026-10-08 的 CI 就是这么红的：一个测试
+    /// 拿着名额没放，另一个末尾的 `acquire` 吃到 429。
     #[test]
     fn only_one_export_may_run_at_a_time() {
         let first = ExportGate::acquire();
@@ -313,10 +318,9 @@ mod tests {
             ExportGate::acquire().is_ok(),
             "前一次结束后必须能再拿到名额"
         );
-    }
 
-    #[test]
-    fn the_gate_is_released_even_when_the_export_fails() {
+        // 失败路径：闭包里拿到闸门后返回错误，guard 随错误一起离开作用域，
+        // 名额必须照常归还（RAII，不是手动 unlock）。
         let result: ServerResult<()> = (|| {
             let _gate = ExportGate::acquire()?;
             Err(ServerError::Msg("模拟导出失败".into()))
