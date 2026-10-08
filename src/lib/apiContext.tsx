@@ -102,6 +102,21 @@ export interface DesktopApi {
   hideCapture(): Promise<void>;
   /** 本次启动记下的非致命警告（快捷键被占用之类）。挂载时读一次。 */
   getStartupWarnings(): Promise<string[]>;
+
+  /**
+   * 在**系统浏览器**里打开一个外部 URL。
+   *
+   * 为什么需要它：桌面端的 WebView 没有后退键，正文里的链接要是让它自己
+   * 导航过去，整个应用就被换成了那个网页，用户出不来 —— 唯一的逃生口是
+   * 重启应用。所以正文渲染处（见 `Markdown`）拦截链接点击后走这里，
+   * 而不是放任 WebView 导航。
+   *
+   * 实现是 opener 插件的 `openUrl`（内部走 ShellExecuteW，不是拼 shell
+   * 命令 —— URL 进 shell 等于命令注入面）。插件本身校验协议白名单，
+   * 调用方传进来的也只该是 http/https。
+   */
+  openExternal(url: string): Promise<void>;
+
   getSyncConfig(): Promise<SyncConfig>;
   setSyncConfig(url: string, token: string): Promise<void>;
   syncNow(): Promise<void>;

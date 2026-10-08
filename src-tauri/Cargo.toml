@@ -41,6 +41,11 @@ tauri-plugin-dialog = "2"
 # "点了没反应"。见 lib.rs 里的装配与逃生口说明。
 tauri-plugin-single-instance = "2"
 
+# 正文里的外链用系统浏览器打开。没有它，WebView 会**自己**导航过去 ——
+# 桌面端没有后退键，应用整个被一个链接换掉，用户只能重启。
+# 不自己拼 `cmd /c start`：URL 进 shell 就是命令注入面，插件走 ShellExecuteW。
+tauri-plugin-opener = "2"
+
 # 单条复制时把图片内联成 data URI。手写 base64 是纯风险（漏了填充、算错 6 位组
 # 都不会报错，只会得到一张画不出来的图），而它本来就在依赖树里（0.22.1）。
 base64 = "0.22"

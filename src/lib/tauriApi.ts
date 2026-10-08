@@ -1,6 +1,7 @@
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { api as commands } from "./api";
 import type { DesktopApi, NoteApi } from "./apiContext";
@@ -41,6 +42,7 @@ export const tauriApi: NoteApi = commands;
 
 export const tauriDesktop: DesktopApi = {
   hideCapture: () => commands.hideCapture(),
+  openExternal: (url) => openUrl(url),
   getSyncConfig: () => commands.getSyncConfig(),
   setSyncConfig: (url, token) => commands.setSyncConfig(url, token),
   syncNow: () => commands.syncNow(),

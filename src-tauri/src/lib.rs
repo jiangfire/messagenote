@@ -202,6 +202,9 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         // 导出时选目标目录。权限只给主窗口，见 capabilities/dialog.json。
         .plugin(tauri_plugin_dialog::init())
+        // 正文里的外链交给系统浏览器。权限只给主窗口，见 capabilities/opener.json ——
+        // 捕获浮层只有一个输入框，没有正文可点，不该有"让系统打开 URL"的能力。
+        .plugin(tauri_plugin_opener::init())
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, _shortcut, event| {

@@ -840,6 +840,64 @@ ok(
   `实际：${JSON.stringify(folderDropped.before)}`
 );
 
+// ---------------------------------------------------------------- 外链
+console.log("== 外链：点下去不带走页面 ==");
+
+// 正文里的链接不能让 WebView 自己导航 —— 桌面端没有后退键，点一下
+// 应用就被换成那个网页了。网页端的行为是开新标签、把应用留在原地
+// （桌面端走 opener 调系统浏览器，那条路只有实机能验证）。
+//
+// 探针 URL 刻意指向**同源**的一个不存在路径：SPA 兜底会返回 200，
+// 即使修复缺失、点击真的发生了导航，会话也还活着、能诚实地报红；
+// 指向外部域名的话，无外网环境下导航本身失败，红就看不到了。
+const probeUrl = new URL("/e2e-external-link-probe", APP).href;
+await fill(s, ".composer-input", `外链探针 ${probeUrl}`);
+await pressEnter(s, ".composer-input");
+await waitFor(
+  s,
+  `!![...document.querySelectorAll('.md a')].find(
+     (a) => a.getAttribute('href') === ${JSON.stringify(probeUrl)}
+   )`,
+  "正文里的 URL 渲染成可点的链接",
+  20000
+);
+
+// 把 window.open 换成记录桩。真开新标签在 headless 里既没必要也不可控；
+// 桩反而能断言「拿哪个 URL 开的、带没带 noopener」。
+// **用完必须还原**：现在后续用例没受影响，靠的是"全应用只有 Markdown 一处
+// 调 window.open"和"头像用例恰好 Page.reload 换掉整个 JS 上下文"这两个
+// 别人手里的巧合。哪天用例重排，后来者拿到的就是一个返回 null 的假
+// window.open —— 恰好是这套 e2e 最忌讳的"看起来绿、其实没测"。
+await evaluate(
+  s,
+  `(() => {
+     window.__origOpen = window.open;
+     window.__opened = null;
+     window.open = (url, target, features) => {
+       window.__opened = { url, target, features };
+       return null;
+     };
+     return true;
+   })()`
+);
+const locBefore = await evaluate(s, "location.href");
+await realClick(s, `.md a[href="${probeUrl}"]`);
+await sleep(200);
+const opened = await evaluate(s, "window.__opened");
+const locAfter = await evaluate(s, "location.href");
+await evaluate(
+  s,
+  "window.open = window.__origOpen; delete window.__origOpen; delete window.__opened; true"
+);
+ok(
+  "点外链是开新标签（window.open + _blank + noopener），不是把当前页面导航走",
+  opened?.url === probeUrl &&
+    opened?.target === "_blank" &&
+    String(opened?.features ?? "").includes("noopener") &&
+    locAfter === locBefore,
+  `window.open 收到：${JSON.stringify(opened)}；location ${locAfter === locBefore ? "没动" : "变了"}`
+);
+
 // ---------------------------------------------------------------- 头像
 console.log("== 头像：能换成自己上传的图 ==");
 

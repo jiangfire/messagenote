@@ -1,0 +1,13 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "opener",
+  "description": "在系统浏览器里打开外链的权限只给主窗口 —— 只有它渲染笔记正文，捕获浮层里没有可点的链接，不该有能力让系统打开任意 URL。和 dialog.json 同一个思路：按窗口给最小权限。这里要两条一起给：allow-open-url 只放行命令本身、不带 URL 作用域（open_url 内部按作用域校验，空作用域 = 全部拒绝，实机踩过：报 Not allowed to open url）；作用域显式收成 http/https 两条 —— 界面上唯一会走 openExternal 的地方（Markdown 的链接拦截）也只送这两种协议，mailto/tel 不给：授了没人用的权限，和 default.json 里反对的那类多余授权是一回事。刻意不要 opener:default —— 它顺带放开 reveal-item-in-dir（在文件管理器里定位文件），这里用不上。",
+  "windows": ["main"],
+  "permissions": [
+    "opener:allow-open-url",
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [{ "url": "https://*" }, { "url": "http://*" }]
+    }
+  ]
+}
