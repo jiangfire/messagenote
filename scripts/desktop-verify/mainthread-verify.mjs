@@ -1,6 +1,6 @@
 // R8 真机验证：长命令跑在主线程时界面不能冻结（scripts/desktop-verify）
 //
-// 背景（REVIEW-2026-10-06.md R8）：`commands.rs` 里 27 个 `#[tauri::command]`
+// 背景（v1.7.0 全库审查 R8）：`commands.rs` 里 27 个 `#[tauri::command]`
 // 原本**全是同步函数**。Tauri v2 的同步命令在**主线程内联执行**，于是
 // `test_sync_connection`（最长 30 秒）、`export_markdown`（不设上界的文件 I/O）、
 // `save_attachment`（IPC 上反序列化约 100 MB 的 JSON 数字数组）跑的时候，

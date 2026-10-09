@@ -1,6 +1,6 @@
 // R7 真机验证：附件上传失败不能饿死拉取（scripts/desktop-verify）
 //
-// 背景（REVIEW-2026-10-06.md R7）：`sync.rs` 原先的顺序是
+// 背景（v1.7.0 全库审查 R7）：`sync.rs` 原先的顺序是
 // `push → blobs_up → pull → blobs_down`，而 `blobs_up` 里的
 // `api.put_blob(&bytes)?` 失败会**中止整轮**。于是一张在慢上行里传不完的
 // 25 MB 图，会让 pull **永远轮不到**，下一轮又卡在同一个附件上 ——
