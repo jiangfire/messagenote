@@ -1,4 +1,4 @@
-import { marked } from "marked";
+import { marked, type Tokens } from "marked";
 import DOMPurify from "dompurify";
 
 /**
@@ -14,6 +14,58 @@ marked.setOptions({
   gfm: true,
   // 聊天式记录里换行就是换行，不该像写文档那样要求空行才分段
   breaks: true,
+});
+
+/**
+ * 把一段**来源文本**转成安全的字面文本（实体转义），让浏览器把它显示
+ * 为原文而不是当标签解析。下面的 renderer 覆盖都要靠它。
+ */
+const ESCAPED_AS: Record<string, string> = {
+  "&": "&amp;",
+  "<": "&lt;",
+  ">": "&gt;",
+  '"': "&quot;",
+  "'": "&#39;",
+};
+
+function escapeAsText(s: string): string {
+  return s.replace(/[&<>"']/g, (ch) => ESCAPED_AS[ch]);
+}
+
+/**
+ * 反斜杠和「长得像标签」的内容按原文显示，不当 markdown 语法消耗。
+ *
+ * 背景：这个应用是拿来记 sed 命令、vim 替换、Windows 路径、HTML 片段的，
+ * 而 marked 的默认行为会**无声地吃掉**这类输入 —— 用户实测过两条：
+ * `%s/vllm\/vllm-openai:v0.26.0` 显示成 `%s/vllm/vllm-openai:v0.26.0`
+ * （`\` + 标点的转义在词法阶段就被消化，渲染层拿到的 token 里反斜杠
+ * 已经没了）；`<config>` 整段消失（marked 把它当原生 HTML 原样吐出，
+ * 随后被下面 DOMPurify 的白名单整个删掉）。原则是「看到的就是输入的」：
+ * 覆盖掉的这三种 token 一律按原文显示。
+ *
+ * 不经过这些覆盖的照旧：代码块/行内代码（本来就不处理转义）、
+ * `<https://…>` 和邮箱自动链接（走 link token，照样可点）、以及全部
+ * 常规 markdown（加粗、列表、表格……）。返回 `false` 表示回落到
+ * marked 的默认渲染。
+ */
+marked.use({
+  renderer: {
+    /** `\` + 标点（`\/`、`\*`…）：token.raw 是含反斜杠的原文，照它显示。 */
+    text(token: Tokens.Text | Tokens.Escape) {
+      return token.type === "escape" ? escapeAsText(token.raw) : false;
+    },
+    /** 行尾 `\`（bash/docker 续行符）默认被当硬换行语法吃掉：字符放回来，换行保留。 */
+    br(token: Tokens.Br) {
+      return token.raw.startsWith("\\") ? "\\<br>" : false;
+    },
+    /**
+     * 原生 HTML 片段（块级和行内同一个出口）：显示为文本。副作用是
+     * 笔记里手写的 `<b>x</b>` 不再按 HTML 渲染 —— 这是故意的取舍。
+     */
+    html({ text }: Tokens.HTML | Tokens.Tag) {
+      return escapeAsText(text);
+    },
+  },
 });
 
 /**

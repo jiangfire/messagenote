@@ -1638,6 +1638,50 @@ ok(
   await evaluate(s, `!!document.querySelector('.app')`)
 );
 
+// ---------------------------------------------------------------- 特殊字符
+console.log("== 特殊字符：反斜杠和尖括号按原文显示 ==");
+
+// 用户实测的两个坏例子：`%s/vllm\/…` 显示成 `%s/vllm/…` —— markdown 的
+// `\`+标点转义在词法阶段把反斜杠消化掉了；`<config>` 整段消失 —— 被
+// marked 当成原生 HTML 塞进 DOM，随后消毒器不认识，整个删掉。断言盯的
+// 是渲染后的 **textContent**（已解码），逐字还原才算过；单看 innerHTML
+// 会被 `&lt;` 之类转义骗过去。
+const nastyLine = "%s/vllm\\/vllm-openai:v0.26.0 <config> <TOKEN>";
+await fill(s, ".composer-input", nastyLine);
+await pressEnter(s, ".composer-input");
+const nastyMd = `[...document.querySelectorAll('.md')].find(
+  (el) => el.textContent.includes('vllm-openai:v0.26.0')
+)`;
+await waitFor(s, `!!${nastyMd}`, "特殊字符消息渲染出来", 15000);
+const nastyText = await evaluate(s, `${nastyMd}.textContent`);
+ok(
+  "反斜杠不被 markdown 吃掉（sed 替换命令逐字显示）",
+  nastyText.includes("%s/vllm\\/vllm-openai:v0.26.0"),
+  JSON.stringify(nastyText)
+);
+ok(
+  "尖括号内容显示为文本而不是整段消失",
+  nastyText.includes("<config>") && nastyText.includes("<TOKEN>"),
+  JSON.stringify(nastyText)
+);
+ok(
+  "渲染产物里没有真的 <config>/<TOKEN> 元素",
+  await evaluate(s, `document.querySelectorAll('.md config, .md TOKEN').length === 0`)
+);
+
+// 别反向误伤：普通换行还是 <br>（breaks:true），多行消息体感不变。
+await fill(s, ".composer-input", "换行探针第一行\n换行探针第二行");
+await pressEnter(s, ".composer-input");
+const brMd = `[...document.querySelectorAll('.md')].find(
+  (el) => el.textContent.includes('换行探针第二行')
+)`;
+await waitFor(s, `!!${brMd}`, "换行探针渲染出来", 15000);
+ok(
+  "普通换行仍然是 <br>",
+  await evaluate(s, `${brMd} && ${brMd}.innerHTML.includes('<br>')`),
+  await evaluate(s, `${brMd} ? ${brMd}.innerHTML : "（没有渲染）"`)
+);
+
 // ---------------------------------------------------------------- 收尾
 console.log("== 页面健康 ==");
 ok(
