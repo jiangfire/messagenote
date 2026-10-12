@@ -172,13 +172,6 @@ export interface DesktopApi {
     utcOffsetMinutes: number,
     filter?: ExportFilter | null
   ): Promise<ExportSummary>;
-  /**
-   * 把一条记录渲染成 Markdown，给"复制这一条"用。
-   *
-   * 这条已经不在了（被删掉）返回 `null` —— 界面据此说"这条记录已经不在了"，
-   * 而不是把一句数据库错误摔到用户脸上。
-   */
-  renderMessageMarkdown(id: string, utcOffsetMinutes: number): Promise<string | null>;
 
   // ------------------------------------------------------------ 附件维护
   //

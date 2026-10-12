@@ -30,9 +30,8 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::Connection;
 
-use base64::Engine as _;
 use messagenote_core::attachment;
 use messagenote_core::export::{self, ExportItem};
 
@@ -54,65 +53,6 @@ pub struct ExportSummary {
     /// 否则他只会以为导出漏了。
     pub missing_attachments: usize,
     pub channels: usize,
-}
-
-/// 单条记录渲染成 Markdown（"复制这一条"用）。
-///
-/// `Ok(None)` 表示这条不在了（被删掉或 id 不对）—— 调用方据此给用户一句
-/// "这条记录已经不在了"，而不是抛一句数据库错误。
-///
-/// **单条复制与全量导出的差别只有附件怎么放**：这里把图内联成 data URI
-/// （剪贴板里没有"文件"这个概念，只有文本），导出那边写相对路径 + 单独的文件。
-/// 格式、front-matter、消毒都走同一份实现。
-pub fn render_one(
-    conn: &Connection,
-    id: &str,
-    utc_offset_minutes: i32,
-) -> AppResult<Option<String>> {
-    let row = conn
-        .query_row(
-            "SELECT id, channel_id, body, created_at, updated_at
-               FROM message WHERE id = ?1 AND deleted_at IS NULL",
-            [id],
-            db::row_to_message,
-        )
-        .optional()?;
-    let Some(mut m) = row else {
-        return Ok(None);
-    };
-    db::attach_tags(conn, std::slice::from_mut(&mut m))?;
-
-    let channels = channel_names(conn)?;
-    let channel = channels
-        .get(&m.channel_id)
-        .map(String::as_str)
-        .unwrap_or(export::ORPHAN_CHANNEL);
-
-    let item = ExportItem {
-        channel,
-        tags: &m.tags,
-        created_at: m.created_at,
-        updated_at: m.updated_at,
-        body: &m.body,
-    };
-    Ok(Some(export::render_markdown(
-        &item,
-        utc_offset_minutes,
-        // **单条复制把图内联成 data URI。** 剪贴板里带不走文件，而留着
-        // `attachment:<sha>` 对别的程序就是一句看不懂的话 —— 复制出去贴到任何
-        // 能画 Markdown 的地方（GitHub、Obsidian、LLM 对话框），图都还在。
-        //
-        // 全量导出那边**刻意不同**：它有磁盘可用，写相对路径、图单独成文件，
-        // 所以导出物是可读、可 diff 的文本。两处的差别来自"有没有地方放字节"，
-        // 不是两套格式。
-        |sha| {
-            let (_stored_mime, bytes) = db::read_attachment(conn, sha).ok()?;
-            // 类型**由字节嗅探**，不采信库里存的那一列 —— 和上传路径同一条规矩。
-            let mime = attachment::resolve_mime(&bytes);
-            let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-            Some(format!("data:{mime};base64,{b64}"))
-        },
-    )))
 }
 
 /// 把整库（或筛选出的那一部分）导出到 `dir`（不存在就建）。
@@ -486,68 +426,6 @@ mod tests {
         assert!(md_files_in(&dir.join("收件箱")).is_empty());
 
         fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn render_one_inlines_attachments_so_the_copy_is_self_contained() {
-        let db = db::open_memory("test-device").unwrap();
-        let conn = db.conn().unwrap();
-
-        let png = png_bytes();
-        let sha = db::save_attachment(&conn, &png).unwrap();
-        let m = db::append_message(&conn, &format!("截图 attachment:{sha}"), None).unwrap();
-
-        let md = render_one(&conn, &m.id, 0).unwrap().expect("记录应当存在");
-        // 剪贴板里带不走文件，而 `attachment:<sha>` 对别的程序是一句看不懂的话。
-        assert!(
-            !md.contains("attachment:"),
-            "不该留下别的程序看不懂的引用：{md}"
-        );
-
-        // **把 data URI 解回来，断言字节一致。** 只断言"有个
-        // data:image/png;base64," 是弱断言 —— base64 编码写错时它照样通过。
-        let b64 = md
-            .split("base64,")
-            .nth(1)
-            .expect("正文里应当有一个 data URI")
-            .split_whitespace()
-            .next()
-            .unwrap()
-            .trim_end_matches(')');
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(b64)
-            .unwrap();
-        assert_eq!(decoded, png, "解回来的字节必须和库里那份逐字节一致");
-        assert!(md.contains("data:image/png;base64,"), "类型由字节嗅探决定");
-
-        assert!(md.contains("channel: \"收件箱\""), "实际：{md}");
-        assert!(md.contains("created: 20"), "实际：{md}");
-    }
-
-    #[test]
-    fn render_one_keeps_the_raw_reference_when_the_bytes_are_not_local() {
-        let db = db::open_memory("test-device").unwrap();
-        let conn = db.conn().unwrap();
-
-        // 只有占位行，字节还没下载到。编不出 data URI，那就**留着原引用** ——
-        // 它至少诚实地说明"这里本来有张图"，而不是一条指向虚空的路径。
-        let sha = "e".repeat(64);
-        let m = db::append_message(&conn, &format!("看图 attachment:{sha}"), None).unwrap();
-
-        let md = render_one(&conn, &m.id, 0).unwrap().expect("记录应当存在");
-        assert!(md.contains(&format!("attachment:{sha}")), "实际：{md}");
-    }
-
-    #[test]
-    fn render_one_returns_none_for_a_record_that_is_gone() {
-        let db = db::open_memory("test-device").unwrap();
-        let conn = db.conn().unwrap();
-        assert!(render_one(&conn, "不存在的-id", 0).unwrap().is_none());
-
-        // 软删除之后也算"不在了"
-        let m = db::append_message(&conn, "待删", None).unwrap();
-        db::delete_message(&conn, &m.id).unwrap();
-        assert!(render_one(&conn, &m.id, 0).unwrap().is_none());
     }
 
     #[test]

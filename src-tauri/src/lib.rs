@@ -339,7 +339,6 @@ pub fn run() {
             commands::suggest_tags,
             commands::accept_tag_suggestion,
             commands::export_markdown,
-            commands::render_message_markdown,
             commands::relaunch,
         ])
         .run(tauri::generate_context!());

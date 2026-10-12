@@ -374,20 +374,6 @@ pub fn export_markdown(
     )
 }
 
-/// 把一条记录渲染成 Markdown，给「复制这一条」用。
-///
-/// 返回 `null` 表示这条已经不在了（被删掉，或 id 不对）—— 界面据此说
-/// "这条记录已经不在了"，而不是把一句数据库错误摔到用户脸上。
-#[tauri::command]
-pub fn render_message_markdown(
-    db: State<'_, Db>,
-    id: String,
-    utc_offset_minutes: i32,
-) -> AppResult<Option<String>> {
-    let conn = db.conn()?;
-    crate::export::render_one(&conn, &id, utc_offset_minutes)
-}
-
 /// 装完更新之后重启自己。
 ///
 /// **不能直接用插件自带的重启。** `tauri::process::restart` 是"起一个新进程，

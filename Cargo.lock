@@ -2439,7 +2439,6 @@ dependencies = [
 name = "messagenote"
 version = "1.8.1"
 dependencies = [
- "base64 0.22.1",
  "messagenote-core",
  "messagenote-server",
  "messagenote-store",

@@ -46,10 +46,6 @@ tauri-plugin-single-instance = "2"
 # 不自己拼 `cmd /c start`：URL 进 shell 就是命令注入面，插件走 ShellExecuteW。
 tauri-plugin-opener = "2"
 
-# 单条复制时把图片内联成 data URI。手写 base64 是纯风险（漏了填充、算错 6 位组
-# 都不会报错，只会得到一张画不出来的图），而它本来就在依赖树里（0.22.1）。
-base64 = "0.22"
-
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
