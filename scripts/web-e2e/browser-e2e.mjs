@@ -1214,26 +1214,8 @@ await evaluate(
   })()`
 );
 
-/** 新建一个频道并等它出现在侧边栏。 */
-const makeChannel = async (name) => {
-  await evaluate(
-    s,
-    `(() => {
-      // 频道区是**第一个** .section（第二个是标签）。注意那个按钮的 onClick
-      // 是 setAdding(v => !v)：输入框开着时再点会把它关掉，所以先查。
-      if (!document.querySelector('.inline-input')) {
-        const btn = document.querySelectorAll('.section')[0]
-          .querySelector('.icon-btn');
-        if (!btn) throw new Error('找不到新建频道的按钮');
-        btn.click();
-      }
-      return true;
-    })()`
-  );
-  await waitFor(s, `!!document.querySelector('.inline-input')`, `「${name}」输入框`);
-  await fill(s, ".inline-input", name);
-  await pressEnter(s, ".inline-input");
-  const channelExists = (name) =>
+/** 侧边栏现在的频道快照：有没有这个名字、输入框开没开、草稿是什么。 */
+const channelExists = (name) =>
   evaluate(
     s,
     `(() => {
@@ -1245,18 +1227,71 @@ const makeChannel = async (name) => {
      })()`
   );
 
-const until = Date.now() + 10000;
-let seen = null;
-while (Date.now() < until) {
-  seen = await channelExists(name);
-  if (seen.found && !seen.open) break;
-  await sleep(200);
-}
-ok(
-  `「${name}」建好并出现在侧边栏`,
-  Boolean(seen?.found) && !seen?.open,
-  JSON.stringify(seen)
-);
+/**
+ * 新建一个频道并等它出现在侧边栏。**整个流程最多试 3 遍。**
+ *
+ * 2026-10-12 的 CI 挂过一次：慢 runner 上 fill 之后 React 的受控值没被
+ * onChange 接住，Enter 提交了空草稿 —— Sidebar 的 commit() 对空值的行为
+ * 是「不建频道、直接关框」，于是输入框关着、频道不存在，轮询干等 10 秒
+ * 后失败，而重跑即绿。与其背一次随机红，不如在这里把竞态吸收掉。
+ */
+const makeChannel = async (name) => {
+  let seen = null;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    // 上一遍可能留下开着的输入框（Enter 落空时 commit 没跑）。
+    // 先按 Esc 关掉，不然这次点 ＋ 会把它关上而不是打开。
+    await evaluate(
+      s,
+      `(() => {
+        document.querySelector('.inline-input')?.dispatchEvent(
+          new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+        return true;
+      })()`
+    );
+
+    // 频道区是**第一个** .section（第二个是标签）。注意那个按钮的 onClick
+    // 是 setAdding(v => !v)：输入框开着时再点会把它关掉，所以先查。
+    await evaluate(
+      s,
+      `(() => {
+        if (!document.querySelector('.inline-input')) {
+          const btn = document.querySelectorAll('.section')[0]
+            .querySelector('.icon-btn');
+          if (!btn) throw new Error('找不到新建频道的按钮');
+          btn.click();
+        }
+        return true;
+      })()`
+    );
+    await waitFor(s, `!!document.querySelector('.inline-input')`, `「${name}」输入框`);
+    await fill(s, ".inline-input", name);
+
+    // **填完必须回读一遍，再按 Enter。** fill 走原生 setter + input 事件，
+    // 派发那一刻 DOM 值必然是对的；但受控输入的真值在 React state 里 ——
+    // onChange 没被接住的话，下一拍的重渲染会把 DOM 值冲回旧值。
+    // sleep 一拍后回读，查得出的才叫竞态；不对就整遍重来。
+    await sleep(100);
+    const typed = await evaluate(
+      s,
+      `document.querySelector('.inline-input')?.value ?? null`
+    );
+    if (typed !== name) continue;
+
+    await pressEnter(s, ".inline-input");
+
+    const until = Date.now() + 10000;
+    while (Date.now() < until) {
+      seen = await channelExists(name);
+      if (seen.found && !seen.open) break;
+      await sleep(200);
+    }
+    if (seen?.found && !seen?.open) break;
+  }
+  ok(
+    `「${name}」建好并出现在侧边栏`,
+    Boolean(seen?.found) && !seen?.open,
+    JSON.stringify(seen ?? { found: false, note: "三遍都没能把名字填进输入框" })
+  );
 };
 
 /** 按名字点侧边栏里的频道。 */
