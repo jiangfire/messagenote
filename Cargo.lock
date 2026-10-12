@@ -2437,7 +2437,7 @@ dependencies = [
 
 [[package]]
 name = "messagenote"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "messagenote-core",
  "messagenote-server",
@@ -2461,7 +2461,7 @@ dependencies = [
 
 [[package]]
 name = "messagenote-core"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -2471,7 +2471,7 @@ dependencies = [
 
 [[package]]
 name = "messagenote-server"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "axum",
  "futures-util",
@@ -2491,7 +2491,7 @@ dependencies = [
 
 [[package]]
 name = "messagenote-store"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "messagenote-core",
  "rusqlite",
