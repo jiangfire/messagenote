@@ -221,6 +221,7 @@ kbd {
 /* 贴在侧边栏最下面：上面的频道/标签是"往上堆"的内容，用户区是恒定的"我是谁"。
    margin-top: auto 在内容不满一屏时把它钉在底部；超屏时跟在内容后面滚动。 */
 .user-badge {
+  position: relative;
   margin-top: auto;
   display: flex;
   align-items: center;
@@ -228,11 +229,22 @@ kbd {
   width: 100%;
   padding: 9px;
   border: 0;
-  border-top: 1px solid var(--border);
+  border-radius: 8px;
   background: transparent;
   text-align: left;
   color: var(--text);
   cursor: pointer;
+}
+
+/* 顶上一条分隔线：独立于按钮本体（::before 悬在外面），这样悬停背景的
+   8px 圆角不会被一条跟着弯的 border 拖变形 —— 悬停态和 nav-item 一致。 */
+.user-badge::before {
+  content: "";
+  position: absolute;
+  top: -9px; /* 落在 flex gap（18px）的正中间 */
+  left: 0;
+  right: 0;
+  border-top: 1px solid var(--border);
 }
 
 .user-badge:hover {
@@ -550,6 +562,16 @@ kbd {
 .avatar-wrap:hover .avatar-clear,
 .avatar-clear:focus-visible {
   opacity: 1;
+}
+
+/* 上传进行中的禁用态：露出来但明显点不动（半亮 + 默认光标），
+   特意放在 hover 规则后面把 opacity 压回去。 */
+.avatar-clear:disabled {
+  cursor: default;
+}
+
+.avatar-wrap:hover .avatar-clear:disabled {
+  opacity: 0.35;
 }
 
 /* ---------------- 用户资料弹窗 ---------------- */
@@ -1319,6 +1341,11 @@ kbd {
 .field select:disabled,
 .field textarea:disabled {
   opacity: 0.6;
+}
+
+/* 备注框只让纵向拖：横向拖宽会顶破弹窗的 padding */
+.field textarea {
+  resize: vertical;
 }
 
 .modal-actions {

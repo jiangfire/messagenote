@@ -65,12 +65,15 @@ export function UserSettings({ onClose }: { onClose: () => void }) {
               {url ? <img src={url} alt="" /> : "我"}
             </button>
 
-            {/* 换回默认。只有真的设过才给这个出口，否则它是个永远点不动的装饰。 */}
+            {/* 换回默认。只有真的设过才给这个出口，否则它是个永远点不动的装饰。
+                上传进行中禁用：否则"上传完成写回 sha"会赢过刚点的清除，
+                头像看起来清不掉。 */}
             {url && (
               <button
                 type="button"
                 className="avatar-clear"
                 onClick={clearAvatar}
+                disabled={busy}
                 title="换回默认头像"
                 aria-label="换回默认头像"
               >

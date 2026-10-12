@@ -28,12 +28,15 @@ export default defineConfig({
       // - target 是 workspace 的构建产物目录，里面全是被 cargo 锁住的
       //   .dll/.exe；watch 它会直接以 EBUSY 崩掉整个 dev server
       // - .cargo / .pnpm-store 是依赖缓存，动辄几万个文件
+      // - .scratch 是 e2e 的浏览器 profile 目录，跑用例时里面的 cache.db
+      //   会被 Edge 锁住 —— dev 和 e2e 同时开时同样会以 EBUSY 崩掉 dev
       ignored: [
         "**/src-tauri/**",
         "**/crates/**",
         "**/target/**",
         "**/.cargo/**",
         "**/.pnpm-store/**",
+        "**/.scratch/**",
       ],
     },
   },

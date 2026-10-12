@@ -1036,6 +1036,30 @@ ok(
 );
 await screenshot(s, `${SHOTS}/web-09c-avatar.png`);
 
+// maxLength（30/200）是产品参数：超限要被浏览器截断。
+// 截断发生在浏览器的**编辑管线**里 —— 真实键入/粘贴才走那条路，
+// 直接给 value 赋值（fill 那条路）不经过它（实测 40 字原样进去了）。
+// 所以这里用 CDP 的 Input.insertText 从输入层插入，等同真实键入。
+await click(s, ".user-badge");
+await waitFor(s, `!!document.querySelector('.user-settings')`, "打开弹窗测超限截断");
+await fill(s, ".user-name-input", "");
+await fill(s, ".user-bio-input", "");
+await evaluate(s, `document.querySelector('.user-name-input').focus(); true`);
+await s.send("Input.insertText", { text: "x".repeat(40) });
+await evaluate(s, `document.querySelector('.user-bio-input').focus(); true`);
+await s.send("Input.insertText", { text: "y".repeat(250) });
+ok(
+  "用户名超 30 字被截断（maxLength 生效）",
+  await evaluate(s, `document.querySelector('.user-name-input').value.length === 30`)
+);
+ok(
+  "备注超 200 字被截断（maxLength 生效）",
+  await evaluate(s, `document.querySelector('.user-bio-input').value.length === 200`)
+);
+// 关掉弹窗再走清理；下面 removeItem + 刷新会把这两个测试值抹掉
+await click(s, ".user-settings .btn.primary");
+await waitFor(s, `!document.querySelector('.user-settings')`, "超限测试后关闭弹窗");
+
 // 换回默认。没设过头像时不该有这个出口（一个永远点不动的装饰），
 // 设过之后点它要真的退回「我」，否则用户设错了就没有回头路。
 //
