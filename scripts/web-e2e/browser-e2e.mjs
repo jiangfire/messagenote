@@ -898,15 +898,68 @@ ok(
   `window.open 收到：${JSON.stringify(opened)}；location ${locAfter === locBefore ? "没动" : "变了"}`
 );
 
-// ---------------------------------------------------------------- 头像
-console.log("== 头像：能换成自己上传的图 ==");
+// ---------------------------------------------------------------- 用户资料
+console.log("== 用户资料：头像 / 用户名 / 备注，统一在左下角设置 ==");
 
 ok(
-  "默认头像有入口可以更换（不是写死的「我」）",
-  await evaluate(s, `!!document.querySelector('.avatar-btn, .avatar-upload')`),
-  "写死的「我」字符让用户没法用自己的图"
+  "左下角有用户区入口（头像 + 用户名）",
+  await evaluate(s, `!!document.querySelector('.user-badge')`),
+  "用户资料没有一个统一的入口"
+);
+ok(
+  "用户区钉在侧边栏最下面（左下角，不跟着内容浮动）",
+  await evaluate(
+    s,
+    `(() => {
+       const b = document.querySelector('.user-badge');
+       const bar = document.querySelector('.sidebar');
+       if (!b || !bar) return false;
+       const rb = b.getBoundingClientRect();
+       const rs = bar.getBoundingClientRect();
+       // 贴着侧边栏底边（留出 sidebar 自身的 padding），水平方向也在侧边栏内
+       return rs.bottom - rb.bottom < 24 && rb.left >= rs.left && rb.right <= rs.right;
+     })()`
+  )
+);
+ok(
+  "消息流里的头像不再承担设置入口（纯展示）",
+  await evaluate(s, `!document.querySelector('.msg-row .avatar-btn')`),
+  "一列消息里几十个可点的圆圈只会是噪音"
+);
+ok(
+  "没设过用户名时用户区显示「我」",
+  await evaluate(
+    s,
+    `document.querySelector('.user-badge-name')?.innerText.trim() === '我'`
+  )
 );
 
+// 打开用户资料弹窗。头像、用户名、备注三个设置都从这里进。
+await click(s, ".user-badge");
+await waitFor(s, `!!document.querySelector('.user-settings')`, "用户资料弹窗打开");
+ok("点左下角用户区打开资料弹窗", true);
+
+await screenshot(s, `${SHOTS}/web-09c-user-settings.png`);
+
+// 用户名 + 备注。填进去当场生效（没有保存按钮 —— 都是本机偏好，改了即存）
+await fill(s, ".user-name-input", "测试员");
+await fill(s, ".user-bio-input", "一句话备注");
+ok(
+  "用户名当场反映到左下角（弹窗还开着，说明是即存即显）",
+  await evaluate(
+    s,
+    `document.querySelector('.user-badge-name')?.innerText.trim() === '测试员'`
+  )
+);
+ok(
+  "备注显示在用户名下面",
+  await evaluate(
+    s,
+    `document.querySelector('.user-badge-bio')?.innerText.trim() === '一句话备注'`
+  )
+);
+
+// 头像：在弹窗里换
 await evaluate(
   s,
   `(async () => {
@@ -929,12 +982,12 @@ await evaluate(
 
 await waitFor(
   s,
-  `!!document.querySelector('.avatar img') && document.querySelector('.avatar img').naturalWidth > 0`,
+  `(() => { const i = document.querySelector('.msg-row .avatar img'); return !!i && i.naturalWidth === 32; })()`,
   "头像换成用户自己上传的图",
   20000
 );
 ok(
-  "消息流里的头像变成了用户上传的图",
+  "消息流里的头像变成了用户上传的图（弹窗开着就跟着变）",
   await evaluate(
     s,
     `(() => {
@@ -943,8 +996,20 @@ ok(
      })()`
   )
 );
+ok(
+  "弹窗里的大预览也是同一张图",
+  await evaluate(
+    s,
+    `(() => {
+       const img = document.querySelector('.user-settings .avatar-lg img');
+       return !!img && img.naturalWidth === 32;
+     })()`
+  )
+);
 
-// 刷新之后还在 —— 只在内存里换了一下等于没换
+// 关掉弹窗，然后刷新。刷新之后还在 —— 只在内存里换了一下等于没换
+await click(s, ".user-settings .btn.primary");
+await waitFor(s, `!document.querySelector('.user-settings')`, "用户资料弹窗关闭");
 await s.send("Page.reload", { ignoreCache: true });
 await sleep(1500);
 await waitFor(s, `!!document.querySelector('.app')`, "刷新后主界面");
@@ -958,16 +1023,32 @@ ok(
      })()`
   )
 );
+ok(
+  "刷新之后用户名和备注还在",
+  await evaluate(
+    s,
+    `(() => {
+       const name = document.querySelector('.user-badge-name')?.innerText.trim();
+       const bio = document.querySelector('.user-badge-bio')?.innerText.trim();
+       return name === '测试员' && bio === '一句话备注';
+     })()`
+  )
+);
 await screenshot(s, `${SHOTS}/web-09c-avatar.png`);
 
 // 换回默认。没设过头像时不该有这个出口（一个永远点不动的装饰），
 // 设过之后点它要真的退回「我」，否则用户设错了就没有回头路。
 //
-// 先把 localStorage 里存的 sha 抹掉再刷新，验的是"从没设过"的初始态。
-await evaluate(s, `localStorage.removeItem('messagenote.avatarSha'); true`);
+// 先把 localStorage 里存的资料抹掉再刷新，验的是"从没设过"的初始态。
+await evaluate(
+  s,
+  `localStorage.removeItem('messagenote.avatarSha');
+   localStorage.removeItem('messagenote.userName');
+   localStorage.removeItem('messagenote.userBio'); true`
+);
 await s.send("Page.reload", { ignoreCache: true });
 await sleep(1600);
-await waitFor(s, `!!document.querySelector('.app')`, "清掉头像后主界面");
+await waitFor(s, `!!document.querySelector('.app')`, "清掉资料后主界面");
 ok(
   "清掉 localStorage 里的头像后退回「我」",
   await evaluate(
@@ -978,6 +1059,20 @@ ok(
      })()`
   )
 );
+ok(
+  "用户名退回「我」、备注不再占一行",
+  await evaluate(
+    s,
+    `(() => {
+       const name = document.querySelector('.user-badge-name')?.innerText.trim();
+       const bio = document.querySelector('.user-badge-bio');
+       return name === '我' && !bio;
+     })()`
+  )
+);
+// 重新打开弹窗：清除按钮只存在于弹窗里，初始态要验的是它不出现
+await click(s, ".user-badge");
+await waitFor(s, `!!document.querySelector('.user-settings')`, "重新打开资料弹窗");
 ok(
   "没设过头像时不显示清除按钮",
   await evaluate(s, `!document.querySelector('.avatar-clear')`)
@@ -1026,6 +1121,9 @@ ok(
     `document.querySelector('.msg-row .avatar').innerText.trim() === '我'`
   )
 );
+// 关掉弹窗，别挡着后面的用例
+await click(s, ".user-settings .btn.primary");
+await waitFor(s, `!document.querySelector('.user-settings')`, "用户资料弹窗关闭（清除后）");
 await sleep(300);
 // ---------------------------------------------------------------- 网页端导出
 

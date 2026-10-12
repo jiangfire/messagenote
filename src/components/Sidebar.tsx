@@ -1,5 +1,7 @@
 import { useState } from "react";
 import type { Channel, TagCount, TimelineStats, View } from "../lib/types";
+import { UserBadge } from "./UserBadge";
+import { UserSettings } from "./UserSettings";
 
 interface Props {
   channels: Channel[];
@@ -36,6 +38,8 @@ export function Sidebar({
 }: Props) {
   const [adding, setAdding] = useState(false);
   const [draft, setDraft] = useState("");
+  /** 左下角用户区的资料弹窗。见 UserBadge / UserSettings。 */
+  const [userOpen, setUserOpen] = useState(false);
 
   // 收件箱（kind = 'inbox'）不在频道列表里露脸，理由见上面的文档注释
   const named = channels.filter((c) => c.kind !== "inbox");
@@ -143,6 +147,11 @@ export function Sidebar({
           </div>
         )}
       </div>
+
+      {/* 左下角的用户区。margin-top: auto 钉在侧边栏最下面（见 .user-badge）。
+          backdrop 是 fixed 定位，弹窗渲染在 aside 里也不影响它铺满窗口。 */}
+      <UserBadge onOpen={() => setUserOpen(true)} />
+      {userOpen && <UserSettings onClose={() => setUserOpen(false)} />}
     </aside>
   );
 }

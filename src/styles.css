@@ -216,6 +216,58 @@ kbd {
   line-height: 1.5;
 }
 
+/* ---------------- 左下角用户区 ---------------- */
+
+/* 贴在侧边栏最下面：上面的频道/标签是"往上堆"的内容，用户区是恒定的"我是谁"。
+   margin-top: auto 在内容不满一屏时把它钉在底部；超屏时跟在内容后面滚动。 */
+.user-badge {
+  margin-top: auto;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  padding: 9px;
+  border: 0;
+  border-top: 1px solid var(--border);
+  background: transparent;
+  text-align: left;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.user-badge:hover {
+  background: var(--accent-soft);
+}
+
+/* 用户区里的头像不吃消息流那套 margin-top —— 那是给对话行对齐用的 */
+.user-badge-avatar {
+  margin-top: 0;
+  flex: 0 0 auto;
+}
+
+.user-badge-text {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.user-badge-name {
+  font-size: 0.8125rem;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.user-badge-bio {
+  font-size: 0.6875rem;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .inline-input {
   margin: 0 6px;
   padding: 6px 8px;
@@ -441,8 +493,8 @@ kbd {
   align-items: flex-start;
 }
 
-/* 头像现在是可点的了。默认态要**看不出**它可点 —— 一列消息里几十个
-   会聚光的圆圈会变成噪音；悬停才给一圈描边。 */
+/* 可点的头像（设置弹窗里的预览）。默认态要**看不出**它可点，悬停才给一圈描边。
+   消息流里的头像不再可点 —— 设置入口统一在左下角用户区，见 UserBadge。 */
 .avatar-btn {
   border: 0;
   padding: 0;
@@ -500,20 +552,35 @@ kbd {
   opacity: 1;
 }
 
-.avatar-error {
-  position: absolute;
-  top: 34px;
-  left: 0;
-  z-index: 5;
-  width: 220px;
-  padding: 5px 9px;
-  border: 1px solid var(--border);
-  border-radius: 7px;
-  background: var(--panel);
-  color: var(--text);
-  font-size: 0.6875rem;
-  line-height: 1.45;
-  box-shadow: 0 3px 12px rgb(0 0 0 / 0.16);
+/* ---------------- 用户资料弹窗 ---------------- */
+
+/* 设置弹窗里的大号预览（消息流里那个是 30px，这里要能看清脸） */
+.avatar-lg {
+  width: 56px;
+  height: 56px;
+  margin-top: 0;
+  font-size: 1.125rem;
+}
+
+/* 头像预览 + 操作按钮一行 */
+.avatar-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.avatar-row-text {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  min-width: 0;
+}
+
+.user-settings-error {
+  font-size: 0.75rem;
+  color: var(--danger);
 }
 
 .msg-body {
@@ -1228,7 +1295,8 @@ kbd {
 
 /* 输入框和下拉框共用一套外观：同一个表单里两种控件长得不一样最扎眼。 */
 .field input,
-.field select {
+.field select,
+.field textarea {
   width: 100%;
   padding: 8px 10px;
   border: 1px solid var(--border);
@@ -1241,13 +1309,15 @@ kbd {
 }
 
 .field input:focus,
-.field select:focus {
+.field select:focus,
+.field textarea:focus {
   border-color: var(--accent);
   box-shadow: 0 0 0 3px var(--accent-soft);
 }
 
 .field input:disabled,
-.field select:disabled {
+.field select:disabled,
+.field textarea:disabled {
   opacity: 0.6;
 }
 
