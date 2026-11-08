@@ -697,7 +697,7 @@ v1.8.0 审查里的 R1 / R7 / R8 也补跑了真机（三条全过）。AI 的**
 
 ```
 D:\Tools\MessageNote\
-├─ MessageNote_1.10.0_x64-portable.exe
+├─ MessageNote_1.11.0_x64-portable.exe
 ├─ messagenote.sqlite      ← 你的全部记录
 └─ startup-*.log           ← 启动失败/警告的日志（只在出问题时才会有）
 ```
