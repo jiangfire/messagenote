@@ -753,16 +753,67 @@ kbd {
   color: var(--danger);
 }
 
+/* 手动输入标签的输入框 —— 标签行的第一个元素。
+
+   它**常驻**在每一行上，所以默认状态必须是"幽灵"：无边框、背景透明。
+   照旧那个"一上来就有边框有底色"的样式铺满一屏之后，
+   满屏都是输入框，真正的标签反而看不见了。 */
 .tag-input {
-  width: 130px;
+  width: 104px;
   padding: 2px 8px;
-  border: 1px solid var(--accent);
+  border: 1px solid transparent;
   border-radius: 999px;
-  background: var(--panel);
+  background: transparent;
   color: var(--text);
   font-family: inherit;
   font-size: 0.75rem;
   outline: none;
+}
+
+.tag-input::placeholder {
+  color: var(--muted);
+  opacity: 0.6;
+}
+
+.tag-input:hover {
+  border-color: var(--border);
+}
+
+.tag-input:focus {
+  border-color: var(--accent);
+  background: var(--panel);
+}
+
+/* AI 建议标签的入口：标签行**最右边**的那颗星星。
+
+   位置本身就是功能 —— 手动输入排第一、AI 排最后，一眼能看出
+   "先自己标，AI 是补充"。用星星而不是一句「＋ AI 建议标签」，
+   是因为一屏几十行，那句话能把整屏的标签都挤没了。 */
+.tag-ai-slot {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.tag-ai-btn {
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 0.875rem;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.tag-ai-btn:hover {
+  background: var(--accent-soft);
+  color: var(--accent);
 }
 
 /* ---------------- 按钮 ---------------- */

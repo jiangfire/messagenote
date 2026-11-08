@@ -236,6 +236,35 @@ function MessageRow({ message, channels, label, onEdit, onDelete, onMove, onTags
   const [tagDraft, setTagDraft] = useState("");
   const [moving, setMoving] = useState(false);
 
+  /**
+   * 手动输入标签的输入框。
+   *
+   * 它**常驻**在标签行的第一个位置，所以不能靠 `autoFocus` 抢焦点 ——
+   * 那会让最后挂载的那一行把焦点抢走（用户刚点进搜索框就被夺走）。
+   * 要聚焦就显式调 `focus()`，见下面那个 `useEffect`。
+   */
+  const tagInputRef = useRef<HTMLInputElement>(null);
+  /**
+   * 写标签的锁。
+   *
+   * `setMessageTags` 是**整体替换**，不是合并。所以连按两次回车，
+   * 第二次必须等第一次落库、列表刷新完再发 —— 否则第二次会拿着
+   * **还不包含第一个标签**的旧快照发出去，第一个标签被覆盖删除，
+   * 而且没有任何报错。（和下面 `accepting` 是同一类坑。）
+   */
+  const [tagBusy, setTagBusy] = useState(false);
+
+  /**
+   * 打开标签输入时把焦点送进去。
+   *
+   * 焦点**必须**在这里显式给，不能靠 `autoFocus`：输入框常驻在标签行里，
+   * 每条记录挂载一次，而 `autoFocus` 是"挂载那一刻抢一次" ——
+   * 一屏几十行，最后挂载的那行会把用户正在用的输入框抢走。
+   */
+  useEffect(() => {
+    if (tagging) tagInputRef.current?.focus();
+  }, [tagging]);
+
   // ---------------------------------------------------------- AI 标签建议
   //
   // **建议态，不是标签。** 点一下才生效，而且生效前它和真标签在视觉上必须
@@ -340,11 +369,16 @@ function MessageRow({ message, channels, label, onEdit, onDelete, onMove, onTags
 
   async function addTag(raw: string) {
     const name = raw.trim().replace(/^#/, "");
-    if (!name) return;
-    if (!message.tags.includes(name)) {
-      await onTags(message.id, [...message.tags, name]);
+    if (!name || tagBusy) return;
+    setTagBusy(true);
+    try {
+      if (!message.tags.includes(name)) {
+        await onTags(message.id, [...message.tags, name]);
+      }
+      setTagDraft("");
+    } finally {
+      setTagBusy(false);
     }
-    setTagDraft("");
   }
 
   async function removeTag(name: string) {
@@ -406,8 +440,55 @@ function MessageRow({ message, channels, label, onEdit, onDelete, onMove, onTags
           </div>
         )}
 
-        {(message.tags.length > 0 || tagging || desktop) && (
+        {/*
+            标签行的**顺序**是有讲究的：
+
+            1. 手动输入 —— 排第一。自己打的标签是确定的，不该排在 AI 的
+               建议后面（那读起来像"AI 先给一批，你再补"）。
+            2. 已经打上的标签
+            3. AI 的建议（虚线 chip）
+            4. 星星 —— **最右边**。AI 是"补充"动作，不该在每条记录刚
+               出现时就抢注意力。
+
+            星星用 `✦` 而不是原来那句「＋ AI 建议标签」：文字按钮在一屏
+            几十行里会占满整行字，谁也看不见真正的标签。
+        */}
+        {(message.tags.length > 0 || suggestions.length > 0 || tagging || desktop) && (
           <div className="msg-tags">
+            {/* 1. 手动输入 —— 永远排第一 */}
+            <input
+              ref={tagInputRef}
+              className="tag-input"
+              value={tagDraft}
+              placeholder="＋ 标签"
+              aria-label="手动添加标签，回车确认"
+              onChange={(e) => setTagDraft(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  void addTag(tagDraft);
+                }
+                if (e.key === "Escape") {
+                  e.preventDefault();
+                  // 窗口上还有一层全局的 Esc 处理（清检索词，见 App.tsx）。
+                  // 不拦住的话，在标签框里按 Esc 会**顺手把检索词也清掉** ——
+                  // 用户明明只想取消这一行。
+                  // 输入框常驻之后，这个组合比以前容易撞上。
+                  e.stopPropagation();
+                  // 桌面端这个输入框是常驻的，关不掉 —— 那就把草稿清掉、
+                  // 焦点让出去。网页端则会连输入框一起收起。
+                  setTagDraft("");
+                  setTagging(false);
+                  tagInputRef.current?.blur();
+                }
+                if (e.key === "Backspace" && !tagDraft) {
+                  setTagging(false);
+                }
+              }}
+              onBlur={() => setTagging(false)}
+            />
+
+            {/* 2. 真标签 */}
             {message.tags.map((t) => (
               <span key={t} className="tag-chip small">
                 {t}
@@ -437,43 +518,35 @@ function MessageRow({ message, channels, label, onEdit, onDelete, onMove, onTags
               </button>
             ))}
 
-            {suggesting ? (
-              <span className="muted small">正在想标签…</span>
-            ) : (
-              /* 按钮**恒常显示**（桌面端），不按"配没配模型"藏起来。
-                 曾经想藏，但那样会带来一个更糟的问题：每行自己读一次配置，
-                 用户在设置里配好了之后，**已经挂在屏幕上的那些行不会刷新**，
-                 于是出现"我明明配了但按钮就是不出现"——而他没有任何办法
-                 知道自己哪里没对上。
-                 改成点一下给一句可操作的话（"AI 还没配好：还没填模型地址"），
-                 问题就消失了。 */
-              <button
-                className="btn tiny ghost"
-                title="让模型给这条记录提几个标签（只是建议，不会自动改你的数据）"
-                onClick={() => void runSuggest()}
-              >
-                ＋ AI 建议标签
-              </button>
-            )}
+            {/*
+                4. 星星 —— 最右边的 AI 入口。
 
-            {tagging && (
-              <input
-                className="tag-input"
-                autoFocus
-                value={tagDraft}
-                placeholder="标签名，回车添加"
-                onChange={(e) => setTagDraft(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") {
-                    e.preventDefault();
-                    void addTag(tagDraft);
-                  }
-                  if (e.key === "Escape" || (e.key === "Backspace" && !tagDraft)) {
-                    setTagging(false);
-                  }
-                }}
-                onBlur={() => setTagging(false)}
-              />
+                **只出现在桌面端**：AI 建议走的是本地命令（Tauri IPC），
+                网页端没有这条通道。摆一个点了没反应的按钮在那儿，
+                比不摆更糟 —— 用户会以为应用坏了。
+            */}
+            {desktop && (
+              <span className="tag-ai-slot">
+                {suggesting ? (
+                  <span className="muted small">正在想标签…</span>
+                ) : (
+                  /* 按钮**恒常显示**（桌面端），不按"配没配模型"藏起来。
+                     曾经想藏，但那样会带来一个更糟的问题：每行自己读一次配置，
+                     用户在设置里配好了之后，**已经挂在屏幕上的那些行不会刷新**，
+                     于是出现"我明明配了但按钮就是不出现"——而他没有任何办法
+                     知道自己哪里没对上。
+                     改成点一下给一句可操作的话（"AI 还没配好：还没填模型地址"），
+                     问题就消失了。 */
+                  <button
+                    className="tag-ai-btn"
+                    title="让模型给这条记录提几个标签（只是建议，不会自动改你的数据）"
+                    aria-label="AI 建议标签"
+                    onClick={() => void runSuggest()}
+                  >
+                    ✦
+                  </button>
+                )}
+              </span>
             )}
           </div>
         )}
@@ -524,7 +597,16 @@ function MessageRow({ message, channels, label, onEdit, onDelete, onMove, onTags
             {copyState === "ok" ? "✓" : copyState === "fail" ? "!" : "⧉"}
           </span>
         </button>
-        <button className="icon-btn" title="添加标签" onClick={() => setTagging(true)}>
+        <button
+          className="icon-btn"
+          title="添加标签"
+          onClick={() => {
+            setTagging(true);
+            // 桌面端输入框常驻，直接把焦点送过去；网页端这时还没渲染出来，
+            // 焦点由上面那个 `useEffect` 在渲染后补上。
+            tagInputRef.current?.focus();
+          }}
+        >
           #
         </button>
         <button
