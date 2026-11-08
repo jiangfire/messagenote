@@ -1,12 +1,17 @@
 //! 数据目录：安装版和便携版走的是**两个不同的地方**。
 //!
 //! - **安装版**：数据在系统应用数据目录（Windows 上是 `%APPDATA%\com.messagenote.desktop`）
-//! - **便携版**：数据在**可执行文件所在的目录**，和 exe 并排
+//! - **便携版**：数据在**可执行文件所在目录下的 `data` 文件夹**里
 //!
 //! 便携版的全部意义就在这条差别上：把整个文件夹拷到 U 盘，数据跟着走，
 //! 换台电脑双击就接着用。数据还躺在 `%APPDATA%` 里的程序不叫便携版 ——
 //! 那只是个换了名字的安装版：装的人以为数据跟着程序走，实际上拔了 U 盘
 //! 就只剩一个空壳，而记录留在了原机器上。
+//!
+//! 为什么单独一个 `data` 文件夹，而不是直接摊在程序目录里：那个目录里
+//! 可能还有用户自己放的东西（说明文档、别的工具的 exe）。应用的数据和它们
+//! 混在一起，既不好认（哪个文件是我的记录？），也不好备份（复制哪个？）。
+//! 归到一个文件夹里，拷走 `data\` 就是完整备份。
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -15,6 +20,9 @@ use tauri::Manager;
 
 /// 解析出来的数据目录。setup 里定一次，之后所有人从这儿取。
 static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// 便携版数据目录的名字：程序所在目录下的这个子目录。
+pub const DATA_SUBDIR: &str = "data";
 
 /// 当前是不是便携模式。
 ///
@@ -54,8 +62,8 @@ fn exe_file_name() -> Option<String> {
         .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_lowercase()))
 }
 
-/// 可执行文件所在的目录。**便携模式的数据目录就是它** —— 和 exe 并排，
-/// 而不是塞进什么子目录：用户打开文件夹就该一眼看见自己的数据。
+/// 可执行文件所在的目录。便携版的数据目录是它下面的 `data` 子目录（见
+/// [`portable_data_dir`]），也是找旧数据时的第一个来源。
 pub fn exe_dir() -> Option<PathBuf> {
     std::env::current_exe()
         .ok()
@@ -67,13 +75,15 @@ pub const DB_FILE: &str = "messagenote.sqlite";
 
 /// 解析出来的数据目录，外加"要不要从旧位置搬家"的结论。
 pub struct DataDir {
-    /// 数据目录。便携版 = 程序所在目录；安装版 = 系统应用数据目录。
+    /// 数据目录。便携版 = 程序所在目录下的 `data` 子目录；
+    /// 安装版 = 系统应用数据目录。
     pub dir: PathBuf,
     /// 搬家的结果。安装版永远是 [`Migration::NotNeeded`]。
     pub migration: Migration,
 }
 
 /// 便携版第一次启动时，旧数据的搬家结果。
+#[derive(Debug)]
 pub enum Migration {
     /// 没什么可搬的：第一次用，或者已经搬过了。
     NotNeeded,
@@ -94,7 +104,7 @@ pub enum Migration {
 /// 在 [`crate::fatal`] 里，而这个模块不该依赖它。
 pub fn resolve(app: &tauri::AppHandle) -> Result<DataDir, String> {
     let (dir, migration) = if is_portable() {
-        let dir = exe_dir().ok_or_else(|| "拿不到可执行文件所在目录".to_string())?;
+        let dir = portable_data_dir().ok_or_else(|| "拿不到可执行文件所在目录".to_string())?;
         let migration = migrate_legacy_db(app, &dir);
         (dir, migration)
     } else {
@@ -109,39 +119,78 @@ pub fn resolve(app: &tauri::AppHandle) -> Result<DataDir, String> {
     Ok(DataDir { dir, migration })
 }
 
-/// 便携版第一次启动：把旧数据从 `%APPDATA%` 搬过来。
+/// 便携版的数据目录：**程序所在目录下的 `data` 子目录**。
+///
+/// 单独一个文件夹，而不是把数据摊在程序目录里 —— 那个目录里可能还有用户
+/// 自己放的东西，数据混在一起既不好认也不好备份。
+pub fn portable_data_dir() -> Option<PathBuf> {
+    exe_dir().map(|d| d.join(DATA_SUBDIR))
+}
+
+/// 便携版第一次启动：把旧数据搬进新的数据目录。
 ///
 /// **为什么必须搬**：1.10 之前的免安装版，数据其实躺在 `%APPDATA%` 里 ——
 /// 那时候的"免安装版"并不是真的免安装。改了目录之后如果什么都不做，
 /// 用户升级后会看到一个**空的**应用：记录还在老地方，只是界面不再读它了。
 /// 那不叫"换了位置"，那叫"数据不见了"。
 ///
+/// **搬之前找两个地方**，按"离得近的优先"：
+/// 1. `<程序目录>\messagenote.sqlite` —— v1.11.0 的布局（数据直接摊在程序目录）
+/// 2. `%APPDATA%\com.messagenote.desktop\messagenote.sqlite` —— 1.10 及更早
+///
+/// 只认后一个会漏掉一类人：他们已经升到 v1.11.0、数据已经搬到程序目录了，
+/// 这一版要再往 `data\` 里挪一次。而第一个优先是有道理的：程序目录里那份
+/// 才是"这个便携程序自己的数据"，`%APPDATA%` 那份可能是**另一个版本**
+/// （装着版）正在用的。
+///
 /// 旧的那份**保留不动**（不删用户的文件）：万一搬家搬砸了，老数据还在。
-/// 代价是两份数据各走各的 —— 但"多一份"比"丢一份"好。
+/// 代价是几份数据各走各的 —— 但"多一份"比"丢一份"好。
 fn migrate_legacy_db(app: &tauri::AppHandle, dir: &Path) -> Migration {
-    let target = dir.join(DB_FILE);
-    if target.exists() {
-        // 已经搬过了（或者本来就有数据在这）。不重复搬。
-        return Migration::NotNeeded;
+    // 旧位置，从近到远。
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(exe_dir) = exe_dir() {
+        candidates.push(exe_dir.join(DB_FILE));
     }
-    let legacy_dir = match app.path().app_data_dir() {
-        Ok(d) => d,
+    match app.path().app_data_dir() {
+        Ok(d) => candidates.push(d.join(DB_FILE)),
         Err(e) => {
             return Migration::Failed {
                 from: PathBuf::from("<未知>"),
                 reason: format!("找不到旧数据目录：{e}"),
             }
         }
-    };
-    let legacy = legacy_dir.join(DB_FILE);
-    if !legacy.exists() {
-        // 第一次用，没有旧数据。
+    }
+    migrate_from(&candidates, dir)
+}
+
+/// 搬家本身。**和 AppHandle 无关**，所以能直接测。
+///
+/// `candidates` 是旧位置，**从近到远**：第一个存在的就用它。
+fn migrate_from(candidates: &[PathBuf], dir: &Path) -> Migration {
+    let target = dir.join(DB_FILE);
+    if target.exists() {
+        // 已经搬过了（或者本来就有数据在这）。不重复搬。
         return Migration::NotNeeded;
     }
-    match copy_db(&legacy, &target) {
-        Ok(()) => Migration::Moved(legacy),
+
+    let Some(source) = candidates.iter().find(|p| p.exists()).cloned() else {
+        // 第一次用，没有旧数据。
+        return Migration::NotNeeded;
+    };
+
+    // 目标目录可能还不存在（第一次跑便携版）——
+    // `VACUUM INTO` 不会自己建目录，缺了就是一句看不懂的 "unable to open database file"。
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        return Migration::Failed {
+            from: source,
+            reason: format!("建数据目录失败：{e}"),
+        };
+    }
+
+    match copy_db(&source, &target) {
+        Ok(()) => Migration::Moved(source),
         Err(reason) => Migration::Failed {
-            from: legacy,
+            from: source,
             reason,
         },
     }
@@ -211,6 +260,16 @@ mod tests {
     }
 
     #[test]
+    fn portable_data_dir_is_a_data_subdir_of_the_exe_dir() {
+        let exe = exe_dir().expect("拿得到 exe 目录");
+        let data = portable_data_dir().expect("拿得到数据目录");
+        assert_eq!(data, exe.join(DATA_SUBDIR));
+        // 数据**不**摊在程序目录里 —— 那个目录可能还有用户自己放的东西，
+        // 混在一起既不好认也不好备份。
+        assert_ne!(data, exe);
+    }
+
+    #[test]
     fn copy_db_keeps_rows_that_are_still_in_the_wal() {
         use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -250,5 +309,139 @@ mod tests {
         assert_eq!(got, 1, "复制出来的库必须带着 WAL 里的那一行");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 造一个只有一行的库，落在 `path`。
+    fn seed_db(path: &Path) {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS t(x INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (7);", []).unwrap();
+    }
+
+    fn rows_in(path: &Path) -> i64 {
+        rusqlite::Connection::open(path)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// v1.11.0 的布局（数据摊在程序目录）要能搬进 `data\`。
+    ///
+    /// 这一条最要紧：已经升到 v1.11.0 的用户，数据就在程序目录里，
+    /// 只认 `%APPDATA%` 的话他们升级后会看到一个**空的**应用。
+    #[test]
+    fn migrates_the_v1_11_0_layout_into_the_data_folder() {
+        let root = std::env::temp_dir().join(format!(
+            "messagenote-migrate-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let exe_dir = root.join("app");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+
+        // 程序目录里躺着 v1.11.0 留下的库
+        let legacy = exe_dir.join(DB_FILE);
+        seed_db(&legacy);
+
+        // 新数据目录还不存在 —— 搬家时得自己建
+        let data_dir = exe_dir.join(DATA_SUBDIR);
+        let result = migrate_from(std::slice::from_ref(&legacy), &data_dir);
+
+        match result {
+            Migration::Moved(from) => assert_eq!(from, legacy),
+            other => panic!("应当搬成：{other:?}"),
+        }
+        assert!(data_dir.join(DB_FILE).exists(), "库应当落在 data 文件夹里");
+        assert_eq!(rows_in(&data_dir.join(DB_FILE)), 1, "搬过去的库要有数据");
+        assert!(legacy.exists(), "旧的那份必须保留");
+    }
+
+    /// 两个旧位置都在时，**程序目录里那份优先**。
+    ///
+    /// 程序目录里那份才是"这个便携程序自己的数据"；`%APPDATA%` 那份可能是
+    /// **另一个版本**（装着版）正在用的 —— 搬错了就是数据分家。
+    #[test]
+    fn the_exe_dir_wins_over_appdata() {
+        let root = std::env::temp_dir().join(format!(
+            "messagenote-migrate-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let exe_dir = root.join("app");
+        let appdata = root.join("appdata");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        std::fs::create_dir_all(&appdata).unwrap();
+
+        let near = exe_dir.join(DB_FILE);
+        seed_db(&near);
+        let far = appdata.join(DB_FILE);
+        seed_db(&far);
+
+        let data_dir = exe_dir.join(DATA_SUBDIR);
+        let result = migrate_from(&[near.clone(), far.clone()], &data_dir);
+
+        match result {
+            Migration::Moved(from) => assert_eq!(from, near, "应当搬程序目录里那份"),
+            other => panic!("应当搬成：{other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 目标已经有了就别再搬 —— 免得把用户的新数据覆盖成旧的。
+    #[test]
+    fn an_existing_target_is_left_alone() {
+        let root = std::env::temp_dir().join(format!(
+            "messagenote-migrate-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let exe_dir = root.join("app");
+        let data_dir = exe_dir.join(DATA_SUBDIR);
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        // 目标里已经有数据了
+        seed_db(&data_dir.join(DB_FILE));
+
+        // 老位置也有一份
+        let legacy = exe_dir.join(DB_FILE);
+        seed_db(&legacy);
+
+        let result = migrate_from(&[legacy], &data_dir);
+        assert!(
+            matches!(result, Migration::NotNeeded),
+            "目标已有数据时不该搬：{result:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 没有旧数据时不搬，也不该报错 —— 第一次用便携版就是这条路。
+    #[test]
+    fn nothing_to_migrate_is_not_an_error() {
+        let root = std::env::temp_dir().join(format!(
+            "messagenote-migrate-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let data_dir = root.join("app").join(DATA_SUBDIR);
+        let result = migrate_from(&[root.join("nope.sqlite")], &data_dir);
+        assert!(
+            matches!(result, Migration::NotNeeded),
+            "没有旧数据时应当是 NotNeeded：{result:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
