@@ -79,7 +79,23 @@ jobs:
           export TAURI_SIGNING_PRIVATE_KEY="$(printf '%s' "$RAW_KEY" | tr -d '\r\n')"
           export TAURI_SIGNING_PRIVATE_KEY_PASSWORD="$RAW_PASSWORD"
 
-          pnpm tauri build
+          # **NSIS 工具链是现下的。** tauri bundler 打包时要从 GitHub 下载
+          # nsis-3.11.zip，而 GitHub 的 release 资源在需要从后端冷取时会返
+          # 504 —— v1.11.0 就这么连挂两次（编译都成功了，挂在最后一步）。
+          #
+          # 这是网络抖动，不是代码问题，所以**重试**，不改代码。
+          # 重试很便宜：第一次已经把编译产物留在 target/ 里，后面几次十几秒
+          # 就又走到打包这一步；而整个 job 重跑要重新编 6 分半
+          # （rust-cache 只在 job 成功时才保存缓存，失败过一次就白编）。
+          for i in 1 2 3 4 5; do
+            if pnpm tauri build; then
+              exit 0
+            fi
+            echo "::warning::打包失败（第 $i 次），30 秒后重试"
+            sleep 30
+          done
+          echo "::error::打包连续失败 5 次，放弃"
+          exit 1
 
       - name: 收集产物
         shell: bash
