@@ -19,6 +19,7 @@ pub mod sync;
 mod commands;
 mod fatal;
 mod llm;
+mod paths;
 mod sse;
 mod suggest;
 mod sync_worker;
@@ -227,17 +228,39 @@ pub fn run() {
             // 这不是防御性编程，是发布版唯一能让用户看见的通道。
 
             // ---- 数据库 ----
-            let dir = match app.path().app_data_dir() {
+            //
+            // 数据目录有两条路（见 `paths`）：安装版在系统应用数据目录，
+            // 便携版在**程序自己所在的目录** —— 和 exe 并排，拷走就带走。
+            let data = match paths::resolve(app.handle()) {
                 Ok(d) => d,
-                Err(e) => fatal::report(&format!("无法定位应用数据目录：{e}")),
+                Err(e) => fatal::report(&e),
             };
+
+            // 便携版第一次启动会从老位置（%APPDATA%）把数据搬过来。
+            // **必须说出来** —— 用户看到的现象是"数据突然出现在程序目录里了"，
+            // 不解释的话他会以为程序动了他的文件。
+            match &data.migration {
+                paths::Migration::NotNeeded => {}
+                paths::Migration::Moved(from) => fatal::note_warning(&format!(
+                    "免安装版的数据目录改成了程序所在目录：旧数据已复制过来（{}）。\
+                     原文件保留着，确认新数据没问题后可以删掉。",
+                    from.display()
+                )),
+                paths::Migration::Failed { from, reason } => fatal::note_warning(&format!(
+                    "免安装版的数据目录改成了程序所在目录，但旧数据（{}）没能复制过来：\
+                     {reason}。程序会先用一个空的库启动 —— 把那个文件复制到程序所在目录，\
+                     记录就回来了。",
+                    from.display()
+                )),
+            }
+            let dir = data.dir;
 
             // MESSAGENOTE_DB 可以覆盖数据库位置。两个实际用途：
             // 1. 在同一台机器上跑两个实例来验证同步 —— 否则它们会抢同一个库文件
             // 2. 拿一份副本做实验，不碰真实数据
             let db_path = match std::env::var("MESSAGENOTE_DB") {
                 Ok(p) if !p.trim().is_empty() => std::path::PathBuf::from(p),
-                _ => dir.join("messagenote.sqlite"),
+                _ => dir.join(paths::DB_FILE),
             };
             let db = match db::open(&db_path) {
                 Ok(db) => db,

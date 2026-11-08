@@ -17,7 +17,8 @@ use std::sync::Mutex;
 
 /// 本次启动期间记下的**非致命**警告。
 ///
-/// 光写日志是不够的：用户不会去翻 `%APPDATA%` 下的 `startup-warnings.log`。
+/// 光写日志是不够的：用户不会去翻数据目录（安装版在 `%APPDATA%` 下面）
+/// 里的 `startup-warnings.log`。
 /// 全局快捷键被别的程序占用这种事如果不显示在界面上，用户感受到的只是
 /// **"这个软件有时候按快捷键没反应"** —— 一个他永远查不出原因的现象。
 static STARTUP_WARNINGS: Mutex<Vec<String>> = Mutex::new(Vec::new());
@@ -119,15 +120,41 @@ pub fn startup_warnings() -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// 优先放在应用数据目录（跟库在一起，用户找得到）；
+/// 优先放在数据目录（跟库在一起，用户找得到）；
 /// 那里写不进去就退到临时目录 —— 记日志失败不该把"告诉用户"这件事也丢掉。
 ///
+/// 数据目录是 `paths::resolve` 定下来的那个：安装版在应用数据目录，
+/// 便携版在程序自己所在的目录 —— 日志和数据在一起，**跟着程序走**。
+///
 /// 刻意**不依赖 Tauri 的路径解析**：那个 API 本身就可能正是失败的原因。
+/// 目录还没定下来就失败时（只有这一种情况会走兜底），退回 [`fallback_dir`]。
 fn log_path(name: &str) -> Option<PathBuf> {
-    let dir = std::env::var_os("APPDATA")
-        .map(|appdata| PathBuf::from(appdata).join("com.messagenote.desktop"))
-        .unwrap_or_else(std::env::temp_dir);
+    let dir = match crate::paths::data_dir() {
+        Some(d) => d.to_path_buf(),
+        None => fallback_dir(),
+    };
     Some(dir.join(name))
+}
+
+/// 数据目录还没定下来时的兜底：应用数据目录（Windows 上是 `%APPDATA%`）。
+#[cfg(not(test))]
+fn fallback_dir() -> PathBuf {
+    std::env::var_os("APPDATA")
+        .map(|appdata| PathBuf::from(appdata).join("com.messagenote.desktop"))
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+/// **测试里不许碰用户的真实数据目录。**
+///
+/// 测试进程里 `paths::data_dir()` 永远是 `None`（setup 钩子根本不跑），
+/// 于是会走兜底 —— 而兜底指向 `%APPDATA%\com.messagenote.desktop`，
+/// 那是**用户自己的文件**。测试往里追加"测试警告甲"是在往用户的日志里
+/// 掺垃圾：用户翻日志想看"刚才都提示了什么"，看到的是单元测试的残渣。
+///
+/// 临时目录是这里唯一正确的选择：测试的产物该待在临时目录里。
+#[cfg(test)]
+fn fallback_dir() -> PathBuf {
+    std::env::temp_dir().join("messagenote-test-logs")
 }
 
 #[cfg(target_os = "windows")]
@@ -198,5 +225,27 @@ mod tests {
             .position(|w| w == "测试警告乙")
             .expect("乙应当在");
         assert!(a < b, "警告应当按发生顺序保留：{list:?}");
+    }
+
+    /// 测试的日志不许落在用户的应用数据目录里。
+    ///
+    /// 这条断言是给"有人把 `#[cfg(test)]` 那套去掉"准备的 ——
+    /// 去掉之后，测试会重新开始往 `%APPDATA%\com.messagenote.desktop` 里
+    /// 追加"测试警告甲"，而用户翻日志时看到的就是这些残渣。
+    #[test]
+    fn test_logs_never_land_in_the_user_appdata() {
+        let dir = fallback_dir();
+        assert!(
+            dir.starts_with(std::env::temp_dir()),
+            "测试日志应当落在临时目录：{}",
+            dir.display()
+        );
+        if let Some(appdata) = std::env::var_os("APPDATA") {
+            assert!(
+                !dir.starts_with(PathBuf::from(appdata)),
+                "测试日志绝不能落进用户的应用数据目录：{}",
+                dir.display()
+            );
+        }
     }
 }

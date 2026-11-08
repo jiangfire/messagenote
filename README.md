@@ -686,6 +686,30 @@ v1.8.0 审查里的 R1 / R7 / R8 也补跑了真机（三条全过）。AI 的**
 安装包**未做代码签名**，Windows SmartScreen 会弹警告 —— 这是预期行为，
 不是安装包损坏。自用可以直接「仍要运行」。
 
+### 数据放在哪
+
+| 版本 | 数据目录 |
+| --- | --- |
+| 安装版（`-setup.exe`） | `%APPDATA%\com.messagenote.desktop` |
+| 免安装版（`-portable.exe`） | **程序自己所在的目录** |
+
+免安装版的数据和 exe **并排**放在同一个文件夹里：
+
+```
+D:\Tools\MessageNote\
+├─ MessageNote_1.10.0_x64-portable.exe
+├─ messagenote.sqlite      ← 你的全部记录
+└─ startup-*.log           ← 启动失败/警告的日志（只在出问题时才会有）
+```
+
+整个文件夹拷到 U 盘，数据跟着走；换台电脑双击就接着用。**这才是"免安装版"
+该有的样子** —— 数据还躺在 `%APPDATA%` 里的程序不叫免安装版，那只是个换了名字
+的安装版：拔了 U 盘就只剩一个空壳，而记录留在了原机器上。
+
+判据是**文件名**：exe 名字里带 `portable` 就是免安装版（发行版产出的就是
+`MessageNote_<版本>_x64-portable.exe`）。把文件改了名的话，设一个环境变量
+`MESSAGENOTE_PORTABLE=1` 就能把它切回便携模式。
+
 ### 校验下载没被篡改
 
 ```bash
